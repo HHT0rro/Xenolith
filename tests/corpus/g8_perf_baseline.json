@@ -1,0 +1,46 @@
+{
+  "app_geomean_ratio_std": 0.98843,
+  "protected_call_p95_ratio": 1.013363,
+  "native_call_p50_ns": 2.245,
+  "vm_call_p50_ns": 2.25,
+  "vm_call_p95_ns": 2.275,
+  "size_worst_ratio": 3.833333,
+  "sizes": [
+    {
+      "sample": "hello_dll.dll",
+      "in": 104448,
+      "out": 208896
+    },
+    {
+      "sample": "license_toy.dll",
+      "in": 9216,
+      "out": 35328
+    },
+    {
+      "sample": "hello-exe.exe",
+      "in": 123904,
+      "out": 241152
+    },
+    {
+      "sample": "eh_dll.dll",
+      "in": 107008,
+      "out": 212992
+    }
+  ],
+  "budgets": {
+    "app_geomean": 2.0,
+    "call_p95": 10.0,
+    "size": 4.0
+  },
+  "spawn_runs": 30,
+  "call_batches": 40,
+  "batch_calls": 20000,
+  "measured_utc": "2026-09-15T15:08:38.2514475Z",
+  "host": "Microsoft Windows 11 专业版-10.0.26200-26200",
+  "verdicts": {
+    "app_geomean_std": "PASS",
+    "protected_call_p95": "PASS",
+    "size_worst": "PASS"
+  },
+  "note": "TASK-038 release budgets refreshed after xl_core O1/G5-O0 and intra-object memcpy/memset alias resolution; all three budgets pass."
+}

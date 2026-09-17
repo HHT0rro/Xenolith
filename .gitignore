@@ -1,0 +1,46 @@
+# --- Rust build output ---
+/target
+**/*.rs.bk
+
+# --- Release bundles / local build output ---
+/dist
+
+# --- Local scratch, never committed ---
+/tui-test
+/assets/*
+!/assets/icon.png
+/docs/codex-handoffs
+
+# --- Sample build artifacts ---
+samples/**/target
+samples/hello-elf/hello-elf
+samples/hello-elf/libhello-elf.so
+
+# --- Reverse-engineering databases / native symbols ---
+*.pdb
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+
+# --- IDEs / editors ---
+.idea/
+.vscode/
+*.iml
+*.swp
+*~
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# --- Local AI-agent tooling state ---
+.serena/
+.zcode/
+.codegraph/
+.claude/
+CLAUDE.md

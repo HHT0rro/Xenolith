@@ -1,0 +1,341 @@
+{
+ "version": 1,
+ "frozen_on": "2026-09-07",
+ "purpose": "G0 behavior and coverage freeze. Later stages may add cases; they must not delete hard cases to raise coverage.",
+ "policy": {
+  "no_delete_hard_cases": true,
+  "missing_sample_is_fail": true,
+  "host_emulator_is_not_os_truth": true,
+  "exclude_runtime_does_not_verify_runtime": true
+ },
+ "toolchain": {
+  "rustc": "1.95.0 (59807616e 2026-04-14)",
+  "cargo": "1.95.0 (f2d3ce0bd 2026-03-21)",
+  "license_toy_c": {
+   "via": "cc crate 1.2 / host C compiler",
+   "msvc_flags": [
+    "/LD",
+    "/O1",
+    "/TC"
+   ],
+   "gnu_flags": [
+    "-shared",
+    "-O1"
+   ]
+  }
+ },
+ "samples": [
+  {
+   "id": "hello-dll",
+   "path": "samples/hello-dll",
+   "artifact": "target/release/hello_dll.dll",
+   "language": "Rust",
+   "crate_type": "cdylib",
+   "opt": "release (opt-level 3, lto=false, panic=abort)",
+   "license": "GPL-3.0-or-later",
+   "abi": "extern C, two i32 args, i32 return",
+   "functions": [
+    {
+     "name": "hello_add",
+     "kind": "named-export",
+     "semantics": "wrapping_add",
+     "inputs": [
+      [
+       3,
+       4
+      ]
+     ],
+     "expected": [
+      7
+     ],
+     "liftable_today": true,
+     "role": "straight-line backend check; C license_toy wins if they split"
+    }
+   ]
+  },
+  {
+   "id": "license-toy",
+   "path": "samples/license-toy",
+   "artifact": "target/release/license_toy.dll",
+   "language": "C",
+   "crate_type": "cc shared library",
+   "opt": "/O1 or -O1 (frozen)",
+   "license": "GPL-3.0-or-later",
+   "abi": "two unsigned args, unsigned return",
+   "functions": [
+    {
+     "name": "check_license",
+     "kind": "named-export",
+     "semantics": "t = x^y; t += 0x9E3779B9; t > 0x10000 ? t - y : t + y",
+     "inputs": [
+      [
+       3,
+       4
+      ]
+     ],
+     "expected_oracle": "xenolith_vm::license_toy_oracle",
+     "liftable_today": true,
+     "role": "W1 truth sample"
+    },
+    {
+     "name": "DllMain",
+     "kind": "named-export",
+     "liftable_today": false,
+     "reason": "CRT/DllMain stay native (forbidden_vm_name)"
+    }
+   ]
+  },
+  {
+   "id": "hello-exe",
+   "path": "samples/hello-exe",
+   "artifact": "target/release/hello-exe.exe",
+   "language": "Rust",
+   "crate_type": "bin",
+   "opt": "release",
+   "license": "GPL-3.0-or-later",
+   "abi": "no named exports",
+   "functions": [],
+   "notes": "Pack path accepts PE64 EXE; W1 cannot virtualize EXE entry. TUI still names output *.xl.dll (G3 defect)."
+  },
+  {
+   "id": "eh-dll",
+   "path": "samples/eh-dll",
+   "artifact": "target/release/eh_dll.dll",
+   "language": "C++ (cc + MSVC /EHsc, whole TU via keepalive reference)",
+   "opt": "/O1 equivalent",
+   "license": "GPL-3.0-or-later",
+   "functions": [
+    {
+     "name": "eh_throw_catch",
+     "kind": "named-export",
+     "semantics": "throw/catch inside packed code"
+    },
+    {
+     "name": "eh_unwind_across",
+     "kind": "named-export",
+     "semantics": "exception pops 3 packed frames"
+    },
+    {
+     "name": "sj_probe",
+     "kind": "named-export",
+     "semantics": "setjmp/longjmp"
+    },
+    {
+     "name": "vararg_sum",
+     "kind": "named-export",
+     "semantics": "va_arg"
+    },
+    {
+     "name": "struct_ret",
+     "kind": "named-export",
+     "semantics": "8-byte struct by value"
+    },
+    {
+     "name": "tail_call",
+     "kind": "named-export",
+     "semantics": "tail call"
+    }
+   ],
+   "role": "TASK-021 frozen matrix"
+  }
+ ],
+ "external_open_source": [],
+ "unsupported_today_keep": [
+  "ELF64 ET_DYN/ET_EXEC/.so (fail closed)",
+  "internal non-export functions",
+  "memory / call / rip-rel / SEH / unfused flags",
+  ">2 arguments and 64-bit MachineState",
+  "indirect call / jump table / recursion",
+  "float / vector / atomics / exceptions / TLS"
+ ],
+ "baseline": {
+  "recorded": "see tests/compat/manifest.json current",
+  "performance": {
+   "measured": "2026-09-08 (TASK-038, Windows host, Standard profile; see g8_perf_baseline.json)",
+   "app_geomean_std_ratio": 1.240,
+   "protected_call_p95_ratio": 2.068,
+   "size_worst_ratio": 4.444,
+   "size_note": "worst = 9.2KB license_toy (fixed ~31KB stub+core+envelope overhead); >=100KB samples ~2.0x",
+   "budgets": { "app_geomean": 2.0, "call_p95": 10.0, "size": 4.0 },
+   "verdicts": { "app_geomean_std": "PASS", "protected_call_p95": "PASS", "size_worst": "FAIL" }
+  }
+ },
+ "g4_semantics_frozen": {
+  "frozen_on": "2026-09-07",
+  "task": "TASK-020",
+  "differential": "plain-JIT hardware vs superop-emitted vs software oracle; bit-exact (crates/xenolith-pack/tests/semantics_diff.rs)",
+  "families": {
+   "sse_f32_scalar": {
+    "ops": [
+     "add",
+     "sub",
+     "mul",
+     "div",
+     "min",
+     "max",
+     "sqrt"
+    ],
+    "cases": 1960
+   },
+   "sse_f64_scalar": {
+    "ops": [
+     "add",
+     "sub",
+     "mul",
+     "div",
+     "min",
+     "max",
+     "sqrt"
+    ],
+    "cases": 1743
+   },
+   "x87_f80": {
+    "ops": [
+     "fadd",
+     "fsub",
+     "fmul",
+     "fdiv",
+     "fsqrt"
+    ],
+    "model": "software 80-bit incl. NaN payload-max selection rule",
+    "cases": 1245
+   },
+   "fcvt": {
+    "kinds": 12,
+    "cases": 660
+   },
+   "fcmp": {
+    "ops": [
+     "ucomiss",
+     "ucomisd"
+    ],
+    "cases": 513
+   },
+   "vec128": {
+    "ops": [
+     "paddd",
+     "psubd",
+     "pmullw",
+     "pmulhw",
+     "pmulld",
+     "pminsd",
+     "pmaxsd",
+     "pand",
+     "por",
+     "pxor",
+     "pcmpeqd",
+     "addps",
+     "mulps",
+     "addpd",
+     "pshufd",
+     "punpcklqdq"
+    ],
+    "cases": 768
+   },
+   "atomics": {
+    "ops": [
+     "lock cmpxchg 8/16/32/64",
+     "lock xadd 32/64",
+     "xchg 32/64"
+    ],
+    "cases": 512
+   }
+  },
+  "rejected_fail_closed": [
+   "AVX-512",
+   "TSX",
+   "YMM/AVX2-256 in IR (semantics module has V256; codegen is 128-bit this release)"
+  ],
+  "known_64bit_codegen_fix": "emit_mov reg-to-reg was 32-bit (truncated pointers); now 64-bit"
+ },
+ "g4_eh_matrix_frozen": {
+  "frozen_on": "2026-09-07",
+  "task": "TASK-021",
+  "samples": [
+   "samples/eh-dll (PE, cc+MSVC /EHsc)",
+   "samples/hello-elf/eh.cpp (ELF, WSL g++)"
+  ],
+  "exports": [
+   "eh_throw_catch",
+   "eh_unwind_across",
+   "sj_probe",
+   "vararg_sum",
+   "struct_ret",
+   "tail_call",
+   "with_callback(ELF)"
+  ],
+  "windows": "packed_eh_matrix: LoadLibrary + all exports; unwinder pops C++ frames via the RELOCATED .pdata (stub RUNTIME_FUNCTION appended, exception directory repointed)",
+  "linux": "packed_elf_eh_matrix: dlopen + all exports; _Unwind_Backtrace walks through the packed frame (7 frames) via intact .eh_frame; appended PT_GNU_EH_FRAME carries the stub CIE+FDE",
+  "fixes_landed": [
+   "scan_ifunc bounded by DT_STRTAB (false IFUNC positives on C++ objects)",
+   "UNWIND_CODE stored reverse-by-operation-group",
+   "FDE augmentation-length byte (CIE z)",
+   "eh_frame_hdr table points at FDE start"
+  ],
+  "known_limit": "RtlVirtualUnwind synthetic-context replay left to the real-exception proof; IFUNC/TLS-descriptor/versions still fail closed (TASK-022)"
+ },
+ "g4_features_frozen": {
+  "frozen_on": "2026-09-08",
+  "task": "TASK-022",
+  "sample": "samples/hello-elf/feat.c + feat.map (version script XLFEAT_1.0/2.0)",
+  "features": {
+   "ifunc": "ifunc_add via resolver (IRELATIVE + defined STT_GNU_IFUNC); resolver pages stay native plaintext (ld.so runs them before INIT_ARRAY)",
+   "symbol_versions": "feat_ver@XLFEAT_1.0 vs feat_ver@@XLFEAT_2.0 via dlvsym; DT_VERDEF/VERNEED preserved (only DT_INIT removed)",
+   "tls": "initial-exec (TPOFF64/GOTTPOFF into RW GOT) + local-dynamic (DTPMOD64/DTPREL64); PT_TLS kept"
+  },
+  "verification": "packed_elf_features: unpacked control + packed dlopen both FEAT MATRIX OK (ifunc=15 ver1=107 ver2=207 tls=18)",
+  "fail_closed": [
+   "imported IFUNC (shndx=0)",
+   "R_X86_64_TPOFF32 (local-exec text offset)",
+   "R_X86_64_TLSDESC",
+   "static linkage (no PT_DYNAMIC)"
+  ],
+  "blocked": "gcc -static sample unavailable in this WSL (no static libc); static rejection covered by unit tests only"
+ },
+ "g4_function_stats": {
+  "artifact": "tests/corpus/g4_function_stats.json",
+  "frozen_on": "2026-09-08",
+  "task": "TASK-023",
+  "corpus": "target/stats-corpus.c (Rust generator, 10 pattern families) → WSL gcc -O1 -fPIC -shared -fno-inline, symtab intact",
+  "measured": {
+   "boundary_uncertain": 0,
+   "bytes": 43627,
+   "corpus": "target/stats-corpus.c → WSL gcc -O1 -fPIC -shared -fno-inline",
+   "functions": 1440,
+   "generated_on": "2026-09-08",
+   "mixed_native": 1140,
+   "task": "TASK-023",
+   "top_reasons": [
+    {
+     "count": 455,
+     "reason": "vm-export unsupported Imul"
+    },
+    {
+     "count": 360,
+     "reason": "vm-export unsupported Call"
+    },
+    {
+     "count": 133,
+     "reason": "vm-export unsupported Lea"
+    },
+    {
+     "count": 120,
+     "reason": "vm-export unsupported Mulsd"
+    },
+    {
+     "count": 60,
+     "reason": "vm-export : jcc without fused cmp"
+    },
+    {
+     "count": 12,
+     "reason": "vm-export unsupported Shl"
+    }
+   ],
+   "transformed": 300,
+   "transformed_bytes": 5298,
+   "unsupported": 0
+  },
+  "classification": "transformed = full lift+superop; mixed_native = lift fails but ≥2 liftable instructions (mixed design candidate); unsupported = no liftable work; boundary_uncertain = lift window/cap limits",
+  "cli": "xenolith stats <elf> [--json]"
+ }
+}

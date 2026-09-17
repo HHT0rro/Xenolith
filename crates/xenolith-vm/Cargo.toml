@@ -1,0 +1,13 @@
+[package]
+name = "xenolith-vm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Stub key-mix VM and pack-internal IR for selected-export superoperators"
+
+[dependencies]
+xenolith-crypto.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+sha2.workspace = true
+iced-x86 = { workspace = true, features = ["code_asm", "decoder", "std"] }

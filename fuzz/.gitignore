@@ -1,0 +1,8 @@
+target
+corpus
+artifacts
+coverage
+crash-*
+slow-unit-*
+timeout-*
+oom-*

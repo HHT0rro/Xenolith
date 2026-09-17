@@ -1,0 +1,57 @@
+name: release
+
+# TASK-039: release bundles with SBOM, artifact hashes, provenance, and gate
+# evidence. No code signing exists (decision D2, 2026-09-08): integrity is
+# the manifest sha256 list. Manual dispatch only — never on push.
+
+on:
+  workflow_dispatch:
+    inputs:
+      label:
+        description: "Release label (e.g. v0.1.0-g8)"
+        required: true
+        type: string
+      allow_budget_fail:
+        description: "Publish an engineering build despite unmet TASK-038 budgets (recorded in the manifest)"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  bundle:
+    name: bundle (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build workspace and samples
+        run: |
+          cargo build -p xenolith-cli --release
+          cargo build -p hello-dll -p license-toy -p hello-exe -p eh-dll -p jni-host -p jni-rust --release
+      - name: Regression
+        env:
+          XL_SKIP_WSL_TESTS: ${{ matrix.os == 'windows-latest' && '1' || '0' }}
+        run: cargo test --workspace --exclude xenolith-runtime
+      - name: Assemble release bundle
+        run: >
+          ./target/release/xenolith release
+          --out dist
+          --label "${{ inputs.label }}-${{ runner.os }}"
+          ${{ inputs.allow_budget_fail && '--allow-budget-fail' || '' }}
+      - name: Manifest digest
+        shell: bash
+        run: |
+          if command -v sha256sum >/dev/null; then
+            sha256sum dist/manifest.json
+          else
+            powershell -Command "(Get-FileHash dist/manifest.json -Algorithm SHA256).Hash"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xenolith-${{ inputs.label }}-${{ runner.os }}
+          path: dist/
+          if-no-files-found: error

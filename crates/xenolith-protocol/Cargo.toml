@@ -1,0 +1,10 @@
+[package]
+name = "xenolith-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "EnvelopeV2 layout, AAD, and fail-closed parse for Xenolith"
+
+[dependencies]
+xenolith-crypto.workspace = true
+thiserror.workspace = true

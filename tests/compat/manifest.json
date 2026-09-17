@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "frozen_on": "2026-09-07",
+  "purpose": "G0 compatibility and product-capability freeze. Current pack() behavior is the baseline, not the production target.",
+  "current": {
+    "platforms_accepted": ["pe64-dll", "pe64-exe"],
+    "elf": "fail-closed",
+    "injected_runtime": "pic-stub+xl-core",
+    "host_emulator_injected": false,
+    "xenolith_runtime_injected": false,
+    "envelope": "XLV2 EnvelopeV2 ChaCha20-Poly1305",
+    "iat_mode_fast": "disk-import-directory",
+    "iat_mode_standard_max": "hashed-resolve-writeback-iat",
+    "runtime_decryption_window": false,
+    "c2_reencrypt": false,
+    "aslr": "preserved-when-present-on-input",
+    "high_entropy_va": "stripped",
+    "reloc_directory": "zeroed",
+    "tls_directory": "zeroed",
+    "import_directory_standard_max": "zeroed (RVA 0 on disk)",
+    "stub_section": "RX (no long-term RWX); meta briefly RW then RX",
+    "eval_ir": "Win64 two u32 (RCX/RDX) -> EAX",
+    "lift_max_bytes": 256,
+    "vm_selection": "named exports only",
+    "project_schema_keys": ["input", "output", "profile", "vm_exports", "trace_diverge"],
+    "g_wb_trace": "same eax required; stream hashes may be equal"
+  },
+  "os_load": {
+    "windows_loadlibrary": "required on Windows CI; missing sample or un-run child is fail",
+    "linux_host": "cfg(windows) tests are not executed; that is not a pass",
+    "xenolith_loader_emulator": "not OS truth"
+  },
+  "expected_named_tests": [
+    "packed_dll_loadlibrary_hello_add",
+    "packed_dll_vm_export_license_toy_trace_diverge",
+    "g_wb_meta_two_packs_not_one_opcode_table",
+    "elf_pack_fails_closed"
+  ],
+  "production_target_not_current": {
+    "platforms": ["pe64-dll", "pe64-exe", "elf64-pie-exec", "elf64-nonpie-exec", "elf64-so"],
+    "aslr": "preserved",
+    "wx": "no long-term RWX",
+    "runtime": "injectable no_std core + PIC boot bridge",
+    "aead": "ChaCha20-Poly1305 EnvelopeV2"
+  }
+}

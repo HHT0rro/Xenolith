@@ -1,0 +1,10 @@
+[package]
+name = "jni-rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "jni_rust"
+crate-type = ["cdylib"]

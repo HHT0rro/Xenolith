@@ -1,0 +1,16 @@
+[package]
+name = "xenolith-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Host-side loader semantics and stub machine-code emitter"
+
+[dependencies]
+xenolith-formats.workspace = true
+xenolith-crypto.workspace = true
+xenolith-protocol.workspace = true
+xenolith-vm.workspace = true
+xenolith-guard.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+sha2.workspace = true

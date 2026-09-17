@@ -1,0 +1,38 @@
+[package]
+name = "xenolith-pack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PE mutation and envelope writer"
+
+[dependencies]
+xenolith-formats.workspace = true
+xenolith-crypto.workspace = true
+xenolith-protocol.workspace = true
+xenolith-loader.workspace = true
+xenolith-guard.workspace = true
+xenolith-vm.workspace = true
+iced-x86 = { workspace = true, features = ["code_asm", "decoder", "instr_info", "std"] }
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+hex.workspace = true
+
+[build-dependencies]
+cc = "1.2"
+
+[dev-dependencies]
+xenolith-vm.workspace = true
+xenolith-formats.workspace = true
+xenolith-loader.workspace = true
+xenolith-protocol.workspace = true
+xenolith-crypto.workspace = true
+serde_json.workspace = true
+
+# TASK-038: G8 perf baseline vs release budgets. Passive under `cargo test`
+# (needs XL_PERF_RUN=1 or `cargo bench`); never slows the normal cycle.
+[[bench]]
+name = "g8_perf"
+harness = false

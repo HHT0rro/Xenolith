@@ -1,0 +1,161 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 3 * * *" # nightly: heavy jobs below (fuzz, soak)
+
+jobs:
+  test-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    env:
+      # ELF OS-load coverage runs natively in test-linux/test-debian; the
+      # hosted Windows images do not ship a WSL distribution.
+      XL_SKIP_WSL_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build sample binaries
+        run: |
+          cargo build -p hello-dll -p license-toy -p hello-exe -p eh-dll -p jni-host -p jni-rust --release
+      - name: Test
+        run: cargo test --workspace --exclude xenolith-runtime
+      - name: Build CLI, pack, inspect
+        run: |
+          cargo build -p xenolith-cli --release
+          ./target/release/xenolith pack ./target/release/hello_dll.dll -o ./target/release/hello_dll.xl.dll --profile max --json
+          ./target/release/xenolith inspect ./target/release/hello_dll.xl.dll --json | Tee-Object -FilePath ./target/release/hello_dll.xl.inspect.json
+          ./target/release/xenolith pack ./target/release/hello_dll.dll -o ./target/release/hello_dll.xl.b.dll --profile max --json
+      - name: Strength gates
+        shell: pwsh
+        run: |
+          ./scripts/ci-gates.ps1 `
+            -PackedA ./target/release/hello_dll.xl.dll `
+            -PackedB ./target/release/hello_dll.xl.b.dll `
+            -InspectJsonPath ./target/release/hello_dll.xl.inspect.json `
+            -Cli ./target/release/xenolith.exe `
+            -InputDll ./target/release/hello_dll.dll
+      - name: Bounded stress (TASK-037, 10 min)
+        run: $env:XL_STRESS_SECONDS='600'; cargo test -p xenolith-pack --test resilience -- --nocapture
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-reports
+          path: |
+            target/release/*.inspect.json
+          if-no-files-found: warn
+
+  # TASK-036: Linux leg. The packer itself builds and packs natively here
+  # (gcc ELF relocatable core + SysV stub bridge); the WSL-only steps in the
+  # Windows test suite are replaced by direct host execution.
+  test-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build workspace
+        run: cargo build -p xenolith-cli --release
+      - name: Unit tests and manifests
+        run: cargo test --workspace --exclude xenolith-runtime
+      - name: Build ELF samples (frozen corpus flags)
+        run: |
+          cd samples/hello-elf
+          gcc -fPIE -pie -o ../../target/hello-elf hello.c
+          gcc -fPIC -shared -o ../../target/libhello-elf.so hello.c
+      - name: Native pack + run (EXE, 3 ASLR bases)
+        run: |
+          ./target/release/xenolith pack target/hello-elf -o target/hello-elf.xl.elf --profile standard --json
+          chmod +x target/hello-elf.xl.elf
+          for i in 1 2 3; do
+            out=$(./target/hello-elf.xl.elf)
+            echo "run $i: $out"
+            [ "$out" = "xenolith-hello-elf" ] || exit 1
+          done
+      - name: Native pack + dlopen (SO)
+        run: |
+          ./target/release/xenolith pack target/libhello-elf.so -o target/libhello-elf.xl.so --profile standard --json
+          cp target/libhello-elf.xl.so /tmp/xl-hello.so
+          python3 -c "import ctypes; l=ctypes.CDLL('/tmp/xl-hello.so'); print('DLOPEN OK'); del l; print('DLCLOSE OK')"
+      - name: Inspect reports
+        run: |
+          ./target/release/xenolith inspect target/hello-elf.xl.elf --json | tee target/hello-elf.xl.inspect.json
+          ./target/release/xenolith inspect target/libhello-elf.xl.so --json | tee target/libhello-elf.xl.so.inspect.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-reports-${{ matrix.os }}
+          path: |
+            target/*.inspect.json
+          if-no-files-found: warn
+
+  test-debian:
+    runs-on: ubuntu-24.04
+    container: debian:12
+    steps:
+      - name: Install build prerequisites
+        run: |
+          apt-get update
+          apt-get install -y build-essential ca-certificates curl git python3
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build workspace
+        run: cargo build -p xenolith-cli --release
+      - name: Unit tests and manifests
+        run: cargo test --workspace --exclude xenolith-runtime
+      - name: Build ELF samples
+        run: |
+          cd samples/hello-elf
+          gcc -fPIE -pie -o ../../target/hello-elf hello.c
+          gcc -fPIC -shared -o ../../target/libhello-elf.so hello.c
+      - name: Native pack + load
+        run: |
+          ./target/release/xenolith pack target/hello-elf -o target/hello-elf.xl.elf --profile standard --json
+          chmod +x target/hello-elf.xl.elf
+          [ "$(./target/hello-elf.xl.elf)" = "xenolith-hello-elf" ]
+          ./target/release/xenolith pack target/libhello-elf.so -o target/libhello-elf.xl.so --profile standard --json
+          cp target/libhello-elf.xl.so /tmp/xl-hello.so
+          python3 -c "import ctypes; l=ctypes.CDLL('/tmp/xl-hello.so'); del l"
+
+  # TASK-037 continuous fuzzing. Bounded per-target runs on the schedule
+  # trigger only (never on PRs); crashes upload as artifacts and their
+  # minimized fixtures belong in fuzz/fixtures.
+  fuzz:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Replay committed fixtures
+        run: |
+          for t in pe_parse elf_parse envelope_parse inspect_bytes; do
+            if compgen -G "fuzz/fixtures/$t/*" > /dev/null; then
+              for f in fuzz/fixtures/$t/*; do
+                cargo fuzz run $t "$f" -- -runs=1 -detect_leaks=0 || exit 1
+              done
+            fi
+          done
+      - name: Fuzz (10 min per target)
+        run: |
+          for t in pe_parse elf_parse envelope_parse inspect_bytes; do
+            cargo fuzz run $t -- -max_total_time=600 -timeout=5 -rss_limit_mb=2560 -detect_leaks=0 || exit 1
+          done
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-crashes
+          path: fuzz/artifacts/
+          if-no-files-found: warn
+
+  # TASK-037 stable contract: the Windows matrix owns the 10-minute bounded
+  # stress run. No self-hosted runner is required by this release.

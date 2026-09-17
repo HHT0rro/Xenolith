@@ -1,0 +1,67 @@
+{
+  "schema": 1,
+  "updated": "2026-09-16",
+  "labels": {
+    "release_level": "user-mode",
+    "kernel_assisted": "absent (G7 out of scope for this release)",
+    "signing": "none (decision D2 2026-09-08); integrity = manifest sha256 list"
+  },
+  "gates": {
+    "G0": {
+      "status": "passed",
+      "date": "2026-09-07",
+      "evidence": "docs baseline + corpus/compat freeze; plan/architecture-cross-platform-protection-v1.md"
+    },
+    "G1": {
+      "status": "passed",
+      "date": "2026-09-07",
+      "evidence": "EnvelopeV2 XLV2 + ChaCha20-Poly1305; host/runtime/golden agreement; commit 8d227d3 ancestry"
+    },
+    "G2": {
+      "status": "passed",
+      "date": "2026-09-07",
+      "evidence": "MachineState eval 10^6 diff; lift_function/rewrite_function; 29-test vm suite"
+    },
+    "G3": {
+      "status": "passed",
+      "date": "2026-09-07",
+      "evidence": "PE EXE/DLL + ELF EXE/SO OS-load, ASLR/PIE preserved (packed_exe_prints_hello, packed_elf_prints_hello)"
+    },
+    "G4": {
+      "status": "passed",
+      "date": "2026-09-08",
+      "evidence": "semantics three-way 7401 bit-exact; EH/TLS/IFUNC matrices; 1440-function four-bucket stats (g4_function_stats.json); matrix-out fail-closed recorded"
+    },
+    "G5": {
+      "status": "passed",
+      "date": "2026-09-08",
+      "evidence": "lazy residency matrix + 10k load/unload + EH across dormant regions (PE); ELF lazy/signal paths out-of-matrix, recorded"
+    },
+    "G6": {
+      "status": "removed",
+      "date": "2026-09-08",
+      "evidence": "operational decision recorded in the authoritative plan Phase 7 note"
+    },
+    "G7": {
+      "status": "out-of-scope",
+      "date": "2026-09-15",
+      "evidence": "operator decision: G7 is not part of the user-mode release. No WDK KMDF build, disposable VM, EV cert/Partner Center, or distro hosts in this cycle. No kernel-assisted capability may be claimed."
+    },
+    "G8": {
+      "status": "closed-usermode",
+      "date": "2026-09-16",
+      "evidence": "GitHub CI run 35001270269 green on windows-2022/2025, ubuntu-22.04/24.04 and debian:12; release workflow 35005123915 green on Windows and Linux; v1.0.0-rc.2 pre-release published (commit 99beaeec7d8ba0487371aef2cb6da3b0a17939b2, dirty=false, override=false); perf tests/corpus/g8_perf_baseline.json PASS on all three budgets (app 0.988x, p95 1.013x, size 3.833x on the 9.2KB toy); 10-minute bounded stress is the stable gate. Windows jobs cover PE and skip WSL-only ELF cases; the Linux/Debian jobs execute ELF natively."
+    }
+  },
+  "fuzzing": {
+    "targets": ["pe_parse", "elf_parse", "envelope_parse", "inspect_bytes"],
+    "first_smoke": "2026-09-08: >9.3M executions, 7 input-safety defects found and fixed, fixtures replay clean",
+    "continuous": "scheduled workflow; Windows host blocked for cargo-fuzz (no MSVC ASan runtime), runs on Linux"
+  },
+  "stress": {
+    "harness": "crates/xenolith-pack/tests/resilience.rs",
+    "bounded_evidence": "tests/corpus/stress-900s.json",
+    "stable_gate": "10-minute bounded concurrent stress on the Windows matrix (approved 2026-09-15 contract)",
+    "long_run": "diagnostic only; not part of the stable claim"
+  }
+}

@@ -1,0 +1,60 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/xenolith-cli",
+    "crates/xenolith-formats",
+    "crates/xenolith-crypto",
+    "crates/xenolith-protocol",
+    "crates/xenolith-pack",
+    "crates/xenolith-vm",
+    "crates/xenolith-loader",
+    "crates/xenolith-runtime",
+    "crates/xenolith-guard",
+    "samples/hello-dll",
+    "samples/hello-exe",
+    "samples/eh-dll",
+    "samples/license-toy",
+    "samples/jni-host",
+    "samples/jni-rust",
+]
+# cargo-fuzz builds its own crate outside the workspace toolchain.
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["Xenolith contributors"]
+repository = "https://github.com/HHT0rro/Xenolith"
+description = "Open-source native packer for Windows x86_64 PE DLL/EXE"
+
+[workspace.dependencies]
+xenolith-formats = { path = "crates/xenolith-formats" }
+xenolith-crypto = { path = "crates/xenolith-crypto" }
+xenolith-protocol = { path = "crates/xenolith-protocol" }
+xenolith-pack = { path = "crates/xenolith-pack" }
+xenolith-vm = { path = "crates/xenolith-vm" }
+xenolith-loader = { path = "crates/xenolith-loader" }
+xenolith-runtime = { path = "crates/xenolith-runtime" }
+xenolith-guard = { path = "crates/xenolith-guard" }
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+chacha20 = { version = "0.9", default-features = false, features = ["std"] }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+sha2 = "0.10"
+hmac = "0.12"
+hkdf = "0.12"
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+iced-x86 = "1.21"
+rand = "0.8"
+hex = "0.4"
+
+[profile.release]
+debug = 0
+lto = false
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

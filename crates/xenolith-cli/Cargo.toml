@@ -1,0 +1,22 @@
+[package]
+name = "xenolith-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Xenolith command line"
+
+[[bin]]
+name = "xenolith"
+path = "src/main.rs"
+
+[dependencies]
+xenolith-pack.workspace = true
+xenolith-formats.workspace = true
+xenolith-loader.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["windows"] }

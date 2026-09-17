@@ -1,0 +1,44 @@
+[package]
+name = "xenolith-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+xenolith-formats = { path = "../crates/xenolith-formats" }
+xenolith-protocol = { path = "../crates/xenolith-protocol" }
+xenolith-loader = { path = "../crates/xenolith-loader" }
+xenolith-pack = { path = "../crates/xenolith-pack" }
+
+[[bin]]
+name = "pe_parse"
+path = "fuzz_targets/pe_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "elf_parse"
+path = "fuzz_targets/elf_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "envelope_parse"
+path = "fuzz_targets/envelope_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inspect_bytes"
+path = "fuzz_targets/inspect_bytes.rs"
+test = false
+doc = false
+bench = false

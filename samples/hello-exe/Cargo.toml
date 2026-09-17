@@ -1,0 +1,10 @@
+[package]
+name = "hello-exe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "hello-exe"
+path = "src/main.rs"

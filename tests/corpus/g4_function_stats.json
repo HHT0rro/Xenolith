@@ -1,0 +1,34 @@
+{
+  "boundary_uncertain": 0,
+  "bytes": 43627,
+  "corpus": "target/stats-corpus.c → WSL gcc -O1 -fPIC -shared -fno-inline",
+  "functions": 1440,
+  "generated_on": "2026-09-08",
+  "mixed_native": 1140,
+  "task": "TASK-023",
+  "top_reasons": [
+    {
+      "count": 467,
+      "reason": "vm-export : unfused flags"
+    },
+    {
+      "count": 360,
+      "reason": "vm-export unsupported Call"
+    },
+    {
+      "count": 133,
+      "reason": "vm-export unsupported Lea"
+    },
+    {
+      "count": 120,
+      "reason": "vm-export unsupported Mulsd"
+    },
+    {
+      "count": 60,
+      "reason": "vm-export : jcc without fused cmp"
+    }
+  ],
+  "transformed": 300,
+  "transformed_bytes": 5298,
+  "unsupported": 0
+}

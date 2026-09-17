@@ -1,0 +1,13 @@
+XLFEAT_1.0 {
+    global:
+        feat_ver;
+        ifunc_add;
+        tls_bump;
+        tls_get;
+        feat_all;
+    local: *;
+};
+XLFEAT_2.0 {
+    global:
+        feat_ver;
+} XLFEAT_1.0;
