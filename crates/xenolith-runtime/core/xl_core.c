@@ -389,8 +389,15 @@ static void import_aad(uint8_t aad[32], uint8_t platform, uint32_t flags,
     aad[20] = (uint8_t)index; aad[21] = (uint8_t)(index >> 8); aad[22] = (uint8_t)(index >> 16); aad[23] = (uint8_t)(index >> 24);
 }
 
+/* AAD for a sealed page region. reloc_bytes MUST mirror the host
+ * (xenolith_protocol::region_aad): the packer authenticates the reloc-table
+ * byte length in the tail dword. Mismatching it made every AEAD open fail
+ * for images whose envelope carries at least one reloc record (the silent
+ * ASLR boot failure — envelope seals with relocs*8, an older core opened
+ * with 0). Callers pass the value parsed from the same envelope. */
 static void region_aad(uint8_t aad[32], uint8_t platform, uint8_t profile, uint32_t flags,
-                       uint32_t index, uint32_t rva, uint32_t len, uint32_t policy) {
+                       uint32_t index, uint32_t rva, uint32_t len, uint32_t policy,
+                       uint32_t reloc_bytes) {
     xl_zero(aad, 32);
     aad[0] = 'X'; aad[1] = 'L'; aad[2] = 'V'; aad[3] = '2';
     aad[4] = 2; aad[5] = 0;
@@ -401,24 +408,122 @@ static void region_aad(uint8_t aad[32], uint8_t platform, uint8_t profile, uint3
     aad[16] = (uint8_t)rva; aad[17] = (uint8_t)(rva >> 8); aad[18] = (uint8_t)(rva >> 16); aad[19] = (uint8_t)(rva >> 24);
     aad[20] = (uint8_t)len; aad[21] = (uint8_t)(len >> 8); aad[22] = (uint8_t)(len >> 16); aad[23] = (uint8_t)(len >> 24);
     aad[24] = (uint8_t)policy; aad[25] = (uint8_t)(policy >> 8); aad[26] = (uint8_t)(policy >> 16); aad[27] = (uint8_t)(policy >> 24);
+    aad[28] = (uint8_t)reloc_bytes; aad[29] = (uint8_t)(reloc_bytes >> 8);
+    aad[30] = (uint8_t)(reloc_bytes >> 16); aad[31] = (uint8_t)(reloc_bytes >> 24);
 }
 
-static uint64_t pe_image_base(const uint8_t *base) {
-    uint32_t lfanew = rd32(base + 0x3c);
-    const uint8_t *opt = base + lfanew + 24;
-    return (uint64_t)rd32(opt + 24) | ((uint64_t)rd32(opt + 28) << 32);
+/* Reloc-table byte length as the packer puts it in the region AAD tail
+ * (reloc count * 8), and — before any page is decrypted — the ASLR delta
+ * recovered from the loader's own fixups.
+ *
+ * The in-memory OptionalHeader.ImageBase CANNOT serve as the preferred base:
+ * the loader rewrites that very field to the actual base while relocating
+ * (measured: a stock ASLR xz.exe shows ImageBase == actual at its entry
+ * breakpoint). Deriving delta from it yields 0, and every DIR64 slot on a
+ * decrypted page then stays UNRELOCATED — the silent delta!=0 crash.
+ *
+ * The delta instead comes from the packer's own disk invariant: every
+ * protected page body is filled with 0xCC, and the loader applies each
+ * recorded fixup to those bytes BEFORE the stub decrypts. A recorded slot
+ * read now holds 0xCCCCCCCCCCCCCCCC + delta (wrapping); all recorded slots
+ * must agree on one delta, otherwise the envelope does not describe this
+ * image and boot fails closed. With no records there is nothing to fix up
+ * and delta stays 0. */
+static int xl_reloc_scan(const uint8_t *env, uint32_t env_len,
+                         const uint8_t *image_base, int read_delta,
+                         uint32_t *reloc_bytes_out, uint64_t *delta_out) {
+    uint32_t region_count, cur, i;
+    uint64_t delta = 0;
+    int have_delta = 0;
+    if (env_len < 16 + 96 + 16 + 16 + 8 + 2) return 0;
+    region_count = rd32(env + 12);
+    /* Walk-only: no 64-slot state table here, so the count is bounded by the
+     * envelope length checks inside the loop, not by XlRegionTable's size.
+     * (A 64 cap here failed every image with more than 64 pages — openssl,
+     * cargo.) */
+    if (region_count > 0xffffu) return 0;
+    cur = 16;
+    cur += 96;                 /* mba */
+    cur += 16;                 /* opcode seed */
+    cur += 16;                 /* api salt */
+    cur += 8;                  /* opcode map */
+    cur += 2 + rd16(env + cur); /* stolen */
+    cur += 4;                  /* program length */
+    if (cur > env_len) return 0;
+    cur += rd32(env + cur - 4); /* program bytes */
+    cur += 4;                  /* policy */
+    for (i = 0; i < region_count; i++) {
+        uint32_t ct_len;
+        if (cur + 4 + 4 + 4 + 12 + 4 > env_len) return 0;
+        cur += 4 + 4 + 4 + 12;
+        ct_len = rd32(env + cur); cur += 4;
+        if (ct_len > 4096 || cur + ct_len + 16 > env_len) return 0;
+        cur += ct_len + 16;
+    }
+    if (cur + 4 > env_len) return 0;
+    {
+        uint32_t n = rd32(env + cur); cur += 4;
+        uint32_t imp_sealed = rd32(env + 8) & 0x2u;
+        if (n > 0xffffu) return 0;
+        for (i = 0; i < n; i++) {
+            uint32_t name_len, dll_len, payload;
+            if (cur + 32 + 4 + 2 + 2 > env_len) return 0;
+            cur += 32 + 4;
+            name_len = rd16(env + cur); cur += 2;
+            dll_len = rd16(env + cur); cur += 2;
+            payload = name_len + dll_len;
+            if (imp_sealed) payload += 12 + 16;
+            if (cur + payload > env_len) return 0;
+            cur += payload;
+        }
+    }
+    if (cur + 4 > env_len) return 0;
+    {
+        /* skip the keep list */
+        uint32_t n = rd32(env + cur); cur += 4;
+        if (n > 0xffffu || cur + n * 4 > env_len) return 0;
+        cur += n * 4;
+    }
+    if (cur + 4 > env_len) return 0;
+    {
+        uint32_t n = rd32(env + cur); cur += 4;
+        if (n > 0xffffu || cur + n * 8 > env_len) return 0;
+        *reloc_bytes_out = n * 8u;
+        for (i = 0; i < n; i++) {
+            uint32_t rva = rd32(env + cur + i * 8);
+            uint16_t kind = rd16(env + cur + i * 8 + 4);
+            if (read_delta && kind == 10) {
+                uint64_t v = 0;
+                int k;
+                for (k = 0; k < 8; k++)
+                    v |= ((uint64_t)image_base[rva + k]) << (8 * k);
+                v -= 0xCCCCCCCCCCCCCCCCull; /* disk filler + delta */
+                if (have_delta && v != delta) return 0;
+                delta = v;
+                have_delta = 1;
+            }
+        }
+        cur += n * 8;
+    }
+    *delta_out = delta;
+    return 1;
 }
 
-static int apply_dir64(XlHostCtx *ctx, const uint8_t *env, uint32_t env_len, uint32_t *curp) {
+/* The in-memory OptionalHeader.ImageBase is NOT usable as the preferred
+ * base (the loader rewrites it to the actual base while relocating), so
+ * no PE header parse survives here — delta comes from xl_reloc_scan. */
+
+/* Re-apply the loader's DIR64 fixups to slots inside decrypted pages.
+ * `delta` arrives from xl_reloc_scan (computed BEFORE decryption, from the
+ * loader-fixed 0xCC page filler) — the in-memory ImageBase field is already
+ * the actual base at this point, so it cannot yield the delta. */
+static int apply_dir64(XlHostCtx *ctx, const uint8_t *env, uint32_t env_len, uint32_t *curp,
+                       uint64_t delta) {
     uint32_t cur = *curp;
     uint32_t n, i;
-    uint64_t preferred;
-    uint64_t delta;
     if (cur + 4 > env_len) return 0;
     n = rd32(env + cur);
     cur += 4;
-    preferred = pe_image_base(ctx->image_base);
-    delta = (uint64_t)(uintptr_t)ctx->image_base - preferred;
     for (i = 0; i < n; i++) {
         uint32_t rva;
         uint16_t kind;
@@ -468,6 +573,9 @@ typedef struct XlRegionState {
 typedef struct XlRegionTable {
     XlRegionState st[64];
     uint32_t count;
+    /* Reloc-table byte length for the region AAD tail (must match the
+     * packer's xenolith_protocol::region_aad). */
+    uint32_t reloc_bytes;
     uint8_t secret[32];
     uint8_t runtime[32];
     uint8_t ok;
@@ -584,6 +692,9 @@ static int xl_build_region_table(XlHostCtx *ctx, XlRegionTable *rt) {
         uint32_t n = rd32(env + cur); cur += 4;
         if (cur + n * 8 > env_len) return 0;
         cur += n * 8;
+        rt->reloc_bytes = n * 8u;
+    } else {
+        rt->reloc_bytes = 0;
     }
     /* lazy table */
     if (cur + 4 <= env_len) {
@@ -618,7 +729,7 @@ static int xl_region_open(XlHostCtx *ctx, XlRegionTable *rt, uint32_t i) {
     uint32_t index = rd32(env + rec);
     uint8_t *dst = ctx->image_base + rva;
     uint32_t old = 0;
-    region_aad(aad, platform, profile, flags, index, rva, len, policy);
+    region_aad(aad, platform, profile, flags, index, rva, len, policy, rt->reloc_bytes);
     if (!vp(ctx, dst, len, XL_PAGE_RW, &old)) return 0;
     if (!aead_open(rt->runtime, nonce, aad, 32, ct, ct_len, tag, dst)) return 0;
     if (!vp(ctx, dst, len, XL_PAGE_RX, &old)) return 0;
@@ -644,7 +755,7 @@ static int xl_region_seal(XlHostCtx *ctx, XlRegionTable *rt, uint32_t i) {
     uint8_t ct[4096];
     uint8_t tag[16];
     uint32_t old = 0, k;
-    region_aad(aad, platform, profile, flags, index, rva, len, policy);
+    region_aad(aad, platform, profile, flags, index, rva, len, policy, rt->reloc_bytes);
     if (!vp(ctx, page, len, XL_PAGE_RW, &old)) return 0;
     aead_seal(rt->runtime, nonce, aad, 32, page, len, ct, tag);
     for (k = 0; k < len; k++) {
@@ -790,6 +901,8 @@ int xl_core_activate(XlHostCtx *ctx) {
     const uint8_t *mba;
     uint32_t cur;
     uint32_t stolen_len, prog_len;
+    uint32_t reloc_bytes;
+    uint64_t delta;
     const uint8_t *stolen;
     uint8_t secret[32], runtime[32];
     uint32_t i;
@@ -826,6 +939,17 @@ int xl_core_activate(XlHostCtx *ctx) {
     if (!reconstruct_mba(mba, secret)) return 0;
     mix_key(secret, ctx->measurement, runtime);
 
+    /* The region AAD must carry the reloc-table byte length exactly like the
+     * packer's seal (record count * 8 in the tail dword) — without it every
+     * open fails for envelopes that carry at least one reloc record. The
+     * same bounded pre-scan also recovers the ASLR delta from the loader's
+     * fixups over the 0xCC page filler, and it MUST run before the decrypt
+     * loop below overwrites those slots with their unrelocated plaintext. */
+    if (!xl_reloc_scan(env, env_len, ctx->image_base, platform != 1,
+                       &reloc_bytes, &delta)) {
+        return 0;
+    }
+
     if (gate >= 2) {
         for (i = 0; i < region_count; i++) {
             uint32_t index, rva, len, ct_len;
@@ -842,7 +966,7 @@ int xl_core_activate(XlHostCtx *ctx) {
             if (ct_len > 4096 || len > 4096 || cur + ct_len + 16 > env_len) return 0;
             ct = env + cur; cur += ct_len;
             tag = env + cur; cur += 16;
-            region_aad(aad, platform, profile, flags, index, rva, len, policy);
+            region_aad(aad, platform, profile, flags, index, rva, len, policy, reloc_bytes);
             if (len > ct_len) return 0;
             {
                 uint8_t *dst = ctx->image_base + rva;
@@ -924,14 +1048,36 @@ int xl_core_activate(XlHostCtx *ctx) {
                 xl_copy((uint8_t *)name, env + cur, name_len); cur += name_len;
                 xl_copy((uint8_t *)dll, env + cur, dll_len); cur += dll_len;
             }
-            /* TLS callbacks run under the loader lock. LoadLibraryA is unsafe
-             * there; keep the disk import directory and skip writeback. */
             if (!ctx->load_library || !ctx->get_proc) {
                 continue;
             }
+
             mod = ctx->load_library(dll);
             if (!mod) return 0;
-            fn = ctx->get_proc(mod, name);
+            /* Ordinal imports arrive under the reserved display name
+             * "#<decimal ordinal>" (packer convention; see docs/SUPPORT.md).
+             * GetProcAddress reads a name pointer below 0x10000 as an
+             * ordinal — the MAKEINTRESOURCE channel — so "#42" binds
+             * GetProcAddress(mod, (LPCSTR)42). A name that merely starts
+             * with '#' but is not fully numeric binds by name and fails
+             * closed below like any other unresolved import. */
+            {
+                int is_ordinal = 0;
+                uint32_t ord = 0;
+                if (name[0] == '#') {
+                    const char *p = name + 1;
+                    uint32_t digits = 0;
+                    while (*p >= '0' && *p <= '9') {
+                        ord = ord * 10u + (uint32_t)(*p - '0');
+                        digits++;
+                        p++;
+                    }
+                    if (digits > 0 && *p == '\0') is_ordinal = 1;
+                }
+                fn = is_ordinal
+                    ? ctx->get_proc(mod, (const char *)(uintptr_t)ord)
+                    : ctx->get_proc(mod, name);
+            }
             if (!fn) return 0;
             slot = ctx->image_base + iat_rva;
             if (!vp(ctx, slot, 8, XL_PAGE_RW, &old)) return 0;
@@ -957,7 +1103,7 @@ int xl_core_activate(XlHostCtx *ctx) {
             cur += 4;
             if (cur + n * 8 > env_len) return 0;
             cur += n * 8;
-        } else if (!apply_dir64(ctx, env, env_len, &cur)) {
+        } else if (!apply_dir64(ctx, env, env_len, &cur, delta)) {
             return 0;
         }
     }

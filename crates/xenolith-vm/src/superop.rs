@@ -251,6 +251,7 @@ fn alloc_map(seed: &[u8; 16], block: u32, live: &[bool; VREG_COUNT]) -> Result<[
     taken[VREG_RSP as usize] = true;
     let mut map = [0u8; VREG_COUNT];
     let mut k = 0usize;
+    let live_count = live.iter().filter(|&&l| l).count();
     for v in 0..VREG_COUNT {
         if v as u8 == VREG_RSP {
             map[v] = VREG_RSP;
@@ -262,7 +263,13 @@ fn alloc_map(seed: &[u8; 16], block: u32, live: &[bool; VREG_COUNT]) -> Result<[
         }
         loop {
             if k >= pool.len() {
-                return Err("superop: not enough physical registers (no spill)".into());
+                return Err(format!(
+                    "superop: not enough physical registers in block {block} (no spill \
+                     allowed): {live_count} live vregs but the pool holds {} registers — \
+                     this happens when a function touches many guest GPRs at once; keep \
+                     the function native or split it",
+                    pool.len()
+                ));
             }
             let p = pool[k];
             k += 1;
@@ -1385,6 +1392,55 @@ fn freq(m: &[String]) -> std::collections::BTreeMap<String, usize> {
 mod tests {
     use super::*;
     use crate::ir::{eval_ir, hello_add_ir, license_toy_ir, license_toy_oracle};
+
+    /// A block touching more guest GPRs than the 11-register pool must fail
+    /// closed with the block index, live count and pool size in the error.
+    #[test]
+    fn register_pool_exhaustion_names_block_and_pool() {
+        // rax/rcx/rdx are forced live by used_vregs; chain nine more distinct
+        // non-RSP GPRs (rbx, rbp, rsi..r12) so twelve live vregs contend for
+        // the 11-entry pool.
+        let mut chained = vec![Stmt::Mov {
+            dst: 3,
+            src: Src::Imm(1),
+        }];
+        let mut prev = 3u8;
+        for r in [5u8, 6, 7, 8, 9, 10, 11, 12] {
+            chained.push(Stmt::Bin {
+                op: crate::ir::BinOp::Add,
+                dst: r,
+                lhs: Src::Reg(prev),
+                rhs: Src::Reg(3),
+            });
+            prev = r;
+        }
+        chained.push(Stmt::Bin {
+            op: crate::ir::BinOp::Add,
+            dst: 13,
+            lhs: Src::Reg(prev),
+            rhs: Src::Reg(3),
+        });
+        for r in [3u8, 5, 6, 7, 8, 9, 10, 11, 12, 13] {
+            chained.push(Stmt::Bin {
+                op: crate::ir::BinOp::Or,
+                dst: crate::ir::VREG_RAX,
+                lhs: Src::Reg(crate::ir::VREG_RAX),
+                rhs: Src::Reg(r),
+            });
+        }
+        let m = crate::ir::IrModule {
+            entry: 0,
+            blocks: vec![crate::ir::IrBlock {
+                stmts: chained,
+                term: crate::ir::Term::Ret,
+            }],
+        };
+        let live = used_vregs(&m);
+        assert!(live.iter().filter(|&&l| l).count() >= 12, "probe needs ≥12 live");
+        let err = emit_superop(&m, &[5; 16]).unwrap_err();
+        assert!(err.contains("not enough physical registers"), "{err}");
+        assert!(err.contains("pool holds"), "{err}");
+    }
 
     #[test]
     fn superop_bytes_are_seed_divergent() {

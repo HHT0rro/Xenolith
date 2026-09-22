@@ -16,6 +16,28 @@ pub const META_ENVELOPE_LEN: usize = 4;
 pub const META_ORIGINAL_ENTRY: usize = 8;
 pub const META_UNPACKED: usize = 12;
 pub const META_MEASUREMENT: usize = 16;
+
+/// Failure phases for the fail-closed exit (PE `l_fail`). Every jump site
+/// loads its phase into r11d right before branching (a `mov` cannot disturb
+/// the flags that selected the branch, and r11 is dead on the fall-through).
+/// At `l_fail` the stub branches on IMAGE_FILE_DLL: a DLL returns 0 (FALSE —
+/// a nonzero DllMain return would present a failed boot to the loader as init
+/// success, i.e. fail-open); an EXE exits with the phase so a dead `rc=0, no
+/// output` becomes a diagnosable code. Table mirrored in docs/SUPPORT.md.
+pub const STAGE_UNKNOWN: u32 = 0;
+pub const STAGE_MAGIC: u32 = 1; // envelope signature mismatch
+pub const STAGE_KERNEL32: u32 = 2; // PEB walk found no kernel32
+pub const STAGE_EXPORT_DIR: u32 = 3; // kernel32 export directory unusable
+pub const STAGE_APIS: u32 = 4; // GetProcAddress/LoadLibraryA/VirtualProtect unresolved
+pub const STAGE_DEBUGGER: u32 = 5; // an anti-debug probe fired
+pub const STAGE_CORE: u32 = 6; // xl_core_activate failed (AEAD open, imports, relocs)
+pub const STAGE_NO_CORE: u32 = 7; // stub emitted without a core image
+pub const STAGE_OPCODE: u32 = 8; // unknown VM opcode (legacy no-core path)
+pub const STAGE_DIGEST: u32 = 9; // page digest mismatch (tamper; legacy path)
+pub const STAGE_PROTECT: u32 = 10; // VirtualProtect failed
+pub const STAGE_RESOLVE: u32 = 11; // LoadLibraryA/GetProcAddress failed on an import
+pub const STAGE_PE: u32 = 12; // no PE signature at the image base
+pub const STAGE_DLL_STATE: u32 = 13; // DLL attach state not process-attach
 /// Original first TLS callback RVA; 0 if the image has no TLS callbacks.
 pub const META_TLS_CALLBACK: usize = 64;
 
@@ -149,6 +171,8 @@ fn emit_inner_g5(
     let mut l_do_unpack = a.create_label();
     let mut l_have_base = a.create_label();
     let mut l_fail = a.create_label();
+    let mut l_fail_exe = a.create_label();
+    let mut l_fail_stage = a.create_label();
     let mut l_mod_loop = a.create_label();
     let mut l_hash_loop = a.create_label();
     let mut l_hash_keep = a.create_label();
@@ -328,6 +352,7 @@ fn emit_inner_g5(
         a.je(l_do_unpack)?;
         a.cmp(dword_ptr(rbx + META_UNPACKED as i32), 1)?;
         a.je(l_detach_quiesce)?;
+        a.mov(r11d, STAGE_DLL_STATE)?;
         a.jmp(l_fail)?;
     } else {
         a.jmp(l_do_unpack)?;
@@ -338,6 +363,7 @@ fn emit_inner_g5(
     a.cmp(dword_ptr(r15 + rax), 0x0000_4550u32)?; // 'PE\0\0'
     a.je(l_have_base)?;
     if is_dll {
+        a.mov(r11d, STAGE_PE)?;
         a.jmp(l_fail)?;
     } else {
         a.db(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00])?;
@@ -348,6 +374,7 @@ fn emit_inner_g5(
     a.mov(eax, dword_ptr(rbx + META_PAYLOAD_RVA as i32))?;
     a.lea(r14, ptr(r15 + rax))?;
     a.cmp(dword_ptr(r14), 0x3256_4C58u32)?; // 'XLV2'
+    a.mov(r11d, STAGE_MAGIC)?;
     a.jne(l_fail)?;
     // Spill the envelope pointer: the export walk needs its registers.
     a.mov(qword_ptr(rsp + 0xE0), r14)?;
@@ -371,6 +398,7 @@ fn emit_inner_g5(
 
     a.set_label(&mut l_mod_loop)?;
     a.cmp(r13, r12)?;
+    a.mov(r11d, STAGE_KERNEL32)?;
     a.je(l_fail)?;
     a.mov(rsi, qword_ptr(r13 + 0x60))?; // BaseDllName.Buffer
     a.movzx(ecx, word_ptr(r13 + 0x58))?; // BaseDllName.Length (bytes)
@@ -415,10 +443,12 @@ fn emit_inner_g5(
     a.mov(eax, dword_ptr(r12 + 0x3C))?;
     a.mov(eax, dword_ptr(r12 + rax + 0x88))?; // export dir RVA
     a.test(eax, eax)?;
+    a.mov(r11d, STAGE_EXPORT_DIR)?;
     a.jz(l_fail)?;
     a.lea(r13, ptr(r12 + rax))?;
     a.mov(r8d, dword_ptr(r13 + 24))?; // NumberOfNames
     a.test(r8d, r8d)?;
+    a.mov(r11d, STAGE_EXPORT_DIR)?;
     a.jz(l_fail)?;
     a.mov(esi, dword_ptr(r13 + 32))?; // AddressOfNames
     a.mov(edi, dword_ptr(r13 + 36))?; // AddressOfNameOrdinals
@@ -488,10 +518,13 @@ fn emit_inner_g5(
     a.set_label(&mut l_apis_chk)?;
     a.mov(r14, qword_ptr(rsp + 0xE0))?; // restore envelope pointer
     a.cmp(qword_ptr(rsp + 0x38), 0)?;
+    a.mov(r11d, STAGE_APIS)?;
     a.je(l_fail)?;
     a.cmp(qword_ptr(rsp + 0x40), 0)?;
+    a.mov(r11d, STAGE_APIS)?;
     a.je(l_fail)?;
     a.cmp(qword_ptr(rsp + 0x48), 0)?;
+    a.mov(r11d, STAGE_APIS)?;
     a.je(l_fail)?;
     // G5: AddVectoredExceptionHandler is a KERNEL32 *forwarder* (the export
     // RVA is a string "NTDLL.RtlAddVectoredExceptionHandler" in a RO page).
@@ -630,6 +663,7 @@ fn emit_inner_g5(
     a.jne(l_probe_skip)?;
     a.db(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00])?;
     a.cmp(byte_ptr(rax + 2i32), 0)?;
+    a.mov(r11d, STAGE_DEBUGGER)?;
     a.jne(l_fail)?;
     // B3 (DR0-DR3) is not done with `mov rax, drN`: that is privileged in
     // user mode and would AV a clean LoadLibrary. Hardware-breakpoint
@@ -653,6 +687,7 @@ fn emit_inner_g5(
     a.mov(qword_ptr(rsp + 0x20), rax)?;
     a.call(qword_ptr(rsp + 0x1A8))?;
     a.cmp(qword_ptr(rsp + 0x1B8), 0)?;
+    a.mov(r11d, STAGE_DEBUGGER)?;
     a.jne(l_fail)?;
     // ProcessDebugObjectHandle (0x1E): success means a debug object exists.
     a.xor(eax, eax)?;
@@ -664,6 +699,7 @@ fn emit_inner_g5(
     a.mov(qword_ptr(rsp + 0x20), rax)?;
     a.call(qword_ptr(rsp + 0x1A8))?;
     a.test(eax, eax)?;
+    a.mov(r11d, STAGE_DEBUGGER)?;
     a.jz(l_fail)?;
     // ProcessDebugFlags (0x1F): 0 means a debugger is attached.
     a.xor(eax, eax)?;
@@ -677,10 +713,12 @@ fn emit_inner_g5(
     a.test(eax, eax)?;
     a.jnz(l_int3_chk)?;
     a.cmp(dword_ptr(rsp + 0x1E0), 0)?;
+    a.mov(r11d, STAGE_DEBUGGER)?;
     a.je(l_fail)?;
     a.set_label(&mut l_int3_chk)?;
     a.mov(rax, qword_ptr(rsp + 0x1A8))?;
     a.cmp(byte_ptr(rax), 0xCCu32)?;
+    a.mov(r11d, STAGE_DEBUGGER)?;
     a.je(l_fail)?;
     a.set_label(&mut l_probe_skip)?;
     a.mov(r14, qword_ptr(rsp + 0xE0))?;
@@ -722,6 +760,7 @@ fn emit_inner_g5(
     a.movzx(edx, byte_ptr(r14 + ENV_OPCODES + 3i32))?;
     a.cmp(eax, edx)?;
     a.je(l_vm_mul)?;
+    a.mov(r11d, STAGE_OPCODE)?;
     a.jmp(l_fail)?;
     a.set_label(&mut l_vm_load)?;
     a.movzx(r12d, byte_ptr(rsi))?;
@@ -735,6 +774,7 @@ fn emit_inner_g5(
     a.set_label(&mut l_vm_mul)?;
     a.jmp(l_vm_loop)?;
     a.set_label(&mut l_vm_unk)?;
+    a.mov(r11d, STAGE_OPCODE)?;
     a.jmp(l_fail)?;
     a.set_label(&mut l_vm_mix)?;
     a.mov(rsi, qword_ptr(rsp + 0x1C0))?;
@@ -875,6 +915,7 @@ fn emit_inner_g5(
     a.xor(r8d, dword_ptr(rsp + 0xA0))?; // de-mix page key[0..4]
     a.mov(edx, dword_ptr(rbp + 24i32))?;
     a.cmp(r8d, dword_ptr(rbp + rdx * 1 + 60i32))?; // digest after mac
+    a.mov(r11d, STAGE_DIGEST)?;
     a.jne(l_fail)?;
     // DEBUG MARKER: last verified page index lands in meta[56]; the test VEH
     // reports it on crashes. meta[63] is the gate byte and must stay intact.
@@ -887,6 +928,7 @@ fn emit_inner_g5(
     a.lea(r9, ptr(rsp + 0x58))?;
     a.call(qword_ptr(rsp + 0x48))?; // VirtualProtect RWX
     a.test(eax, eax)?;
+    a.mov(r11d, STAGE_PROTECT)?;
     a.jz(l_fail)?;
 
     a.mov(edi, dword_ptr(rbp + 24i32))?; // len
@@ -973,12 +1015,14 @@ fn emit_inner_g5(
     a.lea(rcx, ptr(rsp + 0x150))?;
     a.call(qword_ptr(rsp + 0x40))?; // LoadLibraryA
     a.test(rax, rax)?;
+    a.mov(r11d, STAGE_RESOLVE)?;
     a.jz(l_fail)?;
     a.mov(qword_ptr(rsp + 0x110), rax)?;
     a.mov(rcx, qword_ptr(rsp + 0x110))?;
     a.lea(rdx, ptr(rsp + 0xC0))?;
     a.call(qword_ptr(rsp + 0x38))?; // GetProcAddress
     a.test(rax, rax)?;
+    a.mov(r11d, STAGE_RESOLVE)?;
     a.jz(l_fail)?;
     a.mov(qword_ptr(rsp + 0x110), rax)?;
 
@@ -991,6 +1035,7 @@ fn emit_inner_g5(
     a.lea(r9, ptr(rsp + 0x58))?;
     a.call(qword_ptr(rsp + 0x48))?;
     a.test(eax, eax)?;
+    a.mov(r11d, STAGE_PROTECT)?;
     a.jz(l_fail)?;
     a.mov(rax, qword_ptr(rsp + 0x110))?;
     a.mov(rcx, qword_ptr(rsp + 0x118))?;
@@ -1018,6 +1063,7 @@ fn emit_inner_g5(
     a.lea(r9, ptr(rsp + 0x58))?;
     a.call(qword_ptr(rsp + 0x48))?;
     a.test(eax, eax)?;
+    a.mov(r11d, STAGE_PROTECT)?;
     a.jz(l_fail)?;
     a.movzx(eax, word_ptr(r14 + ENV_STOLEN_LEN))?;
     a.xor(ecx, ecx)?;
@@ -1061,6 +1107,7 @@ fn emit_inner_g5(
     a.lea(r9, ptr(rsp + 0x58))?;
     a.call(qword_ptr(rsp + 0x48))?;
     a.test(eax, eax)?;
+    a.mov(r11d, STAGE_PROTECT)?;
     a.jz(l_fail)?;
     a.mov(eax, dword_ptr(r15 + 0x3C))?;
     a.movzx(ecx, word_ptr(r15 + rax + 6i32))?;
@@ -1217,6 +1264,7 @@ fn emit_inner_g5(
         a.call(rax)?;
         a.add(rsp, 0x20i32)?;
         a.test(eax, eax)?;
+        a.mov(r11d, STAGE_CORE)?;
         a.jz(l_fail)?;
         a.lea(rcx, ptr(rbx))?;
         a.mov(edx, STUB_META_LEN as u32)?;
@@ -1239,6 +1287,7 @@ fn emit_inner_g5(
         a.call(qword_ptr(rsp + 0x48))?;
         a.jmp(l_forward)?;
     } else {
+        a.mov(r11d, STAGE_NO_CORE)?;
         a.jmp(l_fail)?;
     }
 
@@ -1278,8 +1327,26 @@ fn emit_inner_g5(
     a.jmp(l_forward)?;
 
     a.set_label(&mut l_fail)?;
-    // Fail closed: DllMain FALSE / EXE exit code 0.
+    // Fail closed, but observable. r11d carries the failing phase from the
+    // jump site (set with `mov`, which preserves the flags that selected the
+    // branch). IMAGE_FILE_DLL from the original header decides the exit
+    // contract: a DLL returns 0 — FALSE — because a nonzero DllMain return
+    // would tell the loader the boot succeeded (fail-open); an EXE exits with
+    // the phase code so "rc=0 with no output" names the failed stage. The
+    // code table lives in docs/SUPPORT.md.
+    a.mov(eax, dword_ptr(r15 + 0x3C))?;
+    a.movzx(eax, word_ptr(r15 + rax + 22))?;
+    a.test(eax, 0x2000u32)?; // IMAGE_FILE_DLL
+    a.jz(l_fail_exe)?;
     a.xor(eax, eax)?;
+    a.jmp(l_epilogue)?;
+
+    a.set_label(&mut l_fail_exe)?;
+    a.mov(eax, r11d)?;
+    a.test(eax, eax)?;
+    a.jnz(l_fail_stage)?;
+    a.mov(eax, STAGE_UNKNOWN)?;
+    a.set_label(&mut l_fail_stage)?;
     a.jmp(l_epilogue)?;
 
     // C2: after DllMain, XOR-reencrypt every executable page that does not

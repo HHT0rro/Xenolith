@@ -23,11 +23,14 @@ use xenolith_protocol::{
     POLICY_STRICT,
 };
 use xenolith_formats::{
-    align_up, classify, write_u64, FormatError, ImageKind, Pe64, Section,
-    IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_DEBUG, IMAGE_DIRECTORY_ENTRY_EXCEPTION,
+    align_up, classify, write_u64, FormatError, ImageKind, LoadConfigCfg, Pe64, Section,
+    IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR,
+    IMAGE_DIRECTORY_ENTRY_DEBUG, IMAGE_DIRECTORY_ENTRY_EXCEPTION,
     IMAGE_DIRECTORY_ENTRY_IMPORT,
     IMAGE_DIRECTORY_ENTRY_TLS, IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE,
-    IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA, IMAGE_REL_BASED_DIR64, IMAGE_SCN_CNT_CODE,
+    IMAGE_DLLCHARACTERISTICS_GUARD_CF, IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA,
+    IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT, IMAGE_GUARD_XFG_ENABLED,
+    IMAGE_REL_BASED_DIR64, IMAGE_SCN_CNT_CODE,
     IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE,
 };
 use xenolith_guard::{max_probes, Probe};
@@ -226,11 +229,45 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
         Err(e) => return Err(PackError::Format(e)),
     };
     let pe = Pe64::parse(request.input)?;
-    if pe.delay_import_present() {
+    if is_already_packed(&pe, request.input) {
         return Err(PackError::Invalid(
-            "delay-load imports are not packed in this release",
+            "input is already packed (xenolith pic-stub+xl-core envelope detected); \
+             re-packing a packed image is not supported — pack the original \
+             unpacked build instead",
         ));
     }
+    // Delay-load imports: the PE64 loader ignores the delay directory
+    // (datadir 13) — the application's own __delayLoadHelper2 resolves it at
+    // first call through the app's IAT (LoadLibraryA/GetProcAddress slots).
+    // Those slots are filled exactly like every other import (the system
+    // loader keeps the disk IAT in TLS/Fast mode; xl_core writeback fills
+    // them otherwise), and the delay descriptors themselves are plain data
+    // the packer never touches, relocated like any other pointer. Rejecting
+    // here only blocked whole images on a mechanism that works. If runtime
+    // evidence contradicts this, the fallback is per-mode rejection
+    // (writeback refuses, TLS-keep/fast allow) — never silent packing.
+    // .NET mixed-mode images (COM descriptor / CLR runtime header present)
+    // rely on the runtime host for entry, unwinding, and metadata tokens —
+    // none of which survive repacking. Fail closed with the specific check
+    // and construction named.
+    if pe
+        .directory(IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR)
+        .map(|d| d.rva != 0 && d.size != 0)
+        .unwrap_or(false)
+    {
+        return Err(PackError::Invalid(
+            ".NET mixed-mode image (COM descriptor present) is not packed in this release; \
+             pack a native build of the same code instead",
+        ));
+    }
+
+    // CFG: the loader invokes a GUARD_CF image's entry (and later any
+    // export-repointed stub thunk) through the GuardCF indirect-call check.
+    // Those RVAs must be in the on-disk GFIDS table or the process fast-fails
+    // (0xC0000409) at load — before a single unpacked byte executes. Parse the
+    // load-config now so every fail-closed case names the construction; the
+    // table itself is rewritten after the stub/payload RVAs are known.
+    let cfg_plan = plan_cfg_rewrite(&pe, request.input)?;
     let mut working = request.input.to_vec();
     pe.zero_directory(&mut working, IMAGE_DIRECTORY_ENTRY_DEBUG)?;
     let tls_first = pe.tls_first_callback(request.input)?;
@@ -264,10 +301,14 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
     // system loader applies ASLR. Relocs that land in protected pages are
     // re-applied by xl_core after AEAD open.
 
-    let stolen = steal_entry_bytes(&working, &pe).map_err(|_| PackError::Invalid("stolen bytes"))?;
-    let entry_off = pe
-        .file_offset_of(pe.entry_rva)
-        .map_err(|_| PackError::Invalid("entry"))?;
+    let stolen = steal_entry_bytes(&working, &pe)
+        .map_err(|e| PackError::Stub(format!("entry stolen-bytes read failed: {e}")))?;
+    let entry_off = pe.file_offset_of(pe.entry_rva).map_err(|_| {
+        PackError::Stub(format!(
+            "entry rva {:#x} does not map to file data; cannot plant stolen-byte traps",
+            pe.entry_rva
+        ))
+    })?;
     for i in 0..stolen.len().min(STOLEN_BYTES) {
         if entry_off + i < working.len() {
             working[entry_off + i] = 0xCC; // trap if executed without stub
@@ -275,28 +316,39 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
     }
 
     let imports = pe.imports(request.input)?;
+    // Ordinal imports carry no name string. They are recorded under the
+    // reserved display name "#<decimal ordinal>" so the writeback runtime can
+    // resolve them through GetProcAddress's ordinal channel ('#' is the
+    // reserved prefix, documented in docs/SUPPORT.md). The envelope record,
+    // the hash, and the TASK-024 sealed name||dll payload all use the same
+    // display name — no protocol change.
     let hashed: Vec<HashedImport> = imports
         .iter()
-        .map(|imp| HashedImport {
-            hash: api_hash(&imp.dll, &imp.name, &api_salt),
-            original_iat_rva: imp.iat_rva,
-            dll: imp.dll.clone(),
-            name: imp.name.clone(),
+        .map(|imp| {
+            let display_name = match imp.ordinal {
+                Some(ord) => format!("#{ord}"),
+                None => imp.name.clone(),
+            };
+            HashedImport {
+                hash: api_hash(&imp.dll, &display_name, &api_salt),
+                original_iat_rva: imp.iat_rva,
+                dll: imp.dll.clone(),
+                name: display_name,
+            }
         })
         .collect();
 
     // The JVM/CRT ABI contract precedes existence: a forbidden name must
-    // answer "stays native" whether or not the export exists.
+    // answer "stays native" whether or not the export exists. Missing names
+    // are NOT pre-checked against the export table alone — COFF symbols and
+    // fn_{rva:#x} unwind names are valid selections, and selection::resolve
+    // reports them by name.
     for name in &request.vm_exports {
-        if lift::forbidden_vm_name(name) {
+        if let Some(rule) = lift::forbidden_vm_rule(name) {
             return Err(PackError::Lift(format!(
-                "vm-export {name}: CRT/DllMain/JNI stay native"
+                "vm-export {name}: stays native ({rule}); CRT/DllMain/JNI ABI exports must \
+                 stay native — pick another export"
             )));
-        }
-    }
-    for name in &request.vm_exports {
-        if !export_names.iter().any(|e| e == name) {
-            return Err(PackError::Invalid("vm-export is missing"));
         }
     }
 
@@ -316,7 +368,17 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
     let mut lifted: Vec<LiftedExport> = Vec::new();
     let mut coverage: Vec<FunctionCoverageRecord> = Vec::new();
     for func in &fn_map.functions {
-        match lift_function(&pe, request.input, &func.name, func.rva, func.len) {
+        match lift_function(
+            &pe,
+            request.input,
+            &func.name,
+            func.rva,
+            func.len,
+            // Explicit --select-rva windows are the user's exact boundary;
+            // everything else (named exports etc.) may sit on an
+            // incremental-link thunk that needs resolving first.
+            !matches!(func.source, BoundarySource::ExplicitRange),
+        ) {
             Ok(function) => {
                 coverage.push(FunctionCoverageRecord {
                     name: func.name.clone(),
@@ -337,25 +399,46 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
                     bucket: if e.0.contains("boundary")
                         || e.0.contains("out of lift window")
                         || e.0.contains("lift cap")
+                        || e.0.contains("branch out of lift window")
                     {
                         "boundary_uncertain".into()
                     } else {
                         "mixed_native".into()
                     },
-                    reason: e.0.lines().next().unwrap_or("").to_string(),
+                    // Full reason, not just the first line: the reason text
+                    // carries the function/RVA/remediation context.
+                    reason: e.0.clone(),
                 });
             }
             Err(e) => return Err(PackError::Lift(e.0)),
         }
     }
-    if request.strict_coverage
-        && coverage
+    if request.strict_coverage {
+        let failed: Vec<&FunctionCoverageRecord> = coverage
             .iter()
-            .any(|record| record.bucket != "transformed")
-    {
-        return Err(PackError::Invalid(
-            "strict coverage: selected function did not fully transform",
-        ));
+            .filter(|record| record.bucket != "transformed")
+            .collect();
+        if !failed.is_empty() {
+            let detail = failed
+                .iter()
+                .map(|r| {
+                    format!(
+                        "  {} (rva {:#x}, {}): {}",
+                        r.name,
+                        r.rva,
+                        r.bucket,
+                        r.reason.lines().next().unwrap_or("unknown reason")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(PackError::Lift(format!(
+                "strict coverage: {} selected function(s) did not fully transform \
+                 (drop --strict-coverage, use --allow-native-fallback, or pick functions \
+                 the lifter supports):\n{detail}",
+                failed.len()
+            )));
+        }
     }
     let mut functions = Vec::new();
     for (i, func) in lifted.iter().enumerate() {
@@ -369,7 +452,13 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
                     trace_diverge: request.trace_diverge,
                 },
             )
-            .map_err(PackError::Stub)?,
+            .map_err(|e| {
+                PackError::Stub(format!(
+                    "vm {name} (rva {rva:#x}): {e}",
+                    name = func.name,
+                    rva = func.rva
+                ))
+            })?,
         );
     }
     let guest_emit = GuestEmit { functions };
@@ -396,18 +485,54 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
     )
     .map_err(PackError::Stub)?;
     if lifted.len() != pic.guest_thunk_offs.len() {
-        return Err(PackError::Stub("guest thunk count".into()));
+        return Err(PackError::Stub(format!(
+            "guest thunk count mismatch: {} lifted functions but the stub emitted {} \
+             thunks (packer bug; report with the input image)",
+            lifted.len(),
+            pic.guest_thunk_offs.len()
+        )));
     }
-    let last_for_va = pe
-        .sections
-        .last()
-        .ok_or(PackError::Invalid("no sections"))?;
+    let last_for_va = pe.sections.last().ok_or_else(|| {
+        PackError::Stub(format!(
+            "image has no sections ({} bytes, {} headers); cannot place the stub",
+            request.input.len(),
+            pe.number_of_sections
+        ))
+    })?;
     let stub_va = align_up(
         last_for_va.virtual_address + last_for_va.virtual_size.max(last_for_va.raw_size),
         pe.section_align,
     );
     for (func, thunk_off) in lifted.iter().zip(&pic.guest_thunk_offs) {
         rewrite_function(&pe, &mut working, func, stub_va.wrapping_add(*thunk_off))?;
+    }
+
+    // Pages the system loader may execute before xl_core opens AEAD:
+    // original AddressOfEntryPoint (stolen-byte restore still needs it in
+    // keep), CFG check/dispatch gadgets (`ret 0` / `jmp rax` in .text), and
+    // the `fothk` forwarder section. Sealing any of these plants INT3s on
+    // the pre-entry GuardCF path.
+    let mut cfg_live_pages: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    if let Some(plan) = &cfg_plan {
+        for (slot, what) in [
+            (
+                plan.cfg.check_function_slot_va,
+                "GuardCFCheckFunctionPointer",
+            ),
+            (
+                plan.cfg.dispatch_function_slot_va,
+                "GuardCFDispatchFunctionPointer",
+            ),
+        ] {
+            if let Some(rva) = pe.load_config_guard_target_rva(request.input, slot, what)? {
+                cfg_live_pages.insert(rva & !0xfff);
+            }
+        }
+    }
+    for section in &pe.sections {
+        if is_cfg_forwarder_section(&section.name_str()) {
+            cfg_live_pages.insert(section.virtual_address & !0xfff);
+        }
     }
 
     let mut pages = Vec::new();
@@ -417,6 +542,15 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
         if section.characteristics & IMAGE_SCN_MEM_EXECUTE == 0 {
             continue;
         }
+        // MSVC /guard:cf emits a tiny RX `fothk` section: a 5-byte jmp back
+        // into .text that the loader's CFG dispatch uses as an IAT/FID
+        // forwarder. That jmp runs at process-init, before xl_core can open
+        // AEAD pages. Sealing it plants INT3s on the dispatch path and the
+        // image "starts" (GFIDS covers the stub entry) then silently does
+        // nothing (ping/Robocopy). Keep the section plaintext.
+        if is_cfg_forwarder_section(&section.name_str()) {
+            continue;
+        }
         let start = section.raw_ptr as usize;
         let len = section.raw_size.min(section.virtual_size) as usize;
         if start.saturating_add(len) > working.len() {
@@ -424,11 +558,16 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
         }
         let mut offset = 0usize;
         while offset < len {
+            let page_rva = section.virtual_address + offset as u32;
+            if cfg_live_pages.contains(&(page_rva & !0xfff)) {
+                offset += PAGE_SIZE;
+                continue;
+            }
             let chunk = (len - offset).min(PAGE_SIZE);
             let slice = working[start + offset..start + offset + chunk].to_vec();
             let nonce = random_nonce12();
             page_files.push((start + offset, chunk));
-            pages.push((page_index, section.virtual_address + offset as u32, slice, nonce));
+            pages.push((page_index, page_rva, slice, nonce));
             // The stub decrypts IN PLACE (mapped file bytes XOR keystream), so
             // the file must hold plaintext XOR keystream: no plaintext .text on
             // disk (C2/C3) and an exact one-pass unpack. The keystream here is
@@ -439,7 +578,15 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
         }
     }
     if pages.len() > xenolith_loader::MAX_PAGES {
-        return Err(PackError::Invalid("too many pages"));
+        return Err(PackError::Stub(format!(
+            "too many pages: {} > {} (executable bytes ≈ {} KiB); the loader envelope \
+             caps a packed image at {} 4-KiB page records — split the binary or exclude \
+             sections from packing",
+            pages.len(),
+            xenolith_loader::MAX_PAGES,
+            pages.len() * 4,
+            xenolith_loader::MAX_PAGES
+        )));
     }
 
     let mut seed = [0u8; 16];
@@ -458,8 +605,13 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
     measure_src.extend_from_slice(&opcode_seed);
     measure_src.extend_from_slice(&(pages.len() as u32).to_le_bytes());
     let measurement = image_measurement(&measure_src);
-    let runtime = xenolith_crypto::mix_runtime_key(&mba, &measurement)
-        .map_err(|_| PackError::Invalid("runtime key"))?;
+    let runtime = xenolith_crypto::mix_runtime_key(&mba, &measurement).map_err(|e| {
+        PackError::Stub(format!(
+            "runtime key derivation failed (mba {} B, measurement {} B): {e}",
+            mba.as_bytes().len(),
+            measurement.len()
+        ))
+    })?;
 
     // Disk original pages are traps, not XOR keystream. Plaintext lives only
     // in EnvelopeV2 AEAD records (xl_core copies them to RX pages).
@@ -474,6 +626,11 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
         let page = exp.rva & !0xfff;
         if !keep.contains(&page) {
             keep.push(page);
+        }
+    }
+    for page in &cfg_live_pages {
+        if !keep.contains(page) {
+            keep.push(*page);
         }
     }
     let mba_bytes = mba.as_bytes();
@@ -538,9 +695,14 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
             let mut r = Vec::new();
             for e in pe.relocs(request.input).unwrap_or_default() {
                 if e.kind != 0 && e.kind != IMAGE_REL_BASED_DIR64 {
-                    return Err(PackError::Invalid(
-                        "unsupported PE relocation type (only DIR64)",
-                    ));
+                    return Err(PackError::Stub(format!(
+                        "unsupported PE relocation at rva {:#x}: type {} (IMAGE_REL_BASED_{}) \
+                         — only DIR64/ABSOLUTE relocs are preserved through packing; \
+                         rebuild the image or strip the non-DIR64 fixups",
+                        e.rva,
+                        e.kind,
+                        reloc_kind_name(e.kind)
+                    )));
                 }
                 if e.kind == IMAGE_REL_BASED_DIR64
                     && protected.iter().any(|(lo, hi)| e.rva >= *lo && e.rva < *hi)
@@ -664,15 +826,56 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
         .and_then(|rva| pe.file_offset_of(rva).ok())
         .map(|off| {
             let dir = pe.directory(IMAGE_DIRECTORY_ENTRY_EXCEPTION).unwrap();
-            let sz = dir.size as usize / 12;
-            image[off..off + sz * 12].to_vec()
+            let dir_size = dir.size as usize;
+            if dir_size % 12 != 0 {
+                return Err(PackError::Stub(format!(
+                    "exception directory size {dir_size} is not a multiple of 12 \
+                     (RUNTIME_FUNCTION); the .pdata declaration is inconsistent with the \
+                     image — refusing to copy a corrupt unwind table"
+                )));
+            }
+            // The directory size can exceed the actual raw data (virtual_size
+            // > raw_size sections, linker padding, third-party edits). Slice
+            // through `get` so a lying declaration is a clean error, not a
+            // panic.
+            let raw = image
+                .get(off..off.saturating_add(dir_size))
+                .ok_or_else(|| {
+                    PackError::Stub(format!(
+                        "exception directory declares {} bytes of .pdata at file offset \
+                         {off} but the image ends at {} bytes — refusing to copy a \
+                         truncated unwind table",
+                        dir_size,
+                        image.len()
+                    ))
+                })?;
+            Ok(raw.to_vec())
         })
+        .transpose()?
         .unwrap_or_default();
 
-    // Layout inside the payload raw area: [envelope][pad to 4][xdata][pdata]
+    // Layout inside the payload raw area:
+    //   [envelope][pad to 4][xdata][pdata][pad to 4][gfids]
+    // GFIDS lives here — the payload section is IMAGE_SCN_MEM_READ, never
+    // AEAD-sealed, and is mapped before the loader's GuardCF check runs.
     let xdata_off = (envelope.len() + 3) & !3usize;
     let pdata_off = (xdata_off + xdata.len() + 3) & !3usize;
-    let payload_total = pdata_off + pdata.len() + 12;
+    let gfids_off = (pdata_off + pdata.len() + 12 + 3) & !3usize;
+    // Upper bound: original entries + stub entry + optional TLS trampoline +
+    // one thunk per lifted function (only export-repointed thunks are written).
+    let gfids_extra_cap = 1
+        + usize::from(tls_first.is_some())
+        + lifted.len();
+    let gfids_reserve = cfg_plan
+        .as_ref()
+        .map(|p| {
+            p.entries
+                .len()
+                .saturating_add(gfids_extra_cap)
+                .saturating_mul(p.stride)
+        })
+        .unwrap_or(0);
+    let payload_total = gfids_off + gfids_reserve;
 
     let payload_raw = align_up(payload_total as u32, file_align);
     let stub_raw = align_up(stub.len() as u32, file_align);
@@ -682,13 +885,17 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
     let last = pe
         .sections
         .last()
-        .ok_or(PackError::Invalid("no sections"))?;
+        .ok_or_else(|| PackError::Stub("image has no sections; cannot place the stub".into()))?;
     let next_va = align_up(
         last.virtual_address + last.virtual_size.max(last.raw_size),
         section_align,
     );
     if next_va != stub_va {
-        return Err(PackError::Stub("stub va drifted".into()));
+        return Err(PackError::Stub(format!(
+            "stub va drifted: layout pass computed {:#x} but the section table pass \
+             computed {:#x} (packer bug; report with the input image)",
+            stub_va, next_va
+        )));
     }
     let next_raw = align_up(image.len() as u32, file_align);
     if next_raw as usize > image.len() {
@@ -763,6 +970,39 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
         pdata_rva,
         (pdata.len() + 12) as u32,
     )?;
+
+    if let Some(plan) = &cfg_plan {
+        // Register every RVA the loader will invoke through GuardCF that we
+        // actually changed: the new AddressOfEntryPoint, the TLS trampoline
+        // (if the first callback slot was wrapped), and named-export thunks
+        // whose export-directory RVA was retargeted. Internal vm-hooks keep
+        // their original RVA (a direct jmp), which is already in GFIDS.
+        let mut extra_rvas = vec![entry_rva];
+        if tls_first.is_some() {
+            extra_rvas.push(stub_section.virtual_address.wrapping_add(pic.tls_entry_off));
+        }
+        let packed_exports = pe.exports(&image).map_err(|e| {
+            PackError::Stub(format!(
+                "CFG GFIDS: re-reading export directory after rewrite failed: {e}"
+            ))
+        })?;
+        for old in &exports {
+            if let Some(new) = packed_exports.iter().find(|e| e.name == old.name) {
+                if new.rva != old.rva {
+                    extra_rvas.push(new.rva);
+                }
+            }
+        }
+        apply_cfg_gfids(
+            &pe,
+            &mut image,
+            plan,
+            payload_section.virtual_address + gfids_off as u32,
+            payload_section.raw_ptr as usize + gfids_off,
+            gfids_reserve,
+            &extra_rvas,
+        )?;
+    }
 
     let mut meta = vec![0u8; STUB_META_LEN];
     meta[META_PAYLOAD_RVA..META_PAYLOAD_RVA + 4]
@@ -873,11 +1113,206 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
     })
 }
 
+/// MSVC CFG forwarder section (`fothk`). The loader's GuardCF dispatch
+/// jumps through it before any packed stub byte runs, so it must stay
+/// plaintext on disk. Name match is exact (8-byte section name, no padding
+/// variants observed on the System32 corpus).
+fn is_cfg_forwarder_section(name: &str) -> bool {
+    name == "fothk"
+}
+
+/// Parsed CFG rewrite plan. `None` from `plan_cfg_rewrite` means the image is
+/// not GuardCF-enforced (including INSTRUMENTED-without-table rustc images).
+struct CfgPlan {
+    cfg: LoadConfigCfg,
+    entries: Vec<xenolith_formats::GfidsEntry>,
+    stride: usize,
+    flag_len: usize,
+}
+
+/// Decide whether this image needs a GFIDS rewrite, and fail closed on every
+/// construction we cannot faithfully reproduce.
+fn plan_cfg_rewrite(pe: &Pe64, bytes: &[u8]) -> Result<Option<CfgPlan>, PackError> {
+    let dll_cf = pe.dll_characteristics & IMAGE_DLLCHARACTERISTICS_GUARD_CF != 0;
+    let cfg = pe.load_config_cfg(bytes)?;
+    let flags = cfg.as_ref().map(|c| c.guard_flags).unwrap_or(0);
+    let table_present = flags & IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT != 0;
+
+    // rustc/MSVC images often set INSTRUMENTED in load-config without
+    // DllCharacteristics GUARD_CF and without a function table (hello-exe:
+    // flags 0x100, table VA 0). The loader does not CFG-check those entries.
+    if !dll_cf && !table_present {
+        return Ok(None);
+    }
+
+    let Some(cfg) = cfg else {
+        return Err(PackError::Lift(format!(
+            "CFG image (DllCharacteristics GUARD_CF={dll_cf}) has no parseable \
+             IMAGE_LOAD_CONFIG_DIRECTORY64: the directory is absent or its declared \
+             Size is below 0x94 (GuardFlags). Cannot register the packed stub in GFIDS"
+        )));
+    };
+
+    if cfg.guard_flags & IMAGE_GUARD_XFG_ENABLED != 0 {
+        return Err(PackError::Lift(format!(
+            "CFG image load-config GuardFlags {:#x} has IMAGE_GUARD_XFG_ENABLED \
+             (0x800000): GFIDS entries carry an XFG hash this packer does not rewrite",
+            cfg.guard_flags
+        )));
+    }
+    if !table_present {
+        return Err(PackError::Lift(format!(
+            "CFG image (DllCharacteristics GUARD_CF, GuardFlags {:#x}) is missing \
+             IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT (0x400); no GFIDS table to extend",
+            cfg.guard_flags
+        )));
+    }
+
+    let entries = pe.gfids_table(bytes, &cfg).map_err(|e| {
+        PackError::Lift(format!(
+            "CFG GFIDS table unreadable (GuardCFFunctionTable VA {:#x}, count {}, \
+             GuardFlags {:#x}, stride {}): {e}",
+            cfg.table_va,
+            cfg.function_count,
+            cfg.guard_flags,
+            Pe64::gfids_stride(cfg.guard_flags)
+        ))
+    })?;
+    let stride = Pe64::gfids_stride(cfg.guard_flags);
+    Ok(Some(CfgPlan {
+        cfg,
+        entries,
+        stride,
+        flag_len: stride - 4,
+    }))
+}
+
+/// Write a merged GFIDS table into the plaintext payload section and retarget
+/// load-config GuardCFFunctionTable / GuardCFFunctionCount in place.
+///
+/// GuardCFFunctionTable is a preferred-base VA. The field offset is unchanged,
+/// so the original DIR64 reloc covering load-config+0x80 still fixes it up
+/// when the image is relocated. The new table itself stores RVAs, not VAs,
+/// and does not need its own reloc entries.
+fn apply_cfg_gfids(
+    pe: &Pe64,
+    image: &mut [u8],
+    plan: &CfgPlan,
+    table_rva: u32,
+    table_file_off: usize,
+    reserved: usize,
+    extra_rvas: &[u32],
+) -> Result<(), PackError> {
+    // Load-config lives in a non-executable section on well-formed images; if
+    // it sat inside a sealed RX page the 0xCC trap fill would already have
+    // clobbered it and this write would not reach the mapped directory.
+    let cfg_end = plan
+        .cfg
+        .flags_file_offset
+        .checked_add(4)
+        .ok_or_else(|| PackError::Stub("CFG load-config offset overflow".into()))?;
+    if cfg_end > image.len()
+        || plan.cfg.table_va_file_offset + 8 > image.len()
+        || plan.cfg.count_file_offset + 8 > image.len()
+    {
+        return Err(PackError::Stub(format!(
+            "CFG load-config at file offset {:#x} overruns the {}-byte packed image",
+            plan.cfg.config_file_offset,
+            image.len()
+        )));
+    }
+
+    let merged = Pe64::merge_gfids_entries(
+        &plan.entries,
+        extra_rvas,
+        pe.entry_rva,
+        plan.flag_len,
+    )
+    .map_err(|e| PackError::Stub(format!("CFG GFIDS merge failed: {e}")))?;
+    let encoded = Pe64::encode_gfids_table(&merged, plan.flag_len)
+        .map_err(|e| PackError::Stub(format!("CFG GFIDS encode failed: {e}")))?;
+    if encoded.len() > reserved {
+        return Err(PackError::Stub(format!(
+            "CFG GFIDS encoded {} bytes but the payload reserved only {reserved} \
+             ({} original entries + extras); packer bound is wrong",
+            encoded.len(),
+            plan.entries.len()
+        )));
+    }
+    let table_end = table_file_off
+        .checked_add(encoded.len())
+        .ok_or_else(|| PackError::Stub("CFG GFIDS payload offset overflow".into()))?;
+    if table_end > image.len() {
+        return Err(PackError::Stub(format!(
+            "CFG GFIDS table at file offset {table_file_off:#x} ({} bytes) overruns \
+             the {}-byte packed image",
+            encoded.len(),
+            image.len()
+        )));
+    }
+    image[table_file_off..table_end].copy_from_slice(&encoded);
+
+    let new_va = pe.image_base.wrapping_add(u64::from(table_rva));
+    write_u64(image, plan.cfg.table_va_file_offset, new_va).map_err(|e| {
+        PackError::Stub(format!(
+            "CFG GFIDS: writing GuardCFFunctionTable VA {new_va:#x} at file offset \
+             {:#x} failed: {e}",
+            plan.cfg.table_va_file_offset
+        ))
+    })?;
+    write_u64(image, plan.cfg.count_file_offset, merged.len() as u64).map_err(|e| {
+        PackError::Stub(format!(
+            "CFG GFIDS: writing GuardCFFunctionCount {} at file offset {:#x} failed: {e}",
+            merged.len(),
+            plan.cfg.count_file_offset
+        ))
+    })?;
+    Ok(())
+}
+
 fn pad_file(image: &mut Vec<u8>, align: u32) {
     let aligned = align_up(image.len() as u32, align) as usize;
     if aligned > image.len() {
         image.resize(aligned, 0);
     }
+}
+
+/// IMAGE_REL_BASED_* name for the relocation types that can appear in an
+/// x64 image; unknown types render numerically.
+fn reloc_kind_name(kind: u16) -> String {
+    match kind {
+        0 => "ABSOLUTE".into(),
+        1 => "HIGH".into(),
+        2 => "LOW".into(),
+        3 => "HIGHLOW".into(),
+        4 => "HIGHADJ".into(),
+        10 => "DIR64".into(),
+        other => format!("TYPE{other}"),
+    }
+}
+
+/// Guard against double packing. Both signals must agree so ordinary images
+/// whose entry happens to sit in the second-to-last section are never
+/// rejected: the entry must land inside the stub section AND the payload
+/// section must open with the EnvelopeV2 magic + version.
+fn is_already_packed(pe: &Pe64, image: &[u8]) -> bool {
+    if pe.sections.len() < 2 {
+        return false;
+    }
+    let stub = &pe.sections[pe.sections.len() - 2];
+    let stub_end = stub
+        .virtual_address
+        .saturating_add(stub.virtual_size.max(stub.raw_size));
+    let entry_in_stub =
+        pe.entry_rva >= stub.virtual_address && pe.entry_rva < stub_end;
+    if !entry_in_stub {
+        return false;
+    }
+    let payload = pe.sections.last().expect("checked len");
+    let off = payload.raw_ptr as usize;
+    image.len() >= off + 6
+        && &image[off..off + 4] == b"XLV2"
+        && u16::from_le_bytes(image[off + 4..off + 6].try_into().unwrap_or([0, 0])) == 2
 }
 
 fn rewrite_function(
@@ -895,26 +1330,53 @@ fn apply_vm_hook(
     func: &LiftedExport,
     thunk_rva: u32,
 ) -> Result<(), PackError> {
-    let off = pe
-        .file_offset_of(func.rva)
-        .map_err(|_| PackError::Invalid("vm hook rva"))?;
-    let end = off
-        .checked_add(func.native_len)
-        .ok_or(PackError::Invalid("vm hook len"))?;
+    let off = pe.file_offset_of(func.rva).map_err(|_| {
+        PackError::Stub(format!(
+            "vm hook: {name} rva {rva:#x} does not map to file data",
+            name = func.name,
+            rva = func.rva
+        ))
+    })?;
+    let end = off.checked_add(func.native_len).ok_or_else(|| {
+        PackError::Stub(format!(
+            "vm hook: {name} native_len {} overflows at rva {rva:#x}",
+            func.native_len,
+            name = func.name,
+            rva = func.rva
+        ))
+    })?;
     if end > working.len() {
-        return Err(PackError::Invalid("vm hook overflow"));
+        return Err(PackError::Stub(format!(
+            "vm hook: {name} rewrite of {} bytes at rva {rva:#x} (file offset {off}) \
+             overruns the {}-byte image",
+            func.native_len,
+            working.len(),
+            name = func.name,
+            rva = func.rva
+        )));
     }
     // Named exports keep their export-directory entry pointed at the thunk.
     // Internal functions selected through COFF/.pdata are reached through
     // their original entry, which receives the same jmp rewrite below.
     let is_export = pe
         .exports(working)
-        .map_err(|_| PackError::Invalid("vm hook export table"))?
+        .map_err(|e| {
+            PackError::Stub(format!(
+                "vm hook: export table re-read failed while hooking {name}: {e}",
+                name = func.name
+            ))
+        })?
         .iter()
         .any(|e| e.name == func.name);
     if is_export {
-        pe.set_export_rva(working, &func.name, thunk_rva)
-            .map_err(|_| PackError::Invalid("vm hook export"))?;
+        pe.set_export_rva(working, &func.name, thunk_rva).map_err(|e| {
+            PackError::Stub(format!(
+                "vm hook: repointing export {name} (rva {rva:#x}) to thunk {thunk_rva:#x} \
+                 failed: {e}",
+                name = func.name,
+                rva = func.rva
+            ))
+        })?;
     }
     if func.native_len >= 5 {
         let next = func.rva.wrapping_add(5);
@@ -978,8 +1440,8 @@ pub fn inspect_bytes(image: &[u8]) -> Result<serde_json::Value, PackError> {
             });
             if !packed {
                 info["note"] = serde_json::json!(
-                    "unpacked ELF: parsed only; packing fail-closes on PT_TLS, IFUNC, \
-                     TLS descriptor, copy reloc, static linkage"
+                    "unpacked ELF: parsed only; packing fail-closes on static linkage, \
+                     TPOFF32-in-text, RELATIVE into sealed page"
                 );
             } else {
                 info["note"] = serde_json::json!(
@@ -1573,6 +2035,181 @@ mod tests {
         assert_eq!(info["packed"], false);
         assert_eq!(info["backend"], "none");
         assert!(info["note"].as_str().unwrap().contains("fail-closes"));
+    }
+
+    fn cfg_pack_request(input: &[u8]) -> PackRequest<'_> {
+        PackRequest {
+            input,
+            profile: Profile::Max,
+            vm_exports: vec![],
+            debug_gate: 3,
+            opcode_seed: Some([7; 16]),
+            trace_diverge: false,
+            select_rva: vec![],
+            select_functions: Vec::new(),
+            select_all: false,
+            allow_native_fallback: false,
+            strict_coverage: false,
+            lazy_regions: false,
+            protect_imports: false,
+            strict_constants: false,
+        }
+    }
+
+    /// Pack a real CFG image and assert the new GFIDS table contains the stub
+    /// entry, is sorted, preserves original RVAs, and that load-config still
+    /// points at a preferred-base VA (DIR64 will fix it at load).
+    #[test]
+    #[cfg(windows)]
+    fn packed_cfg_image_registers_stub_entry_in_gfids() {
+        let bytes = ["out/real-samples/where.exe", "../../out/real-samples/where.exe"]
+            .iter()
+            .find_map(|p| std::fs::read(p).ok())
+            .expect("out/real-samples/where.exe");
+        let orig = Pe64::parse(&bytes).unwrap();
+        let orig_cfg = orig.load_config_cfg(&bytes).unwrap().unwrap();
+        let orig_table = orig.gfids_table(&bytes, &orig_cfg).unwrap();
+        let orig_count = orig_table.len();
+
+        let packed = pack(cfg_pack_request(&bytes)).unwrap_or_else(|e| panic!("{e}"));
+        let pe = Pe64::parse(&packed.image).unwrap();
+        assert_ne!(pe.entry_rva, orig.entry_rva, "packed entry must be the stub");
+        let cfg = pe
+            .load_config_cfg(&packed.image)
+            .unwrap()
+            .expect("packed load-config");
+        assert_eq!(
+            cfg.guard_flags & IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT,
+            IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT
+        );
+        assert_eq!(
+            cfg.table_va_file_offset, orig_cfg.table_va_file_offset,
+            "GuardCFFunctionTable field offset must stay put so DIR64 still covers it"
+        );
+        let table = pe.gfids_table(&packed.image, &cfg).unwrap();
+        assert!(
+            table.len() > orig_count,
+            "packed GFIDS must grow (orig {orig_count}, now {})",
+            table.len()
+        );
+        assert_eq!(cfg.function_count, table.len() as u64);
+        assert!(
+            table.windows(2).all(|w| w[0].rva <= w[1].rva),
+            "packed GFIDS must stay sorted"
+        );
+        assert!(
+            table.iter().any(|e| e.rva == pe.entry_rva),
+            "stub entry {:#x} missing from packed GFIDS",
+            pe.entry_rva
+        );
+        for old in &orig_table {
+            assert!(
+                table.iter().any(|e| e.rva == old.rva),
+                "original GFIDS rva {:#x} dropped",
+                old.rva
+            );
+        }
+        // New table VA is preferred-base + payload RVA, not an RVA stuffed into
+        // a VA-typed field.
+        let payload = pe.sections.last().expect("payload");
+        let table_rva = u32::try_from(cfg.table_va.wrapping_sub(pe.image_base))
+            .expect("GuardCFFunctionTable VA must be image_base + RVA");
+        assert_eq!(
+            cfg.table_va,
+            pe.image_base.wrapping_add(u64::from(table_rva)),
+            "GuardCFFunctionTable must stay a preferred-base VA"
+        );
+        assert!(
+            table_rva >= payload.virtual_address
+                && table_rva < payload.virtual_address + payload.virtual_size.max(payload.raw_size),
+            "new GFIDS must live in the plaintext payload section"
+        );
+        // CFG forwarder section stays on disk: sealing it plants INT3s on the
+        // loader's pre-entry dispatch path.
+        if let Some(orig_fothk) = orig.sections.iter().find(|s| s.name_str() == "fothk") {
+            let packed_fothk = pe
+                .sections
+                .iter()
+                .find(|s| s.name_str() == "fothk")
+                .expect("fothk survives packing");
+            let o_off = orig_fothk.raw_ptr as usize;
+            let p_off = packed_fothk.raw_ptr as usize;
+            let n = orig_fothk.raw_size.min(orig_fothk.virtual_size) as usize;
+            assert_eq!(
+                &bytes[o_off..o_off + n],
+                &packed.image[p_off..p_off + n],
+                "fothk must remain plaintext"
+            );
+        }
+        // Check/dispatch gadgets (`ret 0` / `jmp rax`) stay on disk too.
+        for (slot, what) in [
+            (orig_cfg.check_function_slot_va, "check"),
+            (orig_cfg.dispatch_function_slot_va, "dispatch"),
+        ] {
+            let Some(rva) = orig
+                .load_config_guard_target_rva(&bytes, slot, what)
+                .unwrap()
+            else {
+                continue;
+            };
+            let o_off = orig.file_offset_of(rva).unwrap();
+            let p_off = pe.file_offset_of(rva).unwrap();
+            assert_eq!(
+                packed.image[p_off], bytes[o_off],
+                "{what} gadget at rva {rva:#x} must remain plaintext"
+            );
+            assert_ne!(
+                packed.image[p_off], 0xCC,
+                "{what} gadget at rva {rva:#x} was sealed to INT3"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn non_cfg_hello_exe_still_packs() {
+        let bytes = required_sample("hello-exe.exe");
+        let orig = Pe64::parse(&bytes).unwrap();
+        assert_eq!(orig.dll_characteristics & IMAGE_DLLCHARACTERISTICS_GUARD_CF, 0);
+        let packed = pack(cfg_pack_request(&bytes)).unwrap_or_else(|e| panic!("{e}"));
+        let pe = Pe64::parse(&packed.image).unwrap();
+        assert_ne!(pe.entry_rva, orig.entry_rva);
+        // INSTRUMENTED-without-table images must not grow a fake GFIDS.
+        if let Some(cfg) = pe.load_config_cfg(&packed.image).unwrap() {
+            assert_eq!(cfg.function_count, 0);
+            assert_eq!(cfg.table_va, 0);
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn cfg_xfg_plan_fails_closed_on_real_layout() {
+        let mut bytes = ["out/real-samples/where.exe", "../../out/real-samples/where.exe"]
+            .iter()
+            .find_map(|p| std::fs::read(p).ok())
+            .expect("out/real-samples/where.exe");
+        let pe = Pe64::parse(&bytes).unwrap();
+        let cfg = pe.load_config_cfg(&bytes).unwrap().unwrap();
+        let xfg = cfg.guard_flags | IMAGE_GUARD_XFG_ENABLED;
+        bytes[cfg.flags_file_offset..cfg.flags_file_offset + 4]
+            .copy_from_slice(&xfg.to_le_bytes());
+        let pe = Pe64::parse(&bytes).unwrap();
+        let err = match plan_cfg_rewrite(&pe, &bytes) {
+            Err(e) => e,
+            Ok(_) => panic!("XFG image must fail closed"),
+        };
+        assert!(
+            err.to_string().contains("IMAGE_GUARD_XFG_ENABLED"),
+            "{err}"
+        );
+        let err = match pack(cfg_pack_request(&bytes)) {
+            Err(e) => e,
+            Ok(_) => panic!("XFG pack must fail closed"),
+        };
+        assert!(
+            err.to_string().contains("IMAGE_GUARD_XFG_ENABLED"),
+            "{err}"
+        );
     }
 }
 

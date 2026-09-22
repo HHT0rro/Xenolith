@@ -4,31 +4,39 @@
   "corpus": "target/stats-corpus.c → WSL gcc -O1 -fPIC -shared -fno-inline",
   "functions": 1440,
   "generated_on": "2026-09-08",
-  "mixed_native": 1140,
+  "mixed_native": 1153,
   "task": "TASK-023",
   "top_reasons": [
     {
-      "count": 467,
+      "count": 479,
       "reason": "vm-export : unfused flags"
     },
     {
       "count": 360,
-      "reason": "vm-export unsupported Call"
-    },
-    {
-      "count": 133,
-      "reason": "vm-export unsupported Lea"
+      "reason": "vm-export : unsupported call"
     },
     {
       "count": 120,
-      "reason": "vm-export unsupported Mulsd"
+      "reason": "vm-export : unsupported Mulsd"
+    },
+    {
+      "count": 120,
+      "reason": "vm-export : unsupported Test operand width"
     },
     {
       "count": 60,
       "reason": "vm-export : jcc without fused cmp"
+    },
+    {
+      "count": 13,
+      "reason": "vm-export : unsupported Xor operand width"
+    },
+    {
+      "count": 1,
+      "reason": "vm-export : unsupported Lea"
     }
   ],
-  "transformed": 300,
-  "transformed_bytes": 5298,
+  "transformed": 287,
+  "transformed_bytes": 5233,
   "unsupported": 0
 }

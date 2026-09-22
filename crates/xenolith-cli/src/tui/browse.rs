@@ -8,10 +8,15 @@ pub struct DirRow {
     pub name: String,
     pub path: PathBuf,
     pub is_dir: bool,
+    /// Plausibly openable (PE/ELF/project by extension). The final say is
+    /// `classify()` on the bytes; non-openable rows are listed but dimmed.
+    pub openable: bool,
 }
 
-/// Anything the Pick screen opens: PE (`*.dll`/`*.exe`), ELF
-/// (`*.so`/`*.elf`), or a saved project (`*.xenolith.json`).
+/// Anything the Pick screen opens: PE (`*.dll`/`*.exe`/`*.sys`/`*.ocx`/
+/// `*.cpl`/`*.scr`), ELF (`*.so`/`*.elf`), or a saved project
+/// (`*.xenolith.json`). `open_file` still classifies bytes, so this is a
+/// display hint, not a hard filter.
 pub fn is_pickable_name(name: &str) -> bool {
     let p = Path::new(name);
     let ext = p
@@ -19,12 +24,36 @@ pub fn is_pickable_name(name: &str) -> bool {
         .and_then(|e| e.to_str())
         .map(|s| s.to_ascii_lowercase());
     match ext.as_deref() {
-        Some("dll") | Some("exe") | Some("so") | Some("elf") => true,
+        Some("dll") | Some("exe") | Some("sys") | Some("ocx") | Some("cpl") | Some("scr")
+        | Some("so") | Some("elf") => true,
         Some("json") => {
             let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             stem.to_ascii_lowercase().ends_with(".xenolith")
         }
         _ => false,
+    }
+}
+
+/// Windows drive roots (`C:\`, `D:\`, …) so the picker can cross drives at a
+/// root where `..` does not exist. Empty on non-Windows.
+pub fn drive_roots() -> Vec<DirRow> {
+    #[cfg(windows)]
+    {
+        (b'A'..=b'Z')
+            .filter_map(|letter| {
+                let root = PathBuf::from(format!("{}:\\", letter as char));
+                root.is_dir().then(|| DirRow {
+                    name: format!("{}:\\", letter as char),
+                    path: root,
+                    is_dir: true,
+                    openable: true,
+                })
+            })
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
     }
 }
 
@@ -49,9 +78,11 @@ pub fn parent_of(path: &Path) -> Option<PathBuf> {
     Some(parent.to_path_buf())
 }
 
-/// `..` (when not at a root) + subdirectories + files `is_pickable_name`
-/// accepts (PE, ELF, project JSON). Directories first, then case-insensitive
-/// name. `read_dir` errors propagate; unreadable individual entries are skipped.
+/// `..` (when not at a root), Windows drive roots at a root, subdirectories,
+/// and every regular file (non-openable ones carry `openable: false` so the
+/// UI can dim them instead of hiding them). Directories first, then
+/// case-insensitive name. `read_dir` errors propagate; unreadable individual
+/// entries are skipped.
 pub fn read_dir_sorted(cwd: &Path) -> io::Result<Vec<DirRow>> {
     let mut rows = Vec::new();
     if let Some(parent) = parent_of(cwd) {
@@ -59,7 +90,10 @@ pub fn read_dir_sorted(cwd: &Path) -> io::Result<Vec<DirRow>> {
             name: "..".into(),
             path: parent,
             is_dir: true,
+            openable: true,
         });
+    } else {
+        rows.extend(drive_roots());
     }
     let mut rest = Vec::new();
     for ent in std::fs::read_dir(cwd)? {
@@ -76,13 +110,12 @@ pub fn read_dir_sorted(cwd: &Path) -> io::Result<Vec<DirRow>> {
             Err(_) => continue,
         };
         let is_dir = ft.is_dir();
-        if !is_dir && !is_pickable_name(&name) {
-            continue;
-        }
+        let openable = is_pickable_name(&name);
         rest.push(DirRow {
             path: ent.path(),
             name,
             is_dir,
+            openable,
         });
     }
     rest.sort_by(|a, b| match (a.is_dir, b.is_dir) {
@@ -122,6 +155,10 @@ mod tests {
         for ok in [
             "a.dll",
             "B.EXE",
+            "driver.sys",
+            "ctrl.ocx",
+            "panel.cpl",
+            "save.scr",
             "lib.so",
             "x.SO",
             "app.elf",
@@ -143,6 +180,16 @@ mod tests {
     }
 
     #[test]
+    fn drive_roots_are_dirs_or_empty() {
+        let roots = drive_roots();
+        for r in roots {
+            assert!(r.is_dir, "{}", r.name);
+            assert!(r.openable, "{}", r.name);
+            assert!(r.name.ends_with(':') || r.name.ends_with('\\'), "{}", r.name);
+        }
+    }
+
+    #[test]
     fn parent_of_empty_is_none() {
         assert!(parent_of(Path::new("")).is_none());
         assert!(parent_of(Path::new("/")).is_none());
@@ -159,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_dirs_first_then_pickable_skips_other_files() {
+    fn lists_dirs_first_then_dims_unopenable_files() {
         let root = unique_dir("sort");
         fs::create_dir_all(root.join("sub")).unwrap();
         fs::create_dir_all(root.join("Aaa")).unwrap();
@@ -174,11 +221,16 @@ mod tests {
         let rows = read_dir_sorted(&root).unwrap();
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         assert!(names.contains(&".."), "{names:?}");
-        assert!(!names.contains(&"notes.txt"), "{names:?}");
-        assert!(!names.contains(&"other.json"), "{names:?}");
+        // Unopenable files stay listed (dimmed in the UI), never hidden.
+        let notes = rows.iter().find(|r| r.name == "notes.txt").unwrap();
+        assert!(!notes.openable, "notes.txt must be dimmed, not hidden");
+        let other = rows.iter().find(|r| r.name == "other.json").unwrap();
+        assert!(!other.openable, "{names:?}");
         for listed in ["lib.so", "app.elf", "p.xenolith.json"] {
             assert!(names.contains(&listed), "{names:?}");
         }
+        let openable = rows.iter().find(|r| r.name == "p.xenolith.json").unwrap();
+        assert!(openable.openable, "{names:?}");
 
         let rest: Vec<&DirRow> = rows.iter().filter(|r| r.name != "..").collect();
         assert!(rest[0].is_dir && rest[1].is_dir, "{names:?}");
@@ -199,6 +251,8 @@ mod tests {
                 "app.elf",
                 "B.EXE",
                 "lib.so",
+                "notes.txt",
+                "other.json",
                 "p.xenolith.json",
                 "z.dll"
             ]

@@ -28,11 +28,12 @@ const DT_VERSYM: u64 = 0x6ffffff0;
 const DT_HASH: u64 = 4;
 const DT_GNU_HASH: u64 = 0x6FFF_FEF5;
 const DF_1_PIE: u64 = 0x0800_0000;
-const R_X86_64_COPY: u32 = 5;
 const R_X86_64_TPOFF32: u32 = 23;
 const R_X86_64_IRELATIVE: u32 = 37;
-const R_X86_64_TLSDESC: u32 = 36;
 const STT_GNU_IFUNC: u8 = 10;
+const PN_XNUM: usize = 0xFFFF;
+/// Sane phdr-table bound: real images stay below ~30 entries.
+const MAX_PHNUM: usize = 4096;
 
 #[derive(Clone, Debug)]
 pub struct ProgramHeader {
@@ -80,8 +81,22 @@ pub fn parse(bytes: &[u8]) -> Result<Elf64, FormatError> {
     let entry = read_u64(bytes, 24)?;
     let phoff = read_u64(bytes, 32)? as usize;
     let phentsize = read_u16(bytes, 54)? as usize;
-    let phnum = read_u16(bytes, 56)? as usize;
-    if phentsize < 56 || phnum == 0 || phnum > 128 {
+    let phnum_raw = read_u16(bytes, 56)? as usize;
+    // PN_XNUM (extended numbering): the real count lives in shdr[0].sh_info.
+    let phnum = if phnum_raw == PN_XNUM {
+        let shoff = read_u64(bytes, 40)? as usize;
+        let shentsize = read_u16(bytes, 58)? as usize;
+        if shoff == 0
+            || shentsize < 64
+            || shoff.saturating_add(shentsize) > bytes.len()
+        {
+            return Err(FormatError::Invalid("ELF program headers"));
+        }
+        read_u32(bytes, shoff + 44)? as usize // shdr[0].sh_info
+    } else {
+        phnum_raw
+    };
+    if phentsize < 56 || phnum == 0 || phnum > MAX_PHNUM {
         return Err(FormatError::Invalid("ELF program headers"));
     }
     let mut relro = false;
@@ -112,7 +127,11 @@ pub fn parse(bytes: &[u8]) -> Result<Elf64, FormatError> {
     }
     let dynamic = dynamic_off.is_some();
     if !dynamic {
-        return Err(FormatError::Invalid("static ELF is not packed in this release"));
+        return Err(FormatError::Invalid(
+            "static ELF (no PT_DYNAMIC) is not packed in this release: the injected \
+             bootstrap requires ld.so, so statically linked images (Go w/o cgo, \
+             musl targets, busybox) are out of scope",
+        ));
     }
     let dyn_off = dynamic_off.unwrap();
     let mut pie = kind == ImageKind::Elf64Dyn;
@@ -138,7 +157,6 @@ pub fn parse(bytes: &[u8]) -> Result<Elf64, FormatError> {
         i += 16;
     }
     scan_rela(bytes, phoff, phentsize, phnum, rela_off, rela_sz)?;
-    scan_ifunc(bytes, phoff, phentsize, phnum, dyn_off, dynamic_sz)?;
     Ok(Elf64 {
         kind,
         pie,
@@ -312,29 +330,27 @@ fn scan_rela(
     }
     let off = vaddr_to_off(bytes, phoff, phentsize, phnum, rela_vaddr)?;
     let n = (rela_sz as usize) / 24;
-    if n > 1_000_000 {
+    if n > 1 << 23 {
         return Err(FormatError::Invalid("ELF rela count"));
     }
     for i in 0..n {
         let info = read_u64(bytes, off + i * 24 + 8)?;
         let kind = (info & 0xffff_ffff) as u32;
         match kind {
-            R_X86_64_COPY => {
-                return Err(FormatError::Invalid("ELF copy relocation is not packed"));
-            }
-            R_X86_64_TLSDESC => {
-                return Err(FormatError::Invalid(
-                    "ELF TLS descriptor reloc is not packed",
-                ));
-            }
             // R_X86_64_IRELATIVE: allowed since TASK-022 — resolvers run
             // during ld.so relocation (before INIT_ARRAY), so the packer
             // keeps their pages native; see `ifunc_resolvers`.
-            // R_X86_64_TPOFF64 (18) targets an RW GOT slot: initial-exec,
-            // unaffected by sealing RX pages.
+            // R_X86_64_COPY: writes the shared-library data into this
+            // image's RW .bss at relocation time — a page class the packer
+            // never seals (only executable PT_LOAD file bytes are sealed).
+            // R_X86_64_TLSDESC: resolved by ld.so into the RW GOT before
+            // INIT_ARRAY — likewise outside the seal set.
+            // R_X86_64_TPOFF64 (18): targets an RW GOT slot (initial-exec).
             R_X86_64_TPOFF32 => {
-                // Local-exec: offset embedded in the text itself — the page
-                // restore would wipe the ld.so-applied value.
+                // Local-exec: the offset is embedded in the text itself, and
+                // the ld.so write happens before the stub restores plaintext —
+                // the page restore would wipe the applied value. Still
+                // rejected because its target IS a sealed RX page.
                 return Err(FormatError::Invalid(
                     "ELF R_X86_64_TPOFF32 (text TLS offset) is not packed",
                 ));
@@ -402,15 +418,16 @@ fn dynsym_extent(
             return Ok(Some((off, off.saturating_add(end * 24))));
         }
     }
-    // Fallback: the classic layout, when no hash table states the count.
-    // Without this bound, bytes past .dynsym read as garbage symbols.
-    let end = if strtab > symtab {
-        match vaddr_to_off(bytes, phoff, phentsize, phnum, strtab) {
-            Ok(o) => o,
-            Err(_) => bytes.len(),
-        }
-    } else {
-        bytes.len()
+    // Fallback: the classic layout (.dynstr directly after .dynsym) when no
+    // hash table states the count. Without a table-derived or layout bound
+    // the rest of the file decodes as garbage symbols — refuse to guess and
+    // let callers skip the scan instead (prefer missing over wrong).
+    if strtab <= symtab {
+        return Ok(None);
+    }
+    let end = match vaddr_to_off(bytes, phoff, phentsize, phnum, strtab) {
+        Ok(o) => o,
+        Err(_) => return Ok(None),
     };
     Ok(Some((off, end)))
 }
@@ -456,45 +473,14 @@ fn gnu_hash_sym_count(
     Some(idx)
 }
 
-fn scan_ifunc(
-    bytes: &[u8],
-    phoff: usize,
-    phentsize: usize,
-    phnum: usize,
-    dyn_off: usize,
-    dynamic_sz: usize,
-) -> Result<(), FormatError> {
-    let Some((off, end)) = dynsym_extent(bytes, phoff, phentsize, phnum, dyn_off, dynamic_sz)?
-    else {
-        return Ok(());
-    };
-    let n_syms = (end.saturating_sub(off)) / 24;
-    for n in 0..n_syms.min(65_536) {
-        let so = off + n * 24;
-        if so + 24 > bytes.len() {
-            break;
-        }
-        let info = bytes[so + 4];
-        let ty = info & 0xf;
-        let shndx = u16::from_le_bytes([bytes[so + 6], bytes[so + 7]]);
-        if ty == STT_GNU_IFUNC {
-            if shndx == 0 {
-                // An IMPORTED ifunc: ld.so must run someone else's resolver
-                // during our load — outside our control, keep failing closed.
-                return Err(FormatError::Invalid(
-                    "ELF imported IFUNC symbol is not packed",
-                ));
-            }
-            // Defined here: the resolver runs pre-init, but its address is
-            // known — the packer keeps that page native (see
-            // ifunc_symbol_values / ifunc_resolvers).
-        }
-    }
-    Ok(())
-}
-
 /// Load-relative addresses of every STT_GNU_IFUNC symbol DEFINED in this
-/// object (the resolvers ld.so may call at relocation time).
+/// object (the resolvers ld.so may call at relocation time). IMPORTED IFUNC
+/// symbols (st_shndx == 0) are deliberately absent: their GLOB_DAT/PLT
+/// slots live in RW GOT pages and ld.so resolves them before INIT_ARRAY,
+/// the same window that handles defined resolvers — no page of ours is
+/// executed before the stub restored it, so neither flavor needs to be
+/// rejected (the packer keeps defined-resolver pages native via this
+/// function and `ifunc_resolvers`).
 pub fn ifunc_symbol_values(bytes: &[u8], elf: &Elf64) -> Result<Vec<u64>, FormatError> {
     let phdrs = program_headers(bytes, elf)?;
     let (mut dyn_off, mut dyn_sz) = (None, 0usize);
@@ -842,14 +828,74 @@ mod tests {
     }
 
     #[test]
-    fn real_imported_ifunc_inside_dynsym_still_fails_closed() {
+    fn real_imported_ifunc_inside_dynsym_is_accepted() {
+        // An UNDEFINED STT_GNU_IFUNC in .dynsym (as glibc's memcpy/strlen
+        // appear in every dynamically linked binary's dynsym) is resolved by
+        // ld.so into the RW GOT before INIT_ARRAY — same window as defined
+        // resolvers — so it is no longer a rejection.
         let mut gap = vec![0u8; 40];
         gap[28] = 0x1a;
         let img = elf_with_dynsym(0x0a, &gap); // sym1 st_info type 10, shndx 0
-        match parse(&img) {
-            Err(FormatError::Invalid(m)) => assert!(m.contains("imported IFUNC"), "{m}"),
-            other => panic!("real imported IFUNC must fail closed, got {other:?}"),
+        parse(&img).expect("imported IFUNC must be accepted");
+    }
+
+    #[test]
+    fn dynsym_without_hash_or_layout_bound_skips_scan() {
+        // strtab <= symtab and no DT_HASH/DT_GNU_HASH: the extent is
+        // unknowable, so the scan is skipped instead of decoding the whole
+        // file as symbols.
+        let img = elf_with_dynsym_no_hash(0x0a);
+        parse(&img).expect("unbounded dynsym must not fail the parse");
+    }
+
+    /// Same shape as `elf_with_dynsym` but with no DT_HASH: forces the
+    /// dynsym-extent fallback path with strtab > symtab removed by pointing
+    /// DT_STRTAB *below* DT_SYMTAB.
+    fn elf_with_dynsym_no_hash(sym1_info: u8) -> Vec<u8> {
+        const PHOFF: usize = 64;
+        const DYN_OFF: usize = PHOFF + 2 * 56;
+        let sym_off = DYN_OFF + 3 * 16; // 2 tags + DT_NULL
+        let str_off = sym_off - 8; // below symtab
+
+        let mut dyns: Vec<u8> = Vec::new();
+        for (tag, val) in [
+            (DT_SYMTAB, sym_off as u64),
+            (DT_STRTAB, str_off as u64),
+        ] {
+            dyns.extend_from_slice(&tag.to_le_bytes());
+            dyns.extend_from_slice(&val.to_le_bytes());
         }
+        dyns.extend_from_slice(&[0u8; 16]); // DT_NULL
+
+        let mut img = vec![0u8; DYN_OFF];
+        img[0..4].copy_from_slice(b"\x7fELF");
+        img[4] = 2;
+        img[5] = 1;
+        img[16..18].copy_from_slice(&ET_DYN.to_le_bytes());
+        img[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
+        img[32..40].copy_from_slice(&(PHOFF as u64).to_le_bytes());
+        img[54..56].copy_from_slice(&56u16.to_le_bytes());
+        img[56..58].copy_from_slice(&2u16.to_le_bytes());
+        img.resize(DYN_OFF, 0);
+        let total = (sym_off + 24) as u64;
+        img[PHOFF..PHOFF + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        img[PHOFF + 4..PHOFF + 8].copy_from_slice(&5u32.to_le_bytes());
+        img[PHOFF + 32..PHOFF + 40].copy_from_slice(&total.to_le_bytes());
+        img[PHOFF + 40..PHOFF + 48].copy_from_slice(&total.to_le_bytes());
+        let d = PHOFF + 56;
+        img[d..d + 4].copy_from_slice(&PT_DYNAMIC.to_le_bytes());
+        img[d + 8..d + 16].copy_from_slice(&(DYN_OFF as u64).to_le_bytes());
+        img[d + 16..d + 24].copy_from_slice(&(DYN_OFF as u64).to_le_bytes());
+        img[d + 32..d + 40].copy_from_slice(&(dyns.len() as u64).to_le_bytes());
+        img.extend_from_slice(&dyns);
+        img.extend_from_slice(&[0u8; 24]); // sym0
+        img.extend_from_slice(&1u32.to_le_bytes());
+        img.push(sym1_info);
+        img.push(0x00);
+        img.extend_from_slice(&0u16.to_le_bytes());
+        img.extend_from_slice(&0u64.to_le_bytes());
+        img.extend_from_slice(&0u64.to_le_bytes());
+        img
     }
 }
 

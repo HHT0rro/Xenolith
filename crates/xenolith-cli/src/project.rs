@@ -68,12 +68,15 @@ fn default_schema() -> u32 {
 }
 
 impl ProjectFile {
+    /// Map the stored string onto the loader profile. `load()` validates the
+    /// enum first with the file name in the message; this is the direct
+    /// caller's check for hand-built structs (no file context available).
     pub fn profile(&self) -> Result<Profile> {
         match self.profile.as_str() {
             "fast" => Ok(Profile::Fast),
             "standard" => Ok(Profile::Standard),
             "max" => Ok(Profile::Max),
-            other => bail!("unknown profile {other}"),
+            other => bail!("unknown profile `{other}` (legal values: fast|standard|max)"),
         }
     }
 }
@@ -90,7 +93,8 @@ pub fn load(path: &Path) -> Result<ProjectFile> {
             );
         }
     }
-    let mut value: serde_json::Value = serde_json::from_str(&text)?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
     let version = value
         .get("schema_version")
         .and_then(|v| v.as_u64())
@@ -104,8 +108,30 @@ pub fn load(path: &Path) -> Result<ProjectFile> {
             version
         );
     }
-    let file: ProjectFile = serde_json::from_value(value)?;
+    // Field-level failures (missing input/output, wrong types) name the file
+    // so a broken project is actionable instead of a bare serde dump.
+    let file: ProjectFile = serde_json::from_value(value)
+        .with_context(|| format!("fields in {}", path.display()))?;
+    validate(&file, path)?;
     Ok(file)
+}
+
+/// Lightweight validation applied on every `load()`. This is what makes
+/// `project show` exit non-zero on a bad file before anything is printed:
+/// profile must be a known enum value and every select_rva entry must parse
+/// as RVA:LEN. Fail-closed — no downstream consumer sees an unvalidated file.
+fn validate(file: &ProjectFile, path: &Path) -> Result<()> {
+    if !matches!(file.profile.as_str(), "fast" | "standard" | "max") {
+        bail!(
+            "unknown profile `{}` in {} (legal values: fast|standard|max)",
+            file.profile,
+            path.display()
+        );
+    }
+    if let Err(e) = parse_select_rva(&file.select_rva) {
+        bail!("invalid select_rva in {}: {e}", path.display());
+    }
+    Ok(())
 }
 
 pub fn parse_select_rva(specs: &[String]) -> Result<Vec<(u32, u32)>> {

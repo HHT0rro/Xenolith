@@ -7,10 +7,14 @@
 //! during DT_INIT — before INIT_ARRAY, before the ELF entry — then forwards
 //! to the original DT_INIT.
 //!
-//! Fail-closed (stage 5 will revisit): PT_TLS, IFUNC symbols, IRELATIVE and
-//! TLSDESC relocations, copy relocations, static linkage, missing DT_INIT,
-//! and R_X86_64_RELATIVE entries that target encrypted pages (ld.so applies
-//! them before DT_INIT; restoring plaintext would silently undo them).
+//! Accepted since TASK-022: PT_TLS, IRELATIVE, imported IFUNC (shndx==0),
+//! TLSDESC and copy relocations — ld.so resolves them into RW memory before
+//! INIT_ARRAY and the packer only seals executable PT_LOAD file bytes.
+//!
+//! Fail-closed: static linkage (no PT_DYNAMIC), R_X86_64_TPOFF32 entries that
+//! target the executable text, and R_X86_64_RELATIVE entries that target
+//! encrypted pages (ld.so applies them before DT_INIT; restoring plaintext
+//! would silently undo them).
 
 use crate::runtime_image;
 use crate::stub::{emit_elf_stub, META_ENVELOPE_LEN, META_MEASUREMENT, META_ORIGINAL_ENTRY,
@@ -124,15 +128,28 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
         let _ = va_end;
     }
     if pages.len() > xenolith_loader::MAX_PAGES {
-        return Err(PackError::Invalid("too many pages"));
+        return Err(PackError::Stub(format!(
+            "too many pages: {} > {} (executable bytes ≈ {} KiB); the loader envelope \
+             caps a packed image at {} 4-KiB page records — split the binary or exclude \
+             PT_LOAD segments from packing",
+            pages.len(),
+            xenolith_loader::MAX_PAGES,
+            pages.len() * 4,
+            xenolith_loader::MAX_PAGES
+        )));
     }
 
     let mut measure_src = mba.as_bytes();
     measure_src.extend_from_slice(&opcode_seed);
     measure_src.extend_from_slice(&(pages.len() as u32).to_le_bytes());
     let measurement = image_measurement(&measure_src);
-    let runtime = xenolith_crypto::mix_runtime_key(&mba, &measurement)
-        .map_err(|_| PackError::Invalid("runtime key"))?;
+    let runtime = xenolith_crypto::mix_runtime_key(&mba, &measurement).map_err(|e| {
+        PackError::Stub(format!(
+            "runtime key derivation failed (mba {} B, measurement {} B): {e}",
+            mba.as_bytes().len(),
+            measurement.len()
+        ))
+    })?;
 
     let mut mba_arr = [0u8; 96];
     mba_arr.copy_from_slice(&mba.as_bytes());
@@ -467,7 +484,7 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
                 "tls: PT_TLS kept; models IE(GOTTPOFF)={} LD(DTPMOD/DTPREL)={}; ifunc resolvers={} on {} native pages; symbol versions verneed={} verdef={}",
                 tls_census.0, tls_census.1, resolvers.len(), resolver_pages.len(), verneed, verdef
             ),
-            "fail-closed: TLSDESC, TPOFF32-in-text, copy reloc, static linkage, RELATIVE into RX".into(),
+                "fail-closed: TPOFF32-in-text, static linkage, RELATIVE into sealed page".into(),
             "pages copied RW then RX via raw mprotect; no long-term RWX".into(),
             format!("payload section name: {:02x?}", section_name_from_seed(&opcode_seed, 0)),
         ],

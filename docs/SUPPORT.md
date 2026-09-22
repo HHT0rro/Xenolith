@@ -33,7 +33,9 @@ The following are **not** the product runtime:
 | Windows AMD64 PE64 DLL | Yes | Yes, via system `LoadLibrary` (`GATE 3 OK result=Some(7)`) |
 | Windows AMD64 PE64 EXE | Yes | Yes on this Windows host (`hello-exe` prints `xenolith-hello`); selected-export VM still needs a named export or `--select-rva` |
 | Linux AMD64 ELF64 ET_DYN / ET_EXEC / .so | Yes — appends an R+X PT_LOAD (relocated PHDR table + PIC stub + `xl_core` + EnvelopeV2) and redirects INIT_ARRAY[0] to the stub; ld.so stays the loader (PIE/RELRO/GOT-PLT untouched) | Verified in WSL Ubuntu 24.04: packed `hello-elf` prints `xenolith-hello-elf`; packed `libhello-elf.so` dlopen/dlclose OK (`packed_elf_prints_hello`). PT_TLS, IFUNC, TLSDESC, copy reloc, static, RELATIVE-into-RX fail closed |
-| ARM64, x86-32, macOS, Android, .NET mixed-mode | Rejected or unparsed | Out of scope for this version |
+| ARM64, x86-32, macOS, Android | Rejected or unparsed | Out of scope for this version |
+| .NET mixed-mode images (COM descriptor / CLR header, datadir 14 present) | **Rejected** with a named diagnostic | Out of scope for this version |
+| CFG-instrumented images (`DllCharacteristics GUARD_CF` or load-config `GuardFlags` instrumented) | **Rejected** with a named diagnostic | The loader GuardCF-checks a CFG image's entry against GFIDS; the packed stub entry is not registered there and the process fast-fails (0xC0000409) at load. Rebuild without `/guard:cf`, or wait for GFIDS-aware packing |
 
 Current `pack()` also:
 
@@ -44,7 +46,78 @@ Current `pack()` also:
 - output suffix follows kind: `.xl.dll` / `.xl.exe` / `.xl.so` / `.xl.elf`
 
 C++ exceptions, setjmp/longjmp, varargs, 8-byte struct returns and tail calls are verified through **packed** images on both OSes (`packed_eh_matrix`, `packed_elf_eh_matrix`); the injected stub carries synthesized unwind records (PE: XDATA + relocated .pdata with the stub RUNTIME_FUNCTION; ELF: appended .eh_frame + PT_GNU_EH_FRAME). Rust panic-unwind through a packed image is not separately frozen; On Linux, IFUNC (resolver pages stay native), symbol versions (DT_VERNEED/VERDEF preserved, dlvsym-verified) and initial-exec/local-dynamic TLS are supported packed; imported IFUNC, TLS descriptors, local-exec TPOFF32 and static linkage still fail closed.
-TLS callbacks, delay-load imports, and ordinal-only imports fail closed or are stripped. On ELF, executable PT_LOAD file bytes are 0x90-filled and sealed in EnvelopeV2, except the first 64 bytes at `e_entry` which stay original — glibc (2.39 verified) decodes an ~40-byte instruction window at the entry point and suppresses the whole init phase when it cannot; that window is the `_start` prologue, not protected logic. Linux IFUNC/TLS descriptor/copy reloc/PT_TLS still fail closed until stage 5. Those remaining gaps are defects relative to G3/G4, not features.
+TLS callback images keep the directory with the first callback wrapped by the stub; delay-load and ordinal-only imports are packed (see "Imports: delay-load and ordinal"). On ELF, executable PT_LOAD file bytes are 0x90-filled and sealed in EnvelopeV2, except the first 64 bytes at `e_entry` which stay original — glibc (2.39 verified) decodes an ~40-byte instruction window at the entry point and suppresses the whole init phase when it cannot; that window is the `_start` prologue, not protected logic. Linux IFUNC/TLS descriptor/copy reloc/PT_TLS still fail closed until stage 5. Those remaining gaps are defects relative to G3/G4, not features.
+
+### ASLR / DIR64 pairing (current)
+
+Packed images keep ASLR (`DYNAMIC_BASE` + reloc directory). The system loader
+applies every DIR64 fixup at map time; `xl_core` then decrypts the protected
+pages back to their **unrelocated** plaintext and re-applies the loader's
+fixups for the slots that live inside protected pages. Two invariants make
+that pairing hold (both sides are frozen by tests that pack and run a
+delta≠0 ASLR image):
+
+- **AAD pairing:** the packer authenticates the reloc-table byte length
+  (`record count * 8`) in the region AAD tail (`aad[28..32]`,
+  `xenolith_protocol::region_aad`); `xl_core` derives the same value from the
+  envelope. A mismatch made every AEAD open fail for any image whose envelope
+  carried at least one reloc record — the historical "ASLR EXE exits 0
+  silently" defect.
+- **Delta recovery:** the loader rewrites the in-memory
+  `OptionalHeader.ImageBase` to the actual base while relocating, so the
+  preferred base cannot be read back at runtime. `xl_core` instead recovers
+  delta from the packer's disk invariant (protected page bodies are `0xCC`):
+  before decrypting, each recorded slot holds `0xCCCC…CC + delta`; all
+  recorded slots must agree, otherwise boot fails closed. After decrypt +
+  re-apply, a recorded slot equals `original + delta` (verified: packed
+  `xz` under ASLR, slot `base+0xce38 == base+0xcdb0`).
+
+### Packed-image boot failure codes (PE EXE)
+
+When the boot fails closed, a packed EXE exits with the failing stage so a
+dead `rc=0, no output` names its cause. A packed DLL always returns 0
+(`FALSE`) — a nonzero `DllMain` return would present a failed boot to the
+loader as init success. The ELF stub keeps its existing fail-closed contract
+(return success + `0xCC` trap pages at lowered gates); stages do not apply.
+
+| Exit code | Stage | Meaning |
+| --- | --- | --- |
+| 0 | `STAGE_UNKNOWN` | Pre-core failure without a recorded stage (packer bug; report) |
+| 1 | `STAGE_MAGIC` | Envelope signature mismatch |
+| 2 | `STAGE_KERNEL32` | PEB walk found no kernel32 |
+| 3 | `STAGE_EXPORT_DIR` | kernel32 export directory unusable |
+| 4 | `STAGE_APIS` | `GetProcAddress` / `LoadLibraryA` / `VirtualProtect` unresolved |
+| 5 | `STAGE_DEBUGGER` | An anti-debug probe fired (`max` profile) |
+| 6 | `STAGE_CORE` | `xl_core_activate` failed (AEAD open, import resolution, reloc apply) |
+| 7 | `STAGE_NO_CORE` | Stub emitted without a core image |
+| 8 | `STAGE_OPCODE` | Unknown VM opcode (legacy no-core path) |
+| 9 | `STAGE_DIGEST` | Page digest mismatch (tamper; legacy path) |
+| 10 | `STAGE_PROTECT` | `VirtualProtect` failed |
+| 11 | `STAGE_RESOLVE` | `LoadLibraryA` / `GetProcAddress` failed on an import |
+| 12 | `STAGE_PE` | No PE signature at the image base |
+| 13 | `STAGE_DLL_STATE` | DLL attach state not process-attach |
+
+### Imports: delay-load and ordinal (current)
+
+- **Delay-load imports (datadir 13) are packed as-is.** The PE64 loader
+  ignores the delay directory; the application's own `__delayLoadHelper2`
+  resolves lazily through the app's IAT (`LoadLibraryA` / `GetProcAddress`
+  slots), which the packer fills exactly like every other import. The delay
+  descriptors are plain data the packer never touches. Verified with a real
+  12.7 MB `cargo.exe` (2249 protected pages, two delay descriptors, zero
+  ordinals, no GUARD_CF): the packed image runs and `cargo --version` prints
+  `cargo 1.95.0` with exit 0. If runtime evidence ever contradicts this, the
+  fallback is per-mode rejection (writeback refuses, TLS-keep/fast allow) —
+  never silent packing.
+- **Ordinal-only imports are packed** and recorded under the reserved display
+  name `#<decimal ordinal>` (e.g. `#116`). `#` at the start of an import
+  name is a Xenolith-reserved prefix — a DLL can technically export a literal
+  `#116` name, and such a collision would mis-bind, so the prefix is
+  reserved and documented here. The writeback runtime detects the reserved
+  prefix and resolves through `GetProcAddress`'s ordinal channel
+  (`MAKEINTRESOURCE` semantics). Resolution failure fails the boot closed
+  (`STAGE_CORE`). TLS-keep/fast images never reach this path (the system
+  loader resolves their disk IAT natively).
 
 ### Functions (current)
 
@@ -106,7 +179,7 @@ The first production version, if and only if G0–G8 in the architecture plan pa
 | Functions | Internal functions, integer/memory/stack, direct and indirect calls, function pointers, recursion, jump tables, plus the stage-5 exception/thread/float/vector set. Not "named exports only" and not "two u32 leaf functions only". |
 | Selection | Export, symbol, PDB/DWARF, unwind metadata, or explicit address range. Uncertain boundaries are reported, never guessed. |
 | Honesty | Report `transformed` / `mixed_native` / `unsupported` / `boundary_uncertain`. Strict mode fails the pack if the requested level is not met. Compatibility fallback must not count native leftovers as obfuscated. |
-| Production load | System loader, ASLR/PIE, W^X, TLS, imports/dynamic linking, unwind info usable. Unimplemented semantics fail closed. Do not disable ASLR, DEP/NX, W^X, CFG/CET, or RELRO to gain compatibility. |
+| Production load | System loader, ASLR/PIE, W^X, TLS, imports/dynamic linking, unwind info usable. Unimplemented semantics fail closed. Do not disable ASLR, DEP/NX, W^X, CFG/CET, or RELRO to gain compatibility. Current status: ASLR/PIE packed images re-apply DIR64 fixups on decrypted pages (see the ASLR/DIR64 pairing section). CFG/CET-instrumented images are refused at pack time (the packed entry is not in GFIDS); disabling the guard bit is explicitly out of scope. |
 | Imports | Windows IAT and Linux GOT/PLT are separate models. Do not mix them. Do not promise that every loader-required name is deleted, or that the target of an API call is unobservable at the call instant. |
 | Residency | Protected code does not remain as complete original plaintext long-term; dormant regions do not leak plaintext. The currently executing region remains observable. |
 | Kernel | Optional signed / supported access control: `off` / `optional` / `required`. Not "move the user program into the kernel". Not resistance to a malicious kernel or hypervisor. |

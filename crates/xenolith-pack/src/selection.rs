@@ -1,7 +1,7 @@
 //! Function selection: named export, explicit RVA+length, fail-closed otherwise.
 
 use crate::analysis::function_map::{BoundarySource, FunctionMap, MappedFunction};
-use crate::lift::forbidden_vm_name;
+use crate::lift::forbidden_vm_rule;
 use xenolith_formats::Pe64;
 use thiserror::Error;
 
@@ -63,10 +63,20 @@ impl FunctionSelector {
         explicit.extend(self.functions.iter().cloned());
         explicit.sort();
         explicit.dedup();
+        // CLI origin per name, so the error names the flag the user typed.
+        let origin_of = |name: &str| -> &'static str {
+            if self.exports.iter().any(|e| e == name) {
+                "vm-export"
+            } else {
+                "select-function"
+            }
+        };
         for name in &explicit {
-            if forbidden_vm_name(name) {
+            if let Some(rule) = forbidden_vm_rule(name) {
                 return Err(SelectError::Invalid(format!(
-                    "vm-export {name}: CRT/DllMain/JNI stay native"
+                    "{flag} {name}: stays native ({rule}); CRT/DllMain/JNI ABI exports \
+                     must stay native — pick another function",
+                    flag = origin_of(name)
                 )));
             }
             if let Some(exp) = exports.iter().find(|e| e.name == *name) {
@@ -111,8 +121,40 @@ impl FunctionSelector {
                     continue;
                 }
             }
+            let first = runtime.first().map(|r| format!("fn_{:#x}", r.begin_rva));
+            // The exports list is already resolved above — hand it back so a
+            // typo'd name is a one-glance fix instead of a second tool run.
+            const MAX_LISTED: usize = 8;
+            let named: Vec<&str> = exports
+                .iter()
+                .map(|e| e.name.as_str())
+                .filter(|n| !n.is_empty())
+                .collect();
+            let available = if named.is_empty() {
+                "This image exports nothing by name (ordinal-only or no export directory).".to_string()
+            } else {
+                let listed: Vec<&str> = named.iter().take(MAX_LISTED).copied().collect();
+                let more = if named.len() > MAX_LISTED {
+                    format!(" … (+{} more)", named.len() - MAX_LISTED)
+                } else {
+                    String::new()
+                };
+                format!(
+                    "Available exports ({} of {}): {}{}. Full list: run \
+                     `xenolith inspect <input> --exports`.",
+                    listed.len(),
+                    named.len(),
+                    listed.join(", "),
+                    more
+                )
+            };
             return Err(SelectError::Invalid(format!(
-                "select-function {name} is missing (no export/COFF symbol)"
+                "{flag} {name} is missing: it is neither an export nor a COFF symbol. \
+                 Unexported internal functions can still be selected as fn_<rva> using a \
+                 .pdata begin RVA (this image starts its unwind entries at {first}), or \
+                 with an explicit --select-rva <rva>:<len>. {available}",
+                flag = origin_of(name),
+                first = first.as_deref().unwrap_or("nothing — this image has no .pdata")
             )));
         }
 
@@ -122,7 +164,7 @@ impl FunctionSelector {
             discovered.sort();
             discovered.dedup();
             for name in discovered {
-                if forbidden_vm_name(&name) {
+                if forbidden_vm_rule(&name).is_some() {
                     continue;
                 }
                 let discovered_rva = exports
@@ -215,6 +257,11 @@ mod tests {
         };
         let err = s.resolve(&pe, &dll).unwrap_err().to_string();
         assert!(err.contains("missing"), "{err}");
+        // The error hands back the usable name surface: the available export
+        // list (truncated with a total) and the inspect command for the rest.
+        assert!(err.contains("Available exports"), "{err}");
+        assert!(err.contains("hello_add"), "{err}");
+        assert!(err.contains("xenolith inspect"), "{err}");
     }
 
     #[test]

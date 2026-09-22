@@ -8,7 +8,6 @@ members = [
     "crates/xenolith-pack",
     "crates/xenolith-vm",
     "crates/xenolith-loader",
-    "crates/xenolith-runtime",
     "crates/xenolith-guard",
     "samples/hello-dll",
     "samples/hello-exe",
@@ -17,8 +16,10 @@ members = [
     "samples/jni-host",
     "samples/jni-rust",
 ]
-# cargo-fuzz builds its own crate outside the workspace toolchain.
-exclude = ["fuzz"]
+# Built outside the workspace toolchain: cargo-fuzz has its own target, and
+# xenolith-runtime must stay a standalone no_std build (its #[panic_handler]
+# conflicts with the std-unified crypto deps of the other members, E0152).
+exclude = ["fuzz", "crates/xenolith-runtime"]
 
 [workspace.package]
 version = "0.1.0"

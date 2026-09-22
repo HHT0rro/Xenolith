@@ -22,8 +22,11 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// pack a PE/ELF into a sealed image
     Pack {
+        /// PE/ELF image to pack. Required unless --project supplies input/output.
         input: Option<PathBuf>,
+        /// Sealed output image. Required unless --project supplies it.
         #[arg(short, long)]
         output: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = ProfileArg::Max)]
@@ -71,6 +74,7 @@ pub enum Command {
         #[arg(long, hide = true)]
         keep_export: Vec<String>,
     },
+    /// show image metadata (format, imports, exports, sections)
     Inspect {
         input: PathBuf,
         #[arg(long)]
@@ -86,10 +90,12 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// create and inspect .xenolith.json project files
     Project {
         #[command(subcommand)]
         cmd: ProjectCmd,
     },
+    /// interactive pack wizard (default when no subcommand)
     Tui {
         input: Option<PathBuf>,
     },
@@ -206,6 +212,8 @@ mod tests {
         cmd.write_long_help(&mut buf).unwrap();
         let top = String::from_utf8(buf).unwrap();
         assert!(top.contains("superoperators") || top.contains("selected named"), "{top}");
+        // About lines surface in the top-level subcommand list.
+        assert!(top.contains("interactive pack wizard (default when no subcommand)"), "{top}");
         let pack = cmd.find_subcommand_mut("pack").expect("pack");
         let mut buf = Vec::new();
         pack.write_long_help(&mut buf).unwrap();
@@ -216,6 +224,8 @@ mod tests {
         assert!(help.contains("select-all"), "{help}");
         assert!(help.contains("allow-native-fallback"), "{help}");
         assert!(help.contains("seed-hex"), "{help}");
+        // The pack about line heads its own help.
+        assert!(help.contains("pack a PE/ELF into a sealed image"), "{help}");
         assert!(help.contains("trace-diverge"), "{help}");
         assert!(!help.contains("c2"), "{help}");
     }

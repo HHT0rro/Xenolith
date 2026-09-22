@@ -14,8 +14,8 @@ pub struct PackDone {
 }
 
 /// Assemble the `PackRequest` the TUI sends. Split out from `spawn_pack` so
-/// the field wiring (especially `select_rva` passthrough) is testable
-/// without running a pack.
+/// the field wiring (especially `select_rva` and `opcode_seed` passthrough)
+/// is testable without running a pack.
 pub fn build_request<'a>(
     bytes: &'a [u8],
     profile: ProfileArg,
@@ -29,13 +29,16 @@ pub fn build_request<'a>(
     lazy_regions: bool,
     protect_imports: bool,
     strict_constants: bool,
+    opcode_seed: Option<[u8; 16]>,
 ) -> PackRequest<'a> {
     PackRequest {
         input: bytes,
         profile: profile.into(),
         vm_exports,
         debug_gate: 3,
-        opcode_seed: None,
+        // Mirrors the CLI's `--seed-hex`: None means the runtime draws a
+        // random seed (Secret32::random) per pack. Never printed anywhere.
+        opcode_seed,
         trace_diverge,
         select_rva,
         select_functions,
@@ -65,6 +68,7 @@ pub fn spawn_pack(
     lazy_regions: bool,
     protect_imports: bool,
     strict_constants: bool,
+    opcode_seed: Option<[u8; 16]>,
     output: PathBuf,
 ) -> anyhow::Result<Receiver<Result<PackDone, String>>> {
     let (tx, rx) = mpsc::channel();
@@ -85,6 +89,7 @@ pub fn spawn_pack(
                 lazy_regions,
                 protect_imports,
                 strict_constants,
+                opcode_seed,
             )) {
                 Ok(packed) => Ok(PackDone {
                     report: packed.report,
@@ -92,7 +97,11 @@ pub fn spawn_pack(
                     output,
                     elapsed: t0.elapsed(),
                 }),
-                Err(e) => Err(e.to_string()),
+                Err(e) => {
+                    // `{e:#}` keeps the whole anyhow cause chain; a bare
+                    // `to_string()` would drop why the top-level step failed.
+                    Err(format!("{e:#}"))
+                }
             };
             let _ = tx.send(msg);
         })
@@ -150,6 +159,7 @@ mod tests {
             false,
             false,
             false,
+            None,
             out.clone(),
         )
         .expect("spawn");
@@ -176,6 +186,7 @@ mod tests {
             true,
             true,
             true,
+            Some([0xab_u8; 16]),
         );
         assert_eq!(req.select_rva, vec![(0x1000, 0x20), (0x7fff, 16)]);
         assert_eq!(req.vm_exports, vec!["f"]);
@@ -184,7 +195,9 @@ mod tests {
         assert!(req.select_all && !req.allow_native_fallback);
         assert!(req.lazy_regions && req.protect_imports && req.strict_constants);
         assert_eq!(req.debug_gate, 3);
-        assert!(req.opcode_seed.is_none());
+        // The seed typed on Configure must reach pack() unchanged; None would
+        // silently fall back to the runtime's random draw.
+        assert_eq!(req.opcode_seed, Some([0xab_u8; 16]));
     }
 
     /// End-to-end passthrough: parsed ranges reach `pack()` and internal
@@ -226,6 +239,7 @@ mod tests {
             false,
             false,
             false,
+            None,
             out.clone(),
         )
         .expect("spawn");

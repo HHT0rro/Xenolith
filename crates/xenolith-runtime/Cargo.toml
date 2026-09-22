@@ -1,8 +1,8 @@
 [package]
 name = "xenolith-runtime"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
 description = "Import-free Windows x64 packer runtime"
 
 [lib]
@@ -16,3 +16,12 @@ chacha20 = { version = "0.9", default-features = false }
 poly1305 = { version = "0.8", default-features = false }
 cipher = { version = "0.4", default-features = false }
 universal-hash = { version = "0.5", default-features = false }
+
+# Mirrors the workspace [profile.release] this crate used while it was a
+# member: a no_std `#[panic_handler]` crate cannot build with unwind panics.
+[profile.release]
+debug = 0
+lto = false
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

@@ -75,6 +75,14 @@ fn main() -> Result<()> {
                 protect_imports,
                 strict_constants,
             )?;
+            // One stderr line before the (possibly minutes-long) pack starts;
+            // stdout stays machine-clean for --json consumers.
+            eprintln!(
+                "packing {} (profile={}, out={})",
+                resolved.input.display(),
+                resolved.profile_label,
+                resolved.output.display()
+            );
             let packed = pack(PackRequest {
                 debug_gate: 3,
                 input: &resolved.bytes,
@@ -96,8 +104,14 @@ fn main() -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&packed.report)?);
             } else {
+                // Hash the bytes back off disk so the digest is the artifact's,
+                // not an in-memory view of it.
+                let digest = match release::sha256_file(&resolved.output) {
+                    Ok(d) => d,
+                    Err(e) => format!("unavailable: {e:#}"),
+                };
                 println!(
-                    "packed -> {} ({} pages, backend={}, iat={}, decrypt_window={}, vm={}, size={}B->{}B)",
+                    "packed -> {} ({} pages, backend={}, iat={}, decrypt_window={}, vm={}, size={}B->{}B)\noutput sha256: {digest}",
                     resolved.output.display(),
                     packed.report.pages,
                     packed.report.backend,
@@ -239,6 +253,10 @@ fn main() -> Result<()> {
                 Ok(())
             }
             ProjectCmd::Show { file } => {
+                // load() runs the lightweight validation (profile enum +
+                // select_rva syntax) with the file name in every message, so a
+                // bad file fails closed here with a non-zero exit and prints
+                // nothing.
                 let p = project::load(&file)?;
                 println!("{}", serde_json::to_string_pretty(&p)?);
                 Ok(())
@@ -248,8 +266,12 @@ fn main() -> Result<()> {
 }
 
 struct ResolvedPack {
+    /// Where the image bytes came from — shown in the pre-pack stderr line.
+    input: PathBuf,
     bytes: Vec<u8>,
     output: PathBuf,
+    /// Profile as the user wrote it (`fast|standard|max`), for messages.
+    profile_label: String,
     profile: xenolith_loader::Profile,
     vm_exports: Vec<String>,
     seed: Option<[u8; 16]>,
@@ -306,8 +328,10 @@ fn resolve_pack(
             bail!("strict-coverage and allow-native-fallback are mutually exclusive");
         }
         return Ok(ResolvedPack {
+            input: file.input.clone(),
             bytes,
             output: out,
+            profile_label: file.profile.clone(),
             profile: file.profile()?,
             vm_exports: vm,
             seed,
@@ -329,8 +353,10 @@ fn resolve_pack(
         bail!("strict-coverage and allow-native-fallback are mutually exclusive");
     }
     Ok(ResolvedPack {
+        input: input.clone(),
         bytes,
         output,
+        profile_label: profile.as_str().to_string(),
         profile: profile.into(),
         vm_exports: vm_export,
         seed,

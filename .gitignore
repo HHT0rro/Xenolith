@@ -16,6 +16,9 @@ samples/**/target
 samples/hello-elf/hello-elf
 samples/hello-elf/libhello-elf.so
 
+# --- Standalone no_std crate (excluded from workspace, builds in its own dir) ---
+crates/xenolith-runtime/target
+
 # --- Reverse-engineering databases / native symbols ---
 *.pdb
 *.i64
