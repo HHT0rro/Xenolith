@@ -2062,10 +2062,13 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn packed_cfg_image_registers_stub_entry_in_gfids() {
-        let bytes = ["out/real-samples/where.exe", "../../out/real-samples/where.exe"]
-            .iter()
-            .find_map(|p| std::fs::read(p).ok())
-            .expect("out/real-samples/where.exe");
+        // A tiny committed /guard:cf build: the test must not depend on
+        // scratch files that only exist on a developer machine.
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/cfg_smoke.exe"
+        ))
+        .expect("tests/fixtures/cfg_smoke.exe");
         let orig = Pe64::parse(&bytes).unwrap();
         let orig_cfg = orig.load_config_cfg(&bytes).unwrap().unwrap();
         let orig_table = orig.gfids_table(&bytes, &orig_cfg).unwrap();
@@ -2184,10 +2187,11 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn cfg_xfg_plan_fails_closed_on_real_layout() {
-        let mut bytes = ["out/real-samples/where.exe", "../../out/real-samples/where.exe"]
-            .iter()
-            .find_map(|p| std::fs::read(p).ok())
-            .expect("out/real-samples/where.exe");
+        let mut bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/cfg_smoke.exe"
+        ))
+        .expect("tests/fixtures/cfg_smoke.exe");
         let pe = Pe64::parse(&bytes).unwrap();
         let cfg = pe.load_config_cfg(&bytes).unwrap().unwrap();
         let xfg = cfg.guard_flags | IMAGE_GUARD_XFG_ENABLED;
