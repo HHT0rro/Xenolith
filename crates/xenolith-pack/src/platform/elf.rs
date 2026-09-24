@@ -209,13 +209,17 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
             original_rva: *rva,
             original_len: plain.len() as u32,
             nonce,
-            ciphertext: sealed.ciphertext.clone(),
             mac,
             stub_digest: 0,
         });
         env_v2.regions.push(sealed);
     }
     let envelope = encode_v2(&env_v2)?;
+    let imports_kept_count = env_v2.imports.len();
+    // The regions' ciphertext now lives in `envelope`; free the envelope-side
+    // copy before the output image is assembled (same bytes would otherwise
+    // be held twice through the whole tail of the pack).
+    drop(env_v2);
 
     // ---- append the new R+X PT_LOAD ----
     // Layout: [original file, section headers included] pad → new PHDR table
@@ -309,6 +313,8 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
     image.resize(hdr_off + hdr_placeholder_len.max(4 + 4 + 4 + 8), 0);
     image[stub_off..stub_off + stub.bytes.len()].copy_from_slice(&stub.bytes);
     image[env_off..env_off + envelope.len()].copy_from_slice(&envelope);
+    let envelope_len = envelope.len();
+    drop(envelope);
 
     // In the new segment, va = base + p_vaddr + (file_off - p_offset); the
     // bootstrap table precedes the stub, so add table_len to every stub-file
@@ -352,7 +358,7 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
     meta[META_PAYLOAD_RVA..META_PAYLOAD_RVA + 4]
         .copy_from_slice(&((load_vaddr + (env_off - new_phoff) as u64) as u32).to_le_bytes());
     meta[META_ENVELOPE_LEN..META_ENVELOPE_LEN + 4]
-        .copy_from_slice(&(envelope.len() as u32).to_le_bytes());
+        .copy_from_slice(&(envelope_len as u32).to_le_bytes());
     meta[META_ORIGINAL_ENTRY..META_ORIGINAL_ENTRY + 4]
         .copy_from_slice(&(boot.orig_target as u32).to_le_bytes());
     meta[META_UNPACKED..META_UNPACKED + 4].copy_from_slice(&0u32.to_le_bytes());
@@ -423,10 +429,8 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
         pages: records,
         probes: Vec::new(),
         program,
-        original_bytes: request.input.to_vec(),
     };
 
-    let imports_kept_count = env_v2.imports.len();
     let coverage = if selection_requested {
         let wanted: std::collections::BTreeSet<&str> =
             request.select_functions.iter().map(String::as_str).collect();

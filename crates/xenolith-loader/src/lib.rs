@@ -11,7 +11,7 @@ use xenolith_crypto::{
     mix_runtime_key, random_nonce, MbaKeyShare, Secret32, NONCE_LEN,
 };
 use xenolith_protocol::{open_region, parse as parse_v2, EnvelopeV2, ProtocolError};
-use xenolith_formats::{Pe64, IMAGE_DIRECTORY_ENTRY_IMPORT};
+use xenolith_formats::Pe64;
 use xenolith_guard::Probe;
 use xenolith_vm::{run_key_mix, Program};
 use sha2::{Digest, Sha256};
@@ -76,7 +76,6 @@ pub struct PageRecord {
     pub original_rva: u32,
     pub original_len: u32,
     pub nonce: [u8; NONCE_LEN],
-    pub ciphertext: Vec<u8>,
     pub mac: [u8; 32],
     /// Keyed FNV-1a of the mapped bytes; the stub re-verifies (G-TAMPER).
     pub stub_digest: u32,
@@ -104,7 +103,6 @@ pub struct PackedImage {
     pub pages: Vec<PageRecord>,
     pub probes: Vec<Probe>,
     pub program: Program,
-    pub original_bytes: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -191,24 +189,6 @@ impl PackedImage {
         Err(LoaderError::Invalid(
             "host emulator must open EnvelopeV2 via open_envelope_region",
         ))
-    }
-
-    pub fn dump_view(&self, state: &RuntimeState) -> Vec<u8> {
-        let mut dump = self.original_bytes.clone();
-        if state.poisoned_header && dump.len() >= 2 {
-            dump[0] = 0;
-            dump[1] = 0;
-        }
-        // Unopened pages stay ciphertext-shaped garbage in the dump view.
-        dump
-    }
-
-    pub fn iat_directory_cleared(&self) -> bool {
-        Pe64::parse(&self.original_bytes)
-            .ok()
-            .and_then(|pe| pe.directory(IMAGE_DIRECTORY_ENTRY_IMPORT).cloned())
-            .map(|d| d.rva == 0 && d.size == 0)
-            .unwrap_or(true)
     }
 }
 

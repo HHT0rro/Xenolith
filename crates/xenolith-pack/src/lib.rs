@@ -679,8 +679,16 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
         }
     }
 
-    let mut pages = Vec::new();
-    let mut page_files: Vec<(usize, usize)> = Vec::new(); // (file offset, len)
+    // Sealing plan: metadata only (index, RVA, file offset, length). The
+    // plaintext stays exactly where it already lives — the `working` buffer
+    // (later moved into `image`) — and each page is sealed straight out of
+    // that buffer once the runtime key exists. The previous design staged a
+    // full plaintext copy of every sealed page AND two ciphertext copies
+    // (envelope region + PageRecord clone) simultaneously, peaking at
+    // ~5.5x the input size: 150-250 MB real-world monoliths (libcef /
+    // Electron class) exhausted ordinary system commit and the packer died
+    // as an OOM fail-fast (0xC0000409) before writing any output.
+    let mut pages: Vec<PagePlan> = Vec::new();
     let mut page_index = 0u32;
     for section in &pe.sections {
         if section.characteristics & IMAGE_SCN_MEM_EXECUTE == 0 {
@@ -708,15 +716,12 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
                 continue;
             }
             let chunk = (len - offset).min(PAGE_SIZE);
-            let slice = working[start + offset..start + offset + chunk].to_vec();
-            let nonce = random_nonce12();
-            page_files.push((start + offset, chunk));
-            pages.push((page_index, page_rva, slice, nonce));
-            // The stub decrypts IN PLACE (mapped file bytes XOR keystream), so
-            // the file must hold plaintext XOR keystream: no plaintext .text on
-            // disk (C2/C3) and an exact one-pass unpack. The keystream here is
-            // derived from the same runtime key the stub rebuilds.
-            // NOTE: computed after `runtime` below; placeholder replaced there.
+            pages.push(PagePlan {
+                index: page_index,
+                rva: page_rva,
+                foff: start + offset,
+                len: chunk,
+            });
             page_index += 1;
             offset += chunk;
         }
@@ -771,13 +776,11 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
         ))
     })?;
 
-    // Disk original pages are traps, not XOR keystream. Plaintext lives only
-    // in EnvelopeV2 AEAD records (xl_core copies them to RX pages).
-    for (foff, clen) in &page_files {
-        for b in &mut image[*foff..*foff + *clen] {
-            *b = 0xCC;
-        }
-    }
+    // Disk original pages become INT3 traps below — AFTER the sealing loop,
+    // which reads the plaintext straight out of this same `image` buffer
+    // (the working copy was moved here). Nothing between this point and the
+    // sealing loop reads or writes sealed executable bytes: the import-name
+    // scrub touches .idata/.rdata only, and every parse uses request.input.
 
     // Entry-less images seal zero pages, so the keep set starts empty (an
     // entry RVA of 0 would otherwise record page 0 for nothing).
@@ -800,10 +803,19 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
     let mba_bytes = mba.as_bytes();
     let mut mba_arr = [0u8; 96];
     mba_arr.copy_from_slice(&mba_bytes);
+    // FLAG_LOADER_RESOLVED_IAT must be set at construction, before any
+    // region is sealed (region AAD binds the header flags): with a retained
+    // import directory the loader resolves the IAT itself, so the injected
+    // runtime must NOT re-bind imports through its own (host-relative)
+    // search order.
     let mut env_v2 = EnvelopeV2 {
         platform: PLATFORM_PE64,
         profile: request.profile as u8,
-        flags: 0,
+        flags: if keep_import_directory {
+            xenolith_protocol::FLAG_LOADER_RESOLVED_IAT
+        } else {
+            0
+        },
         policy: POLICY_STRICT,
         mba: mba_arr,
         opcode_seed,
@@ -844,9 +856,8 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
                 .collect();
             (0..pages.len() as u32)
                 .filter(|i| {
-                    let (idx, rva, _, _) = &pages[*i as usize];
-                    let _ = idx;
-                    let page = rva & !0xfff;
+                    let plan = &pages[*i as usize];
+                    let page = plan.rva & !0xfff;
                     !keep.contains(&page) && !reloc_pages.contains(&page)
                 })
                 .collect()
@@ -863,7 +874,7 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
             let protected = merge_ranges(
                 pages
                     .iter()
-                    .map(|(_i, rva, plain, _n)| (*rva, *rva + plain.len() as u32))
+                    .map(|p| (p.rva, p.rva + p.len as u32))
                     .collect(),
             );
             let mut r = Vec::new();
@@ -945,24 +956,45 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
         request.strict_constants,
     )
     .map_err(|e| PackError::DataProtection(e.to_string()))?;
+    // Seal straight out of the working image: each 4-KiB plaintext page is
+    // read from `image` (still plaintext here), sealed into exactly one
+    // ciphertext record pushed into the envelope, and the metadata-only
+    // PageRecord notes where it decrypts back to. No staged plaintext copy
+    // and no second ciphertext copy exists at any point.
     let mut records = Vec::new();
-    for (index, rva, plain, _old_nonce) in &pages {
+    for plan in &pages {
+        let plain = &image[plan.foff..plan.foff + plan.len];
         let nonce = random_nonce12();
-        let sealed = seal_region(&runtime, &env_v2, *index, *rva, plain, nonce)?;
+        let sealed = seal_region(&runtime, &env_v2, plan.index, plan.rva, plain, nonce)?;
         let mut mac = [0u8; 32];
         mac[..16].copy_from_slice(&sealed.tag);
         records.push(PageRecord {
-            index: *index,
-            original_rva: *rva,
-            original_len: plain.len() as u32,
+            index: plan.index,
+            original_rva: plan.rva,
+            original_len: plan.len as u32,
             nonce,
-            ciphertext: sealed.ciphertext.clone(),
             mac,
             stub_digest: 0,
         });
         env_v2.regions.push(sealed);
     }
+    // Disk original pages are traps, not XOR keystream. Plaintext lives only
+    // in EnvelopeV2 AEAD records (xl_core copies them to RX pages). This runs
+    // after the sealing loop above — that loop is the last reader of the
+    // plaintext still sitting in `image`.
+    for plan in &pages {
+        for b in &mut image[plan.foff..plan.foff + plan.len] {
+            *b = 0xCC;
+        }
+    }
+    drop(pages);
     let envelope = encode_v2(&env_v2)?;
+    let envelope_len = envelope.len();
+    // The regions' ciphertext is now fully embedded in `envelope` (and, right
+    // after, in the output image). Free the envelope-side copy before the
+    // image grows by the payload — same bytes would otherwise be held twice
+    // through the entire final assembly.
+    drop(env_v2);
 
     let mut stub = pic.bytes;
     let meta_off = pic.meta_off;
@@ -1121,6 +1153,11 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
     image.resize((payload_section.raw_ptr + payload_section.raw_size) as usize, 0);
     image[payload_section.raw_ptr as usize..payload_section.raw_ptr as usize + envelope.len()]
         .copy_from_slice(&envelope);
+    // The image now embeds the envelope; only its length is needed below
+    // (stub metadata). Free the standalone copy — for a 200 MB-class input
+    // this is the difference between holding the ciphertext twice or once
+    // through the whole final assembly.
+    drop(envelope);
 
     // TASK-021: write XDATA + relocated PDATA into the payload section and
     // repoint the exception directory. The stub RUNTIME_FUNCTION is appended
@@ -1185,7 +1222,7 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
     meta[META_PAYLOAD_RVA..META_PAYLOAD_RVA + 4]
         .copy_from_slice(&payload_section.virtual_address.to_le_bytes());
     meta[META_ENVELOPE_LEN..META_ENVELOPE_LEN + 4]
-        .copy_from_slice(&(envelope.len() as u32).to_le_bytes());
+        .copy_from_slice(&(envelope_len as u32).to_le_bytes());
     meta[META_ORIGINAL_ENTRY..META_ORIGINAL_ENTRY + 4]
         .copy_from_slice(&pe.entry_rva.to_le_bytes());
     meta[META_UNPACKED..META_UNPACKED + 4].copy_from_slice(&0u32.to_le_bytes());
@@ -1222,7 +1259,6 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
         pages: records,
         probes,
         program,
-        original_bytes: request.input.to_vec(),
     };
 
     let out_pe = Pe64::parse(&image)?;
@@ -1402,6 +1438,16 @@ fn inject_header_slack(input: &[u8]) -> Result<Option<Vec<u8>>, PackError> {
         ));
     }
     Ok(Some(out))
+}
+
+/// One sealed-page obligation: where the plaintext lives in the working
+/// buffer (`foff..foff+len`) and the RVA it decrypts back to at runtime.
+/// Metadata only — no bytes are staged; sealing slices the working buffer.
+struct PagePlan {
+    index: u32,
+    rva: u32,
+    foff: usize,
+    len: usize,
 }
 
 /// Parsed CFG rewrite plan. `None` from `plan_cfg_rewrite` means the image is
