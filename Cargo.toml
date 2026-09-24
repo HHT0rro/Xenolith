@@ -9,6 +9,7 @@ members = [
     "crates/xenolith-vm",
     "crates/xenolith-loader",
     "crates/xenolith-guard",
+    "crates/xl-loadhost",
     "samples/hello-dll",
     "samples/hello-exe",
     "samples/eh-dll",

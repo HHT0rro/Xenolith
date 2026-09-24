@@ -1,0 +1,502 @@
+[
+ {
+  "name": "QQ_QQNT.dll",
+  "mode": "load",
+  "reason": "QQ Electron 主模块库，load 仅触发 DllMain 初始化，子进程超时隔离有界"
+ },
+ {
+  "name": "QQ_flue.dll",
+  "mode": "load",
+  "reason": "QQ 小程序框架运行时库，load 仅 DllMain，子进程隔离有界"
+ },
+ {
+  "name": "QQ_dxcompiler.dll",
+  "mode": "load",
+  "reason": "微软 DXIL 着色器编译器库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "QQ_AVSDKPlugin.dll",
+  "mode": "load",
+  "reason": "腾讯音视频 SDK 插件库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "QQ_libvips-42.dll",
+  "mode": "load",
+  "reason": "libvips 图像处理库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "QQ_avcodec-58.dll",
+  "mode": "load",
+  "reason": "FFmpeg 编解码库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "QQ_liteav.dll",
+  "mode": "load",
+  "reason": "腾讯 liteav 音视频库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "QQ_QBar.dll",
+  "mode": "load",
+  "reason": "QQ 功能组件库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "QQ_ilink2.dll",
+  "mode": "load",
+  "reason": "腾讯 ilink 通信库，load 仅 DllMain，不调用导出即不联网"
+ },
+ {
+  "name": "QQ_ncnn.dll",
+  "mode": "load",
+  "reason": "ncnn 神经网络推理库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "QQ_libGLESv2.dll",
+  "mode": "load",
+  "reason": "GLES 图形库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "QQ_dbgeng.dll",
+  "mode": "load",
+  "reason": "Windows 调试引擎封装库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "QQ_d3dcompiler_47.dll",
+  "mode": "load",
+  "reason": "D3D 着色器编译器库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "QQ_D3DX9_43.dll",
+  "mode": "load",
+  "reason": "D3DX9 工具库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "QQ_QQ.exe",
+  "mode": "exec",
+  "reason": "QQ GUI 主程序，短暂启动观察后杀进程树，风险有界"
+ },
+ {
+  "name": "QQ_QQEX.exe",
+  "mode": "exec",
+  "reason": "QQ 功能子程序，无参启动短暂运行后即退出，30 秒硬杀有界"
+ },
+ {
+  "name": "QQ_crashpad_handler.exe",
+  "mode": "exec",
+  "reason": "崩溃上报子进程，独立启动后空等管道，30 秒硬杀有界"
+ },
+ {
+  "name": "QQ_remoting_host.exe",
+  "mode": "skip",
+  "reason": "远程访问宿主组件（远控类），保守跳过"
+ },
+ {
+  "name": "QQ_WeChatAppEx.exe",
+  "mode": "exec",
+  "reason": "内嵌浏览器子进程，缺 --type 参数很快自行退出，风险有界"
+ },
+ {
+  "name": "QQ_ginkgo.exe",
+  "mode": "skip",
+  "reason": "QQ 后台常驻组件（ams_sdk 服务型进程，用途不明），保守跳过"
+ },
+ {
+  "name": "Weixin_Weixin.dll",
+  "mode": "load",
+  "reason": "微信 Electron 主模块库，load 仅 DllMain，子进程超时隔离有界"
+ },
+ {
+  "name": "Weixin_VoipEngine.dll",
+  "mode": "load",
+  "reason": "VOIP 引擎库，load 仅 DllMain，不调用导出即不联网"
+ },
+ {
+  "name": "Weixin_roam_server.dll",
+  "mode": "load",
+  "reason": "微信进程内漫游服务实现库，load 仅 DllMain，不驻留系统"
+ },
+ {
+  "name": "Weixin_ilink2.dll",
+  "mode": "load",
+  "reason": "腾讯 ilink 通信库，load 仅 DllMain，不调用导出即不联网"
+ },
+ {
+  "name": "Weixin_mmcronet.dll",
+  "mode": "load",
+  "reason": "cronet 网络库，load 仅 DllMain，不调用导出即不联网"
+ },
+ {
+  "name": "Weixin_wcprobe.dll",
+  "mode": "load",
+  "reason": "质量探针库，load 仅 DllMain，不调用导出即不上报"
+ },
+ {
+  "name": "Weixin_XNet.dll",
+  "mode": "load",
+  "reason": "微信网络库，load 仅 DllMain，不调用导出即不联网"
+ },
+ {
+  "name": "Weixin_shared_andromeda.dll",
+  "mode": "load",
+  "reason": "微信组件通信库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "Weixin_libGLESv2.dll",
+  "mode": "load",
+  "reason": "GLES 图形库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "Weixin_owl.dll",
+  "mode": "load",
+  "reason": "微信内部组件库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "Weixin_Weixin.exe",
+  "mode": "exec",
+  "reason": "微信 GUI 主程序，短暂启动后杀进程树，风险有界"
+ },
+ {
+  "name": "Weixin_crashpad_handler.exe",
+  "mode": "exec",
+  "reason": "崩溃上报子进程，独立启动后空等管道，30 秒硬杀有界"
+ },
+ {
+  "name": "IDA_ida.dll",
+  "mode": "load",
+  "reason": "IDA 主内核库，load 仅 DllMain，子进程隔离有界"
+ },
+ {
+  "name": "IDA_ida32.dll",
+  "mode": "load",
+  "reason": "IDA 32 位内核库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "IDA_libclang.dll",
+  "mode": "load",
+  "reason": "libclang 解析库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "IDA_libz3.dll",
+  "mode": "load",
+  "reason": "Z3 约束求解器库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "IDA_Qt6Gui.dll",
+  "mode": "load",
+  "reason": "Qt6 GUI 库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "IDA_Qt6Widgets.dll",
+  "mode": "load",
+  "reason": "Qt6 控件库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "IDA_Qt6Core.dll",
+  "mode": "load",
+  "reason": "Qt6 核心库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "IDA_Qt6OpenGL.dll",
+  "mode": "load",
+  "reason": "Qt6 OpenGL 库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "IDA_clp64.dll",
+  "mode": "load",
+  "reason": "CLP 线性规划求解器库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "IDA_hexx64.dll",
+  "mode": "load",
+  "reason": "Hex-Rays x64 反编译器库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "IDA_hexarm.dll",
+  "mode": "load",
+  "reason": "Hex-Rays ARM 反编译器库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "IDA_hexrv.dll",
+  "mode": "load",
+  "reason": "Hex-Rays RISC-V 反编译器库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "IDA_pc.dll",
+  "mode": "load",
+  "reason": "IDA 处理器模块库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "IDA_idalib.dll",
+  "mode": "load",
+  "reason": "idalib 集成库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "IDA_idalib32.dll",
+  "mode": "load",
+  "reason": "idalib 32 位集成库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "IDA_ida.exe",
+  "mode": "exec",
+  "reason": "IDA GUI 主程序，短暂启动后杀进程树，风险有界"
+ },
+ {
+  "name": "IDA_tilib.exe",
+  "mode": "exec",
+  "reason": "类型库命令行工具，无参打印用法即退出，无副作用"
+ },
+ {
+  "name": "IDA_hv.exe",
+  "mode": "exec",
+  "reason": "IDA 小型查看器 GUI，短暂启动后杀进程树，风险有界"
+ },
+ {
+  "name": "IDA_uninstall.exe",
+  "mode": "skip",
+  "reason": "卸载器，执行会改动系统安装状态，保守跳过"
+ },
+ {
+  "name": "WeMeet_WeMeetWebCore.dll",
+  "mode": "load",
+  "reason": "腾讯会议 Electron 内核库，load 仅 DllMain，子进程隔离有界"
+ },
+ {
+  "name": "WeMeet_libTencentSM.dll",
+  "mode": "load",
+  "reason": "腾讯自研加密库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "CloudMusic_libcef.dll",
+  "mode": "load",
+  "reason": "CEF 浏览器内核库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "CloudMusic_cloudmusic.dll",
+  "mode": "load",
+  "reason": "网易云音乐主模块库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "SodaMusic_main.dll",
+  "mode": "load",
+  "reason": "汽水音乐主模块库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "Steam_libcef.dll",
+  "mode": "load",
+  "reason": "CEF 浏览器内核库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "Steam_steamclient64.dll",
+  "mode": "load",
+  "reason": "Steam 客户端核心库，load 仅 DllMain，不调用导出即不联网"
+ },
+ {
+  "name": "Steam_steamwebhelper.exe",
+  "mode": "exec",
+  "reason": "Steam 内嵌浏览器子进程，脱离 Steam 环境启动后很快退出，风险有界"
+ },
+ {
+  "name": "DockerDesktop_Docker Desktop.exe",
+  "mode": "skip",
+  "reason": "启动会拉起 Docker 引擎/WSL VM 与后台服务并驻留，保守跳过"
+ },
+ {
+  "name": "Docker_com.docker.backend.exe",
+  "mode": "skip",
+  "reason": "Docker 后端服务组件，会常驻后台并改动系统状态，保守跳过"
+ },
+ {
+  "name": "Git_git.exe",
+  "mode": "exec",
+  "reason": "git 命令行，无参打印用法后以非零码退出，无副作用"
+ },
+ {
+  "name": "Git_msys-2.0.dll",
+  "mode": "load",
+  "reason": "MSYS2 运行时库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "Nmap_libgtk-3-0.dll",
+  "mode": "load",
+  "reason": "GTK3 图形库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "Nmap_libpython3.14.dll",
+  "mode": "load",
+  "reason": "Python 运行时库，load 仅 DllMain，不解释任何代码"
+ },
+ {
+  "name": "Edge_msedge.exe",
+  "mode": "exec",
+  "reason": "Edge GUI 主程序，短暂启动后杀进程树，风险有界"
+ },
+ {
+  "name": "Edge_widevinecdm.dll",
+  "mode": "load",
+  "reason": "Widevine DRM 库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "Chrome_chrome.exe",
+  "mode": "exec",
+  "reason": "Chrome GUI 主程序，短暂启动后杀进程树，风险有界"
+ },
+ {
+  "name": "Chrome_optimization_guide_internal.dll",
+  "mode": "load",
+  "reason": "Chrome 优化引导模型库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "Office_EXCEL.EXE",
+  "mode": "exec",
+  "reason": "Excel GUI 主程序，无文档启动停在开始屏幕，杀进程树有界"
+ },
+ {
+  "name": "Office_WINWORD.EXE",
+  "mode": "exec",
+  "reason": "Word GUI 主程序，无文档启动停在开始屏幕，杀进程树有界"
+ },
+ {
+  "name": "Office_MSORES.DLL",
+  "mode": "load",
+  "reason": "纯资源 DLL，DllMain 近似空操作，风险有界"
+ },
+ {
+  "name": "Office_msmdlocal_xl.dll",
+  "mode": "load",
+  "reason": "Analysis Services 本地引擎库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "IDEA_ijent-x86_64-pc-windows-gnullvm-release.exe",
+  "mode": "skip",
+  "reason": "JetBrains 常驻文件/终端 agent（后台驻留型），保守跳过"
+ },
+ {
+  "name": "VSCode_Code - Insiders.exe",
+  "mode": "exec",
+  "reason": "VSCode GUI 主程序，短暂启动后杀进程树，风险有界"
+ },
+ {
+  "name": "OBS_obs64.exe",
+  "mode": "exec",
+  "reason": "OBS GUI 主程序，短暂启动后杀进程树，风险有界"
+ },
+ {
+  "name": "OBS_avcodec-62.dll",
+  "mode": "load",
+  "reason": "FFmpeg 编解码库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "NVIDIA_PhysXCore64.dll",
+  "mode": "load",
+  "reason": "PhysX 物理引擎库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "NVIDIA_NVPrxy64.DLL",
+  "mode": "load",
+  "reason": "NVIDIA 代理通信库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "WSL_wsl.exe",
+  "mode": "skip",
+  "reason": "会启动 WSL 发行版 VM 并唤醒系统服务，杀掉后 vmmem 仍驻留，保守跳过"
+ },
+ {
+  "name": "Go_go.exe",
+  "mode": "exec",
+  "reason": "go 命令行，无参打印用法即退出，无副作用"
+ },
+ {
+  "name": "ClashVerge_clash-verge.exe",
+  "mode": "skip",
+  "reason": "代理客户端，启动会修改系统代理设置并拉起代理内核，保守跳过"
+ },
+ {
+  "name": "ClashVerge_verge-mihomo.exe",
+  "mode": "skip",
+  "reason": "代理内核进程，监听端口转发流量（联网类），保守跳过"
+ },
+ {
+  "name": "radare2_r_arch.dll",
+  "mode": "load",
+  "reason": "radare2 架构支持库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "VMware_vix.dll",
+  "mode": "load",
+  "reason": "VMware VIX API 库，load 仅 DllMain，不调用导出即不碰虚拟机"
+ },
+ {
+  "name": "Everything_Everything.exe",
+  "mode": "exec",
+  "reason": "Everything GUI 主程序，无服务环境仅弹窗空转，杀进程树有界"
+ },
+ {
+  "name": "nodejs_node.exe",
+  "mode": "exec",
+  "reason": "node 无参进入 REPL 空等输入，30 秒硬杀有界，无副作用"
+ },
+ {
+  "name": "Python_python313.dll",
+  "mode": "load",
+  "reason": "CPython 运行时库，load 仅 DllMain，不解释任何代码"
+ },
+ {
+  "name": "Python_opencv_videoio_ffmpeg500_64.dll",
+  "mode": "load",
+  "reason": "OpenCV ffmpeg 视频库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "NotepadPP_notepad++.exe",
+  "mode": "exec",
+  "reason": "Notepad++ GUI 主程序，短暂启动后杀进程树，风险有界"
+ },
+ {
+  "name": "ToDesk_ToDesk.exe",
+  "mode": "skip",
+  "reason": "远控主程序（题目点名的远控类），保守跳过"
+ },
+ {
+  "name": "ToDesk_zagent.exe",
+  "mode": "skip",
+  "reason": "ToDesk 服务/驻留 agent，会安装并常驻后台服务，保守跳过"
+ },
+ {
+  "name": "ToDesk_zrtc.dll",
+  "mode": "load",
+  "reason": "ToDesk 音视频库，load 仅 DllMain，不调用导出即无远控行为，隔离有界"
+ },
+ {
+  "name": "Huorong_libcodecs.dll",
+  "mode": "load",
+  "reason": "火绒解码器库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "Espressif_clangd.exe",
+  "mode": "exec",
+  "reason": "clangd 语言服务器，无参在 stdin 上空等，30 秒硬杀有界"
+ },
+ {
+  "name": "Espressif_libclang-cpp.dll",
+  "mode": "load",
+  "reason": "libclang 解析库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "Espressif_libgcc_s_seh-1.dll",
+  "mode": "load",
+  "reason": "GCC 运行时库，load 仅 DllMain，风险有界"
+ },
+ {
+  "name": "XPipe_xpipe.exe",
+  "mode": "exec",
+  "reason": "XPipe GUI 主程序，短暂启动后杀进程树，风险有界"
+ },
+ {
+  "name": "BellSoft_native-image.exe",
+  "mode": "exec",
+  "reason": "native-image 命令行，无参打印用法即退出，无副作用"
+ },
+ {
+  "name": "Ditto_mfc140u.dll",
+  "mode": "load",
+  "reason": "MFC 运行时库，load 仅 DllMain，风险有界"
+ }
+]

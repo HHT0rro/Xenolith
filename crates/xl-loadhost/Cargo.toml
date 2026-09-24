@@ -1,0 +1,28 @@
+[package]
+name = "xl-loadhost"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Test-only load host: LoadLibraryW a (packed) DLL, GetProcAddress exports, never call them"
+publish = false
+
+# Companion to scripts/compat2/run_func.ps1 ("load" mode). NOT part of the
+# shipped toolchain: it exists so the harness can prove a packed DLL still
+# loads and still resolves exports from an isolated, killable child process.
+#
+# Safety contract:
+#   - the only win32 calls are LoadLibraryW / GetProcAddress / FreeLibrary /
+#     module enumeration; NO export is ever dereferenced or invoked
+#   - DllMain of the target runs implicitly as part of LoadLibraryW - that is
+#     exactly what "loads" is supposed to prove; the 60 s harness timeout and
+#     process-tree kill bound anything DllMain does
+#   - exit codes: 0 loaded (JSON on stdout) | 3 load failed (JSON on stdout)
+#                | 2 usage error (message on stderr)
+
+[[bin]]
+name = "xl-loadhost"
+path = "src/main.rs"
+
+[dependencies]
