@@ -1954,6 +1954,644 @@ mod tests {
         &bytes[off.min(end)..end]
     }
 
+    /// Synthetic PE in the tight MSVC layout that hits the header-slack
+    /// path: 16 sections whose table ends at 0x3C8 + 2×40 bytes past
+    /// SizeOfHeaders=0x400 with FileAlignment=0x200 — the construction the
+    /// three real corpus failures (QQ_AVSDKPlugin et al.) use.
+    fn tight_headers_pe(n_sections: usize) -> Vec<u8> {
+        const FILE_ALIGN: u32 = 0x200;
+        const SECTION_ALIGN: u32 = 0x1000;
+        let optional_size = 240usize;
+        let table_off = 0x40 + 4 + 20 + optional_size;
+        let headers_end = table_off + n_sections * 40;
+        let size_of_headers = ((headers_end + FILE_ALIGN as usize - 1) / FILE_ALIGN as usize)
+            * FILE_ALIGN as usize; // table fits EXACTLY: no slack for +2
+        let raw_start = size_of_headers.max(FILE_ALIGN as usize * 2);
+        let mut img = vec![0u8; raw_start + n_sections * FILE_ALIGN as usize];
+        img[0] = b'M';
+        img[1] = b'Z';
+        img[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        let pe = &mut img[0x40..];
+        pe[..4].copy_from_slice(b"PE\0\0");
+        pe[4..6].copy_from_slice(&0x8664u16.to_le_bytes()); // machine
+        pe[6..8].copy_from_slice(&(n_sections as u16).to_le_bytes());
+        pe[20..22].copy_from_slice(&(optional_size as u16).to_le_bytes());
+        let opt = &mut pe[24..24 + optional_size];
+        opt[0..2].copy_from_slice(&0x20Bu16.to_le_bytes()); // PE32+
+        opt[16..20].copy_from_slice(&0x1000u32.to_le_bytes()); // entry rva
+        opt[32..36].copy_from_slice(&SECTION_ALIGN.to_le_bytes()); // SectionAlignment
+        opt[36..40].copy_from_slice(&FILE_ALIGN.to_le_bytes()); // FileAlignment
+        opt[56..60].copy_from_slice(&(0x1000 * (n_sections as u32 + 1)).to_le_bytes()); // size of image
+        opt[60..64].copy_from_slice(&(size_of_headers as u32).to_le_bytes());
+        opt[108..112].copy_from_slice(&16u32.to_le_bytes()); // data dirs
+        // SECURITY directory: VA is an absolute FILE OFFSET (0x600).
+        opt[112 + 4 * 8..112 + 4 * 8 + 4].copy_from_slice(&0x600u32.to_le_bytes());
+        opt[112 + 4 * 8 + 4..112 + 4 * 8 + 8].copy_from_slice(&0x10u32.to_le_bytes());
+        for i in 0..n_sections {
+            let s = &mut img[table_off + i * 40..table_off + i * 40 + 40];
+            let name = format!("s{i:<7}");
+            s[..8].copy_from_slice(&name.as_bytes()[..8]);
+            s[8..12].copy_from_slice(&0x180u32.to_le_bytes()); // virtual size
+            s[12..16].copy_from_slice(&(0x1000 * (i as u32 + 1)).to_le_bytes()); // VA
+            s[16..20].copy_from_slice(&FILE_ALIGN.to_le_bytes()); // raw size
+            let raw_ptr_val = (raw_start + i * FILE_ALIGN as usize) as u32;
+            s[20..24].copy_from_slice(&raw_ptr_val.to_le_bytes());
+            s[24..28].copy_from_slice(&raw_ptr_val.to_le_bytes()); // relocs ptr (unused)
+            s[36..40].copy_from_slice(&0x6000_0020u32.to_le_bytes()); // R+X
+            let base = raw_start + i * FILE_ALIGN as usize;
+            img[base..base + FILE_ALIGN as usize].fill((i + 1) as u8);
+        }
+        img
+    }
+
+    #[test]
+    fn header_slack_injection_grows_headers_and_shifts_raw_data() {
+        let img = tight_headers_pe(16);
+        let pe = Pe64::parse(&img).unwrap();
+        let needed = pe.section_table_offset + (pe.number_of_sections as usize + 2) * 40;
+        assert!(needed > pe.size_of_headers as usize, "fixture must be tight");
+
+        let shifted = inject_header_slack(&img)
+            .expect("parse ok")
+            .expect("fixture needs the shift");
+        assert_eq!(shifted.len(), img.len() + 0x200);
+
+        let pe2 = Pe64::parse(&shifted).unwrap();
+        let needed2 = pe2.section_table_offset + (pe2.number_of_sections as usize + 2) * 40;
+        assert!(needed2 <= pe2.size_of_headers as usize);
+        assert_eq!(pe2.size_of_headers, pe.size_of_headers + 0x200);
+        // every raw-bearing section moved by exactly delta; content identical
+        for (a, b) in pe.sections.iter().zip(pe2.sections.iter()) {
+            assert_eq!(a.raw_ptr + 0x200, b.raw_ptr);
+            assert_eq!(a.raw_size, b.raw_size);
+            assert_eq!(a.virtual_address, b.virtual_address);
+            let old = &img[a.raw_ptr as usize..a.raw_ptr as usize + a.raw_size as usize];
+            let new = &shifted[b.raw_ptr as usize..b.raw_ptr as usize + b.raw_size as usize];
+            assert_eq!(old, new);
+        }
+        // SECURITY directory zeroed (its VA is a file offset, now stale)
+        let sec = pe2.directory(IMAGE_DIRECTORY_ENTRY_SECURITY).unwrap();
+        assert_eq!((sec.rva, sec.size), (0, 0));
+        // headers region between old table end and new SizeOfHeaders is zero
+        // (the injected hole), and the old raw area is fully relocated
+        assert!(shifted[pe.size_of_headers as usize..pe.size_of_headers as usize + 0x200]
+            .iter()
+            .all(|&b| b == 0));
+        // idempotent: the shifted image needs no second injection
+        assert!(inject_header_slack(&shifted).unwrap().is_none());
+    }
+
+    /// Synthetic resource-only DLL: AddressOfEntryPoint=0, no executable
+    /// section, GUARD_CF set with no load-config directory — the MSORES-class
+    /// shape. pack() must produce a structural 0-page image with the entry
+    /// left at 0 and the vacuous GUARD_CF bit cleared.
+    fn entryless_resource_dll() -> Vec<u8> {
+        const FILE_ALIGN: u32 = 0x200;
+        const SECTION_ALIGN: u32 = 0x1000;
+        let optional_size = 240usize;
+        let table_off = 0x40 + 4 + 20 + optional_size;
+        let n_sections = 2usize;
+        let size_of_headers = 0x400usize;
+        let raw_start = 0x400usize;
+        let mut img = vec![0u8; raw_start + n_sections * 0x200];
+        img[0] = b'M';
+        img[1] = b'Z';
+        img[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        let pe = &mut img[0x40..];
+        pe[..4].copy_from_slice(b"PE\0\0");
+        pe[4..6].copy_from_slice(&0x8664u16.to_le_bytes());
+        pe[6..8].copy_from_slice(&(n_sections as u16).to_le_bytes());
+        pe[20..22].copy_from_slice(&(optional_size as u16).to_le_bytes());
+        let opt = &mut pe[24..24 + optional_size];
+        opt[0..2].copy_from_slice(&0x20Bu16.to_le_bytes());
+        opt[16..20].copy_from_slice(&0u32.to_le_bytes()); // AddressOfEntryPoint = 0
+        opt[32..36].copy_from_slice(&SECTION_ALIGN.to_le_bytes());
+        opt[36..40].copy_from_slice(&FILE_ALIGN.to_le_bytes());
+        opt[60..64].copy_from_slice(&(size_of_headers as u32).to_le_bytes());
+        opt[70..72].copy_from_slice(&0x4160u16.to_le_bytes()); // GUARD_CF | DYNAMIC_BASE | ...
+        opt[108..112].copy_from_slice(&16u32.to_le_bytes());
+        for i in 0..n_sections {
+            let s = &mut img[table_off + i * 40..table_off + i * 40 + 40];
+            let name = if i == 0 { ".rdata" } else { ".rsrc" };
+            s[..8].copy_from_slice(&[name.as_bytes(), &[0u8; 8]].concat()[..8]);
+            s[8..12].copy_from_slice(&0x100u32.to_le_bytes());
+            s[12..16].copy_from_slice(&(0x1000 * (i as u32 + 1)).to_le_bytes());
+            s[16..20].copy_from_slice(&0x200u32.to_le_bytes());
+            s[20..24]
+                .copy_from_slice(&((raw_start + i * 0x200) as u32).to_le_bytes());
+            s[36..40].copy_from_slice(&0x4000_0040u32.to_le_bytes()); // R + INITIALIZED_DATA
+        }
+        img
+    }
+
+    #[test]
+    fn packs_entryless_resource_dll_structurally() {
+        let img = entryless_resource_dll();
+        let out = pack(PackRequest {
+            input: &img,
+            profile: Profile::Max,
+            vm_exports: vec![],
+            debug_gate: 3,
+            opcode_seed: None,
+            trace_diverge: false,
+            select_rva: vec![],
+            select_functions: Vec::new(),
+            select_all: false,
+            allow_native_fallback: false,
+            strict_coverage: false,
+            lazy_regions: false,
+            protect_imports: false,
+            strict_constants: false,
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(out.report.pages, 0);
+        assert_eq!(out.report.stolen_bytes, 0);
+        assert!(out.report.notes.iter().any(|n| n.contains("entry-less")));
+        let pe = Pe64::parse(&out.image).unwrap();
+        assert_eq!(pe.entry_rva, 0, "entry must stay 0");
+        assert_eq!(
+            pe.dll_characteristics & IMAGE_DLLCHARACTERISTICS_GUARD_CF,
+            0,
+            "vacuous GUARD_CF must be cleared"
+        );
+        assert_eq!(pe.number_of_sections, 4, "stub + payload appended");
+        assert_eq!(out.image[0], b'M', "DOS header untouched");
+        // entry-less with code or exports must fail closed, not pack broken
+        let mut with_code = entryless_resource_dll();
+        let s0 = 0x40 + 4 + 20 + 240;
+        with_code[s0 + 36..s0 + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes()); // .rdata -> R+X
+        let err = match pack(PackRequest {
+            input: &with_code,
+            profile: Profile::Max,
+            vm_exports: vec![],
+            debug_gate: 3,
+            opcode_seed: None,
+            trace_diverge: false,
+            select_rva: vec![],
+            select_functions: Vec::new(),
+            select_all: false,
+            allow_native_fallback: false,
+            strict_coverage: false,
+            lazy_regions: false,
+            protect_imports: false,
+            strict_constants: false,
+        }) {
+            Err(e) => e,
+            Ok(_) => panic!("entry-less image with executable sections must be refused"),
+        };
+        assert!(err.to_string().contains("entry-less"));
+    }
+
+    /// Entry-less resource DLL carrying a real TLS directory in `.rdata`
+    /// (directory at RVA 0x1100/0x40, callback array at RVA 0x1200, index
+    /// slot at 0x1300). `first_callback == Some(rva)` plants one callback
+    /// pointing at `rva` inside non-executable `.rdata` — the previously
+    /// undefined entry-less shape; `None` leaves the array NULL-terminated
+    /// (empty), the pure-data shape the loader consumes without calling
+    /// anything.
+    fn entryless_resource_dll_with_tls(first_callback: Option<u32>) -> Vec<u8> {
+        const FILE_ALIGN: u32 = 0x200;
+        const SECTION_ALIGN: u32 = 0x1000;
+        const IMAGE_BASE: u64 = 0x140_000_000;
+        let optional_size = 240usize;
+        let table_off = 0x40 + 4 + 20 + optional_size;
+        let n_sections = 2usize;
+        let size_of_headers = 0x400usize;
+        let raw_start = 0x400usize;
+        let mut img = vec![0u8; raw_start + 0x400 + n_sections * 0x200];
+        img[0] = b'M';
+        img[1] = b'Z';
+        img[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        let pe = &mut img[0x40..];
+        pe[..4].copy_from_slice(b"PE\0\0");
+        pe[4..6].copy_from_slice(&0x8664u16.to_le_bytes());
+        pe[6..8].copy_from_slice(&(n_sections as u16).to_le_bytes());
+        pe[20..22].copy_from_slice(&(optional_size as u16).to_le_bytes());
+        let opt = &mut pe[24..24 + optional_size];
+        opt[0..2].copy_from_slice(&0x20Bu16.to_le_bytes());
+        opt[16..20].copy_from_slice(&0u32.to_le_bytes()); // AddressOfEntryPoint = 0
+        opt[24..32].copy_from_slice(&IMAGE_BASE.to_le_bytes());
+        opt[32..36].copy_from_slice(&SECTION_ALIGN.to_le_bytes());
+        opt[36..40].copy_from_slice(&FILE_ALIGN.to_le_bytes());
+        opt[60..64].copy_from_slice(&(size_of_headers as u32).to_le_bytes());
+        opt[70..72].copy_from_slice(&0x4160u16.to_le_bytes()); // GUARD_CF | DYNAMIC_BASE | ...
+        opt[108..112].copy_from_slice(&16u32.to_le_bytes());
+        // TLS directory (index 9): RVA 0x1100, size 0x40.
+        opt[112 + 9 * 8..112 + 9 * 8 + 4].copy_from_slice(&0x1100u32.to_le_bytes());
+        opt[112 + 9 * 8 + 4..112 + 9 * 8 + 8].copy_from_slice(&0x40u32.to_le_bytes());
+        for i in 0..n_sections {
+            let s = &mut img[table_off + i * 40..table_off + i * 40 + 40];
+            let name = if i == 0 { ".rdata" } else { ".rsrc" };
+            s[..8].copy_from_slice(&[name.as_bytes(), &[0u8; 8]].concat()[..8]);
+            let (vsize, chars) = if i == 0 { (0x400u32, 0x4000_0040u32) } else { (0x100u32, 0x4000_0040u32) };
+            s[8..12].copy_from_slice(&vsize.to_le_bytes());
+            s[12..16].copy_from_slice(&(0x1000 * (i as u32 + 1)).to_le_bytes());
+            s[16..20].copy_from_slice(&0x400u32.to_le_bytes());
+            s[20..24]
+                .copy_from_slice(&((raw_start + i * 0x400) as u32).to_le_bytes());
+            s[36..40].copy_from_slice(&chars.to_le_bytes()); // R + INITIALIZED_DATA
+        }
+        let va = |rva: u32| IMAGE_BASE.wrapping_add(u64::from(rva));
+        // IMAGE_TLS_DIRECTORY64 at RVA 0x1100 (.rdata raw 0x400). Every
+        // target stays inside .rdata [0x1000, 0x1400) and distinct:
+        // callback array @0x1200, callback body @0x1300, index slot @0x1310,
+        // raw TLS template @0x1380.
+        let tls_off = raw_start + 0x100;
+        img[tls_off..tls_off + 8].copy_from_slice(&va(0x1380).to_le_bytes()); // Start
+        img[tls_off + 8..tls_off + 16].copy_from_slice(&va(0x1384).to_le_bytes()); // End
+        img[tls_off + 16..tls_off + 24].copy_from_slice(&va(0x1310).to_le_bytes()); // Index
+        img[tls_off + 24..tls_off + 32].copy_from_slice(&va(0x1200).to_le_bytes()); // Callbacks
+        // SizeOfZeroFill/Characteristics stay 0.
+        // Callback array at RVA 0x1200: one slot + NULL terminator.
+        let arr_off = raw_start + 0x200;
+        match first_callback {
+            Some(cb) => img[arr_off..arr_off + 8].copy_from_slice(&va(cb).to_le_bytes()),
+            None => img[arr_off..arr_off + 8].copy_from_slice(&0u64.to_le_bytes()),
+        }
+        img[arr_off + 8..arr_off + 16].copy_from_slice(&0u64.to_le_bytes());
+        img
+    }
+
+    #[test]
+    fn entryless_with_tls_callbacks_fails_closed() {
+        let img = entryless_resource_dll_with_tls(Some(0x1300));
+        let pe = Pe64::parse(&img).unwrap();
+        assert!(
+            pe.tls_first_callback(&img).unwrap().is_some(),
+            "fixture must carry a real callback"
+        );
+        let err = match pack(cfg_pack_request(&img)) {
+            Ok(_) => panic!("entry-less + TLS callbacks must fail closed"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("entry-less") && msg.contains("TLS callbacks"),
+            "error must name the construction, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn entryless_with_callbackless_tls_directory_packs_with_dir_untouched() {
+        let img = entryless_resource_dll_with_tls(None);
+        let orig = Pe64::parse(&img).unwrap();
+        assert!(
+            orig.tls_first_callback(&img).unwrap().is_none(),
+            "fixture must be callback-less"
+        );
+        let (orig_rva, orig_size) = {
+            let d = orig.directory(IMAGE_DIRECTORY_ENTRY_TLS).unwrap();
+            (d.rva, d.size)
+        };
+        let out = pack(cfg_pack_request(&img)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(out.report.pages, 0, "entry-less packs seal nothing");
+        let pe = Pe64::parse(&out.image).unwrap();
+        assert_eq!(pe.entry_rva, 0, "entry must stay 0");
+        assert!(out.report.tls_directory, "TLS directory must survive");
+        let dir = pe.directory(IMAGE_DIRECTORY_ENTRY_TLS).unwrap();
+        assert_eq!((dir.rva, dir.size), (orig_rva, orig_size));
+        let a = orig.file_offset_of(orig_rva).unwrap();
+        let b = pe.file_offset_of(dir.rva).unwrap();
+        assert_eq!(
+            &img[a..a + 64],
+            &out.image[b..b + 64],
+            "TLS directory bytes must be byte-identical in the output"
+        );
+    }
+
+    /// Synthetic PE64 with executable sections and a `.reloc` directory of
+    /// DIR64 fixups at fixed RVAs:
+    ///
+    /// * `.text`  VA 0x1000, vsize/raw 0x2000 → sealed pages 0x1000..0x3000,
+    /// * `.text2` VA 0x2800, vsize 0x100, raw 0x200 → sealed chunk
+    ///   0x2800..0x2900, NESTED inside .text's second page (only when
+    ///   `overlap`),
+    /// * `.rdata` VA 0x4000 holding the reloc directory.
+    ///
+    /// DIR64 slots: 0x1100 (.text only), 0x2850 (in both), 0x2950 and 0x2ff8
+    /// (inside .text's range but past .text2's end — exactly the tail a
+    /// merely sorted interval table shadows and drops), 0x5008 (outside every
+    /// sealed page). With `security`, a stale SECURITY directory whose VA is
+    /// an absolute file offset is planted, as a signed input would carry.
+    fn synthetic_exec_reloc_pe(overlap: bool, security: bool) -> Vec<u8> {
+        const FILE_ALIGN: u32 = 0x200;
+        const SECTION_ALIGN: u32 = 0x1000;
+        const IMAGE_BASE: u64 = 0x140_000_000;
+        let optional_size = 240usize;
+        let table_off = 0x40 + 4 + 20 + optional_size;
+        let n_sections = if overlap { 3usize } else { 2usize };
+        let size_of_headers = 0x400usize;
+        let raw_start = 0x400usize;
+        let text_raw = raw_start;
+        let text2_raw = text_raw + 0x2000;
+        let rdata_raw = if overlap { text2_raw + 0x200 } else { text_raw + 0x2000 };
+        let mut img = vec![0u8; rdata_raw + 0x200];
+        img[0] = b'M';
+        img[1] = b'Z';
+        img[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        let pe = &mut img[0x40..];
+        pe[..4].copy_from_slice(b"PE\0\0");
+        pe[4..6].copy_from_slice(&0x8664u16.to_le_bytes());
+        pe[6..8].copy_from_slice(&(n_sections as u16).to_le_bytes());
+        pe[20..22].copy_from_slice(&(optional_size as u16).to_le_bytes());
+        let opt = &mut pe[24..24 + optional_size];
+        opt[0..2].copy_from_slice(&0x20Bu16.to_le_bytes());
+        opt[16..20].copy_from_slice(&0x1000u32.to_le_bytes()); // entry rva
+        opt[24..32].copy_from_slice(&IMAGE_BASE.to_le_bytes());
+        opt[32..36].copy_from_slice(&SECTION_ALIGN.to_le_bytes());
+        opt[36..40].copy_from_slice(&FILE_ALIGN.to_le_bytes());
+        opt[56..60].copy_from_slice(&0x5000u32.to_le_bytes()); // size of image
+        opt[60..64].copy_from_slice(&(size_of_headers as u32).to_le_bytes());
+        opt[70..72].copy_from_slice(&0x0160u16.to_le_bytes()); // ASLR|HE|NX, no GUARD_CF
+        opt[108..112].copy_from_slice(&16u32.to_le_bytes());
+        // BASERELOC (index 5): the .reloc content below, 40 bytes at 0x4000.
+        opt[112 + 5 * 8..112 + 5 * 8 + 4].copy_from_slice(&0x4000u32.to_le_bytes());
+        opt[112 + 5 * 8 + 4..112 + 5 * 8 + 8].copy_from_slice(&40u32.to_le_bytes());
+        if security {
+            // SECURITY (index 4): VA is an absolute FILE OFFSET (0x600 sits
+            // inside .text raw data), as Authenticode leaves it.
+            opt[112 + 4 * 8..112 + 4 * 8 + 4].copy_from_slice(&0x600u32.to_le_bytes());
+            opt[112 + 4 * 8 + 4..112 + 4 * 8 + 8].copy_from_slice(&0x10u32.to_le_bytes());
+        }
+        let mut push_section = |img: &mut Vec<u8>, i: usize, name: &str, vsize: u32, va: u32, raw_size: u32, raw_ptr: usize, chars: u32| {
+            let s = table_off + i * 40;
+            img[s..s + 8].copy_from_slice(&[name.as_bytes(), &[0u8; 8]].concat()[..8]);
+            img[s + 8..s + 12].copy_from_slice(&vsize.to_le_bytes());
+            img[s + 12..s + 16].copy_from_slice(&va.to_le_bytes());
+            img[s + 16..s + 20].copy_from_slice(&raw_size.to_le_bytes());
+            img[s + 20..s + 24].copy_from_slice(&(raw_ptr as u32).to_le_bytes());
+            img[s + 36..s + 40].copy_from_slice(&chars.to_le_bytes());
+        };
+        push_section(&mut img, 0, ".text", 0x2000, 0x1000, 0x2000, text_raw, 0x6000_0020);
+        let mut next = 1;
+        if overlap {
+            push_section(&mut img, next, ".text2", 0x100, 0x2800, 0x200, text2_raw, 0x6000_0020);
+            next += 1;
+        }
+        push_section(&mut img, next, ".rdata", 0x200, 0x4000, 0x200, rdata_raw, 0x4000_0040);
+        // Code bytes: a nonzero pattern so sealed/trap overwrites are visible.
+        for i in 0..0x2000 {
+            img[text_raw + i] = 0x40 + (i % 40) as u8;
+        }
+        if overlap {
+            for i in 0..0x200 {
+                img[text2_raw + i] = 0x80 + (i % 64) as u8;
+            }
+        }
+        // .reloc at rva 0x4000: three blocks, DIR64 (type 10) entries plus
+        // ABSOLUTE (type 0) padding.
+        let dir64 = |ofs: u16| 10u16 << 12 | ofs;
+        let r = rdata_raw;
+        img[r..r + 4].copy_from_slice(&0x1000u32.to_le_bytes()); // page rva
+        img[r + 4..r + 8].copy_from_slice(&12u32.to_le_bytes()); // block size
+        img[r + 8..r + 10].copy_from_slice(&dir64(0x100).to_le_bytes()); // → 0x1100
+        img[r + 10..r + 12].copy_from_slice(&0u16.to_le_bytes()); // ABSOLUTE pad
+        img[r + 12..r + 16].copy_from_slice(&0x2000u32.to_le_bytes());
+        img[r + 16..r + 20].copy_from_slice(&16u32.to_le_bytes());
+        img[r + 20..r + 22].copy_from_slice(&dir64(0x850).to_le_bytes()); // → 0x2850
+        img[r + 22..r + 24].copy_from_slice(&dir64(0x950).to_le_bytes()); // → 0x2950
+        img[r + 24..r + 26].copy_from_slice(&dir64(0xff8).to_le_bytes()); // → 0x2ff8
+        img[r + 26..r + 28].copy_from_slice(&0u16.to_le_bytes());
+        img[r + 28..r + 32].copy_from_slice(&0x5000u32.to_le_bytes());
+        img[r + 32..r + 36].copy_from_slice(&12u32.to_le_bytes());
+        img[r + 36..r + 38].copy_from_slice(&dir64(0x008).to_le_bytes()); // → 0x5008
+        img[r + 38..r + 40].copy_from_slice(&0u16.to_le_bytes());
+        img
+    }
+
+    /// Envelope reloc list of a packed image: (rva, kind) pairs the packed
+    /// stub must re-apply after AEAD open.
+    fn envelope_relocs(packed: &[u8]) -> Vec<(u32, u16)> {
+        let pe = Pe64::parse(packed).unwrap();
+        let payload = pe.sections.last().expect("payload section");
+        let env = &packed[payload.raw_ptr as usize..];
+        let mut r = xenolith_protocol::parse(env).expect("EnvelopeV2").relocs;
+        r.sort_unstable();
+        r
+    }
+
+    const DIR64: u16 = IMAGE_REL_BASED_DIR64;
+
+    #[test]
+    fn overlapping_exec_sections_keep_every_dir64_in_the_overlap() {
+        let img = synthetic_exec_reloc_pe(true, false);
+        let orig = Pe64::parse(&img).unwrap();
+        let dir64s: Vec<u32> = orig
+            .relocs(&img)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == IMAGE_REL_BASED_DIR64)
+            .map(|e| e.rva)
+            .collect();
+        assert_eq!(dir64s, vec![0x1100, 0x2850, 0x2950, 0x2ff8, 0x5008]);
+        assert_eq!(orig.sections.len(), 3, "fixture must carry .text2");
+        // .text2's sealed chunk is nested inside .text's second page.
+        assert!(orig.sections[1].virtual_address >= orig.sections[0].virtual_address);
+        assert!(
+            orig.sections[1].virtual_address
+                < orig.sections[0].virtual_address + orig.sections[0].virtual_size
+        );
+
+        let out = pack(cfg_pack_request(&img)).unwrap_or_else(|e| panic!("{e}"));
+        // 3 sealed page records: two .text pages + the nested .text2 chunk.
+        assert_eq!(out.packed.pages.len(), 3);
+        assert_eq!(
+            envelope_relocs(&out.image),
+            vec![(0x1100, DIR64), (0x2850, DIR64), (0x2950, DIR64), (0x2ff8, DIR64)],
+            "every DIR64 inside the sealed union must survive: 0x2950/0x2ff8 sit in \
+             .text's range past the nested .text2 end — the tail a merely sorted \
+             interval table shadows and silently drops (runtime wild pointers)"
+        );
+        assert!(
+            !envelope_relocs(&out.image).iter().any(|&(rva, _)| rva == 0x5008),
+            "0x5008 is outside every sealed page and must not be carried"
+        );
+    }
+
+    #[test]
+    fn non_overlapping_exec_sections_dir64_baseline() {
+        let img = synthetic_exec_reloc_pe(false, false);
+        assert_eq!(Pe64::parse(&img).unwrap().sections.len(), 2);
+        let out = pack(cfg_pack_request(&img)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(out.packed.pages.len(), 2, ".text alone seals two pages");
+        // Same sealed union [0x1000, 0x3000) — the overlap must not change
+        // WHICH DIR64s survive, only add the nested page record.
+        assert_eq!(
+            envelope_relocs(&out.image),
+            vec![(0x1100, DIR64), (0x2850, DIR64), (0x2950, DIR64), (0x2ff8, DIR64)]
+        );
+    }
+
+    #[test]
+    fn merge_ranges_unions_overlaps_and_stays_sorted_disjoint() {
+        // nested
+        assert_eq!(
+            merge_ranges(vec![(0x1000, 0x3000), (0x2800, 0x2900)]),
+            vec![(0x1000, 0x3000)]
+        );
+        // partial overlap, unsorted input
+        assert_eq!(
+            merge_ranges(vec![(0x1800, 0x2800), (0x1000, 0x2000)]),
+            vec![(0x1000, 0x2800)]
+        );
+        // touching intervals merge
+        assert_eq!(
+            merge_ranges(vec![(0x1000, 0x2000), (0x2000, 0x3000)]),
+            vec![(0x1000, 0x3000)]
+        );
+        // empty intervals protect nothing and are dropped
+        assert_eq!(
+            merge_ranges(vec![(0x4000, 0x4100), (0x1000, 0x1000), (0x1100, 0x1100)]),
+            vec![(0x4000, 0x4100)]
+        );
+        assert!(merge_ranges(Vec::new()).is_empty());
+    }
+
+    /// Property: for pseudo-random interval sets (including empty,
+    /// overlapping, nested, and touching intervals), the merged table is
+    /// sorted and disjoint, and binary-search containment on it equals
+    /// brute-force union membership at every probe (endpoints, neighbors,
+    /// and random points).
+    #[test]
+    fn merge_ranges_property_membership_matches_bruteforce() {
+        // Deterministic LCG (no external test deps, reproducible failures).
+        struct Lcg(u64);
+        impl Lcg {
+            fn next_u32(&mut self) -> u32 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (self.0 >> 33) as u32
+            }
+            fn below(&mut self, n: u32) -> u32 {
+                self.next_u32() % n
+            }
+        }
+        let mut rng = Lcg(0x5851_F42D_4C95_7F2D);
+        for _case in 0..400 {
+            let n = 1 + rng.below(12) as usize;
+            let ranges: Vec<(u32, u32)> = (0..n)
+                .map(|_| {
+                    let lo = rng.below(0x10000);
+                    let len = rng.below(0x4000); // zero-length intervals included on purpose
+                    (lo, lo + len)
+                })
+                .collect();
+            let merged = merge_ranges(ranges.clone());
+            // Invariant 1: sorted, disjoint (not even touching), non-empty.
+            for w in merged.windows(2) {
+                assert!(
+                    w[0].1 < w[1].0,
+                    "merged table not sorted/disjoint: {merged:?} from {ranges:?}"
+                );
+            }
+            for &(lo, hi) in &merged {
+                assert!(hi > lo, "empty interval survived: {merged:?}");
+            }
+            // Invariant 2: membership == brute force, probed hard.
+            let mut probes: Vec<u32> = Vec::new();
+            for &(lo, hi) in &ranges {
+                probes.extend_from_slice(&[lo.saturating_sub(1), lo, hi.saturating_sub(1), hi]);
+            }
+            for _ in 0..64 {
+                probes.push(rng.below(0x14000));
+            }
+            for p in probes {
+                let brute = ranges.iter().any(|&(lo, hi)| p >= lo && p < hi);
+                assert_eq!(
+                    range_contains(&merged, p),
+                    brute,
+                    "rva {p:#x}: merged {merged:?} disagrees with brute force on {ranges:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pack_clears_security_directory_on_the_roomy_repack_path() {
+        let img = synthetic_exec_reloc_pe(false, true);
+        assert_eq!(
+            Pe64::parse(&img)
+                .unwrap()
+                .directory(IMAGE_DIRECTORY_ENTRY_SECURITY)
+                .map(|d| (d.rva, d.size)),
+            Some((0x600, 0x10)),
+            "fixture must arrive signed-shaped"
+        );
+        let out = pack(cfg_pack_request(&img)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            Pe64::parse(&out.image)
+                .unwrap()
+                .directory(IMAGE_DIRECTORY_ENTRY_SECURITY)
+                .map(|d| (d.rva, d.size)),
+            Some((0, 0)),
+            "every repack path must drop the stale Authenticode directory"
+        );
+    }
+
+    #[test]
+    fn pack_clears_security_directory_on_the_entryless_path() {
+        let mut img = entryless_resource_dll();
+        Pe64::parse(&img)
+            .unwrap()
+            .set_directory(&mut img, IMAGE_DIRECTORY_ENTRY_SECURITY, 0x500, 0x10)
+            .unwrap();
+        let out = pack(cfg_pack_request(&img)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(out.report.pages, 0);
+        assert_eq!(
+            Pe64::parse(&out.image)
+                .unwrap()
+                .directory(IMAGE_DIRECTORY_ENTRY_SECURITY)
+                .map(|d| (d.rva, d.size)),
+            Some((0, 0)),
+            "entryless packs must drop the stale Authenticode directory too"
+        );
+    }
+
+    #[test]
+    fn pack_clears_security_directory_on_the_header_slack_path() {
+        // tight_headers_pe bakes in SECURITY VA 0x600 / size 0x10 and needs
+        // the header-slack shift: the end-to-end pack covers the re-entry.
+        let img = tight_headers_pe(16);
+        assert_eq!(
+            Pe64::parse(&img)
+                .unwrap()
+                .directory(IMAGE_DIRECTORY_ENTRY_SECURITY)
+                .map(|d| (d.rva, d.size)),
+            Some((0x600, 0x10))
+        );
+        let out = pack(cfg_pack_request(&img)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            Pe64::parse(&out.image)
+                .unwrap()
+                .directory(IMAGE_DIRECTORY_ENTRY_SECURITY)
+                .map(|d| (d.rva, d.size)),
+            Some((0, 0)),
+            "header-slack packs must drop the stale Authenticode directory too"
+        );
+    }
+
+    #[test]
+    fn header_slack_skips_roomy_layouts() {
+        let img = tight_headers_pe(16);
+        let mut roomy = img.clone();
+        let pe = Pe64::parse(&roomy).unwrap();
+        // one extra FileAlignment of header room: no shift needed
+        roomy.resize(roomy.len() + 0x200, 0);
+        pe.set_size_of_headers(&mut roomy, pe.size_of_headers + 0x200)
+            .unwrap();
+        for s in pe.sections.iter() {
+            let mut shifted = s.clone();
+            if s.raw_size > 0 && s.raw_ptr > 0 {
+                shifted.raw_ptr = s.raw_ptr + 0x200;
+            }
+            let i = pe.sections.iter().position(|x| x.raw_ptr == s.raw_ptr).unwrap();
+            pe.write_section_header(&mut roomy, i, &shifted).unwrap();
+        }
+        assert!(inject_header_slack(&roomy).unwrap().is_none());
+    }
+
     #[test]
     fn stub_is_seed_divergent() {
         let a = emit_pic_stub(&[1; 16]).expect("stub a");
