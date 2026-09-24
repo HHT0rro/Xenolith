@@ -43,6 +43,11 @@ pub struct ConstantPlan {
     pub native_referenced: usize,
 }
 
+/// Historical single-shot scanner, retained verbatim as the equivalence
+/// reference for `discover_intervals` (see the test module). Production
+/// discovery uses the single-pass form; this rescan-to-end semantics is
+/// exactly the O(n^2) the forward pass replaces.
+#[cfg(test)]
 fn printable_run(buf: &[u8]) -> Option<usize> {
     // A string-like run: >=6 printable bytes followed by NUL.
     let mut run = 0usize;
@@ -59,10 +64,42 @@ fn printable_run(buf: &[u8]) -> Option<usize> {
     None
 }
 
-/// One candidate constant interval, sorted by rva. `printable_run` scans
-/// forward within a section, so the produced intervals never overlap and the
-/// sorted table answers "which candidate does this address fall into" with a
-/// single binary search per position instead of a nested loop per candidate.
+/// Discover string-like constant intervals in ONE forward pass. An interval
+/// `[interval_start, nul]` (NUL included) is emitted when the NUL terminates
+/// a run of >= 6 printable bytes; scanning resumes right after that NUL.
+///
+/// Byte-identical to the historical rescan loop
+/// (`while off < len { if let Some(run) = printable_run(&raw[off..]) … off += 1 }`):
+/// if no qualifying NUL exists ahead of position p, none exists ahead of
+/// p+1 either (the printable-run window only shrinks), so the old +1
+/// stepping never discovered an event the forward pass misses — it only
+/// rescanned the same tail O(n) times. That rescan made discovery O(n^2) on
+/// run-free binary data (real-world .rdata tables) and stalled
+/// multi-megabyte images for minutes; the verdicts, interval boundaries,
+/// and emitted (offset, len) pairs here are the same as before.
+fn discover_intervals(raw: &[u8]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut interval_start = 0usize;
+    let mut run = 0usize;
+    for (i, &b) in raw.iter().enumerate() {
+        if (0x20..0x7f).contains(&b) {
+            run += 1;
+            continue;
+        }
+        if b == 0 && run >= 6 {
+            out.push((interval_start, i + 1 - interval_start));
+            interval_start = i + 1;
+        }
+        run = 0;
+    }
+    out
+}
+
+/// One candidate constant interval, sorted by rva. `discover_intervals`
+/// scans forward within a section, so the produced intervals never overlap
+/// and the sorted table answers "which candidate does this address fall
+/// into" with a single binary search per position instead of a nested loop
+/// per candidate.
 #[derive(Clone, Copy, Debug)]
 struct Candidate {
     rva: u32,
@@ -121,17 +158,14 @@ pub fn plan_constants(
             .get(start as usize..)
             .and_then(|s| s.get(..sec.raw_size as usize))
             .unwrap_or(&[][..]);
-        let mut off = 0usize;
-        while off < raw.len() {
-            if let Some(run) = printable_run(&raw[off..]) {
-                candidates.push(Candidate {
-                    rva: sec.virtual_address + off as u32,
-                    len: run as u32,
-                });
-                off += run;
-            } else {
-                off += 1;
-            }
+        // Single-pass discovery (see discover_intervals) — the old rescan
+        // loop was O(n^2) on run-free binary data (real-world .rdata
+        // tables), which stalled multi-megabyte images for minutes.
+        for (off, len) in discover_intervals(raw) {
+            candidates.push(Candidate {
+                rva: sec.virtual_address + off as u32,
+                len: len as u32,
+            });
         }
     }
     plan.candidates = candidates.len();
@@ -253,5 +287,73 @@ mod tests {
         assert_eq!(printable_run(b"abc\0"), None);
         assert_eq!(printable_run(b"no terminator"), None);
         let _ = synth_image();
+    }
+
+    /// The historical discovery loop, kept verbatim as the equivalence
+    /// reference for discover_intervals.
+    fn old_discovery(raw: &[u8]) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let mut off = 0usize;
+        while off < raw.len() {
+            if let Some(run) = printable_run(&raw[off..]) {
+                out.push((off, run));
+                off += run;
+            } else {
+                off += 1;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn discover_intervals_matches_old_rescan_loop() {
+        // Handcrafted adversarial shapes first.
+        let cases: Vec<&[u8]> = vec![
+            b"",
+            b"\0\0\0\0",
+            b"abcdef\0",
+            b"abcde\0",                       // run of 5: no event
+            b"x abcdef\0",                    // leading junk joins the interval
+            b"abcdef\0abcdefgh\0",            // two adjacent events
+            b"abcdef\x01ghijkl\0",            // non-printable resets the run
+            b"abcdef",                        // printable tail without NUL
+            b"binary\0\0\0table\0data",       // NUL storm
+            &[0x10u8, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x00, 0x01], // run-free head + event
+        ];
+        for raw in cases {
+            assert_eq!(
+                discover_intervals(raw),
+                old_discovery(raw),
+                "handcrafted case mismatch for {raw:?}"
+            );
+        }
+
+        // Deterministic pseudo-random buffers across printable densities:
+        // string-rich (.rdata), binary-rich (tables), and NUL-heavy.
+        let mut state = 0x2545F4914F6CDD1Du64;
+        let mut next = move |modulus: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % modulus) as u8
+        };
+        for &modulus in &[4u64, 8, 16, 128, 256] {
+            for case in 0..300 {
+                let len = 1 + (case * 37) % 4096;
+                let raw: Vec<u8> = (0..len).map(|_| next(modulus)).collect();
+                assert_eq!(
+                    discover_intervals(&raw),
+                    old_discovery(&raw),
+                    "random case mismatch (modulus {modulus}, case {case}, len {len})"
+                );
+            }
+        }
+
+        // A long run-free binary stretch (the real-world stall shape: the old
+        // loop rescanned it from every position).
+        let mut runfree = vec![0x11u8; 1 << 16];
+        runfree.extend_from_slice(b"const-string\0");
+        runfree.extend_from_slice(&[0x9e; 512]);
+        assert_eq!(discover_intervals(&runfree), old_discovery(&runfree));
     }
 }
