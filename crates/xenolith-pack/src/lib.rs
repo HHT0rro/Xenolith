@@ -702,10 +702,20 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
                 .collect()
         },
         relocs: {
-            let protected: Vec<(u32, u32)> = pages
-                .iter()
-                .map(|(_i, rva, plain, _n)| (*rva, *rva + plain.len() as u32))
-                .collect();
+            // Sealed-page interval table. Page chunks step 4 KiB inside each
+            // executable section, but nothing in the PE format forces
+            // sections to own disjoint RVA ranges — merge_ranges unions the
+            // (possibly overlapping or nested) page ranges first, so the one
+            // binary search per relocation below is correct for every input.
+            // Real monoliths carry 5×10^5-8×10^5 DIR64 entries against
+            // 2×10^4-5×10^4 pages and the former per-relocation linear scan
+            // measured minutes (R×P ≈ 4×10^10 on libcef-class inputs).
+            let protected = merge_ranges(
+                pages
+                    .iter()
+                    .map(|(_i, rva, plain, _n)| (*rva, *rva + plain.len() as u32))
+                    .collect(),
+            );
             let mut r = Vec::new();
             for e in pe.relocs(request.input).unwrap_or_default() {
                 if e.kind != 0 && e.kind != IMAGE_REL_BASED_DIR64 {
@@ -718,9 +728,7 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
                         reloc_kind_name(e.kind)
                     )));
                 }
-                if e.kind == IMAGE_REL_BASED_DIR64
-                    && protected.iter().any(|(lo, hi)| e.rva >= *lo && e.rva < *hi)
-                {
+                if e.kind == IMAGE_REL_BASED_DIR64 && range_contains(&protected, e.rva) {
                     r.push((e.rva, e.kind));
                 }
             }
@@ -1302,6 +1310,47 @@ fn reloc_kind_name(kind: u16) -> String {
         4 => "HIGHADJ".into(),
         10 => "DIR64".into(),
         other => format!("TYPE{other}"),
+    }
+}
+
+/// Merge a set of half-open RVA intervals `[lo, hi)` into a sorted, disjoint
+/// table whose union equals the union of the inputs.
+///
+/// Executable sections normally own distinct RVA ranges, but nothing in the
+/// PE format enforces that: hand-linked and post-processed images can carry
+/// sections whose RVA ranges overlap or nest. On such input a merely
+/// *sorted* table breaks the containment binary search — a later-starting
+/// interval shadows an earlier, longer one, and relocations inside the
+/// shadowed tail would look unprotected and be silently dropped from the
+/// envelope (wild pointers at runtime once the loader applies the surviving
+/// fixups). Unioning the ranges before searching makes the answer correct
+/// for every input, overlapping or not, without rejecting images the OS
+/// loader itself accepts.
+fn merge_ranges(ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    let mut ranges = ranges;
+    ranges.sort_unstable_by_key(|&(lo, _)| lo);
+    let mut merged: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+    for (lo, hi) in ranges {
+        if hi <= lo {
+            continue; // empty interval: covers nothing, cannot merge
+        }
+        match merged.last_mut() {
+            // Overlapping or touching: extend the running hull. Adjacent
+            // intervals merge too; containment semantics are unchanged.
+            Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+            _ => merged.push((lo, hi)),
+        }
+    }
+    merged
+}
+
+/// Half-open containment against a table produced by [`merge_ranges`]
+/// (sorted, disjoint): one binary search, no linear scan.
+fn range_contains(table: &[(u32, u32)], rva: u32) -> bool {
+    let idx = table.partition_point(|&(lo, _)| lo <= rva);
+    idx > 0 && {
+        let (lo, hi) = table[idx - 1];
+        rva >= lo && rva < hi
     }
 }
 
