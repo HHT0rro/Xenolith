@@ -20,7 +20,27 @@ use thiserror::Error;
 pub const ENVELOPE_VERSION: u16 = 2;
 pub const MAX_PLAINTEXT_PAGES: usize = 4;
 pub const STOLEN_BYTES: usize = 16;
-pub const MAX_PAGES: usize = 16_384;
+
+/// Upper bound on sealed 4-KiB page records in one envelope.
+///
+/// The wire format counts regions in a u32 and the host emulator is fully
+/// dynamic; the binding constraint is the injected core's envelope pre-scan
+/// (`xl_reloc_scan` in crates/xenolith-runtime/core/xl_core.c), which walks
+/// the region records with per-step bounds checks and rejects
+/// `region_count > 0xffff`. Real-world monolithic binaries (libcef/Electron
+/// class, 150-250 MB) carry 3-5×10⁴ executable pages, so the historical
+/// 16_384 cap rejected them all; the limit now sits exactly at what the
+/// core accepts.
+pub const MAX_PAGES: usize = 65_535;
+
+/// Region states the injected core can track for the G5 lazy-region
+/// lifecycle (fault-wake / quiesce re-seal): `XlRegionTable.st[]` in
+/// crates/xenolith-runtime/core/xl_core.c is a fixed 64-entry array. A lazy
+/// pack with more sealed regions than this would boot but never wake a
+/// sealed page (the fault path rebuilds the table and fails closed), so the
+/// packer refuses it up front. All-live packs are unaffected — the boot
+/// decrypt walk is streaming and unbounded by this table.
+pub const LAZY_REGION_STATE_MAX: usize = 64;
 
 #[derive(Debug, Error)]
 pub enum LoaderError {

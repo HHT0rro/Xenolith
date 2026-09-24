@@ -138,6 +138,17 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
             xenolith_loader::MAX_PAGES
         )));
     }
+    // Same injected-core constraint as the PE path: the G5 fault-wake table
+    // tracks at most LAZY_REGION_STATE_MAX regions (xl_core.c st[]).
+    if request.lazy_regions && pages.len() > xenolith_loader::LAZY_REGION_STATE_MAX {
+        return Err(PackError::Stub(format!(
+            "lazy regions: {} sealed pages exceed the injected runtime's region-state \
+             table ({} entries); dormant-region packs must stay within it — pack without \
+             --lazy-regions (all-live decrypt) or exclude PT_LOAD segments from packing",
+            pages.len(),
+            xenolith_loader::LAZY_REGION_STATE_MAX
+        )));
+    }
 
     let mut measure_src = mba.as_bytes();
     measure_src.extend_from_slice(&opcode_seed);

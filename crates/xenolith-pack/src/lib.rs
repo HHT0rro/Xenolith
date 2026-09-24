@@ -588,6 +588,20 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
             xenolith_loader::MAX_PAGES
         )));
     }
+    // G5 lazy regions: the injected core's fault-wake/quiesce table is a
+    // fixed 64-entry array (XlRegionTable.st[] in xl_core.c). A lazy pack
+    // beyond it would boot but never wake a sealed page, so refuse here
+    // instead of shipping a silently-broken image. All-live packs are
+    // unaffected (the boot decrypt walk is streaming).
+    if request.lazy_regions && pages.len() > xenolith_loader::LAZY_REGION_STATE_MAX {
+        return Err(PackError::Stub(format!(
+            "lazy regions: {} sealed pages exceed the injected runtime's region-state \
+             table ({} entries); dormant-region packs must stay within it — pack without \
+             --lazy-regions (all-live decrypt) or exclude sections from packing",
+            pages.len(),
+            xenolith_loader::LAZY_REGION_STATE_MAX
+        )));
+    }
 
     let mut seed = [0u8; 16];
     OsRng.fill_bytes(&mut seed);
