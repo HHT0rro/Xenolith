@@ -228,6 +228,49 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
         Err(FormatError::ElfNotImplemented) => return Err(PackError::Elf("unsupported ELF kind")),
         Err(e) => return Err(PackError::Format(e)),
     };
+    // Header-slack injection: pack() appends TWO section headers (stub +
+    // payload). Tight MSVC layouts end the section table exactly at
+    // SizeOfHeaders, leaving no room; instead of rejecting the image, grow
+    // the header block by inserting a FileAlignment-sized hole before the
+    // first raw data and re-enter pack() on the shifted image so every
+    // downstream offset (entry steal, imports, relocs, pdata, envelope) is
+    // computed on the shifted bytes consistently. See inject_header_slack.
+    if matches!(kind, ImageKind::Pe64Dll | ImageKind::Pe64Exe) {
+        if let Some(shifted) = inject_header_slack(request.input)? {
+            let PackRequest {
+                input: _,
+                profile,
+                vm_exports,
+                debug_gate,
+                opcode_seed,
+                trace_diverge,
+                select_rva,
+                select_functions,
+                select_all,
+                strict_coverage,
+                allow_native_fallback,
+                lazy_regions,
+                protect_imports,
+                strict_constants,
+            } = request;
+            return pack(PackRequest {
+                input: &shifted,
+                profile,
+                vm_exports,
+                debug_gate,
+                opcode_seed,
+                trace_diverge,
+                select_rva,
+                select_functions,
+                select_all,
+                strict_coverage,
+                allow_native_fallback,
+                lazy_regions,
+                protect_imports,
+                strict_constants,
+            });
+        }
+    }
     let pe = Pe64::parse(request.input)?;
     if is_already_packed(&pe, request.input) {
         return Err(PackError::Invalid(
@@ -1141,6 +1184,96 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
 /// variants observed on the System32 corpus).
 fn is_cfg_forwarder_section(name: &str) -> bool {
     name == "fothk"
+}
+
+/// Grow a PE's header block so two more section headers fit.
+///
+/// Tight linker layouts end the section table exactly at `SizeOfHeaders`
+/// (e.g. 16 sections, `FileAlignment` 0x200, raw data starting at 0x400),
+/// and pack() appends two section headers (stub + payload) — the historical
+/// behavior was to reject the whole image ("no room for 2 extra section
+/// headers"). Instead of refusing, insert a `FileAlignment`-multiple hole
+/// immediately before the first section's raw data and shift every raw
+/// pointer past it:
+///
+/// * the section TABLE stays at its spec-fixed offset (it always follows the
+///   optional header); only its end must fit inside the grown header block;
+/// * `SizeOfHeaders += delta`, still ≤ the (shifted) first raw pointer — the
+///   loader maps the enlarged header region and finds the two new headers;
+/// * raw pointers of sections with raw data each shift by the same `delta`,
+///   so no bytes are reordered, only relocated as a block — RVAs, imports,
+///   relocs, and unwind tables are untouched;
+/// * the SECURITY directory is zeroed: unlike every other directory its VA
+///   is an absolute FILE OFFSET, and an Authenticode signature over the
+///   original bytes is invalid after any repack anyway;
+/// * `None` means "no injection needed" (the table already fits) or "this
+///   image cannot be shifted safely" (raw data starting inside the header
+///   block, or no raw data at all) — the caller's existing fail-closed
+///   error then reports it.
+fn inject_header_slack(input: &[u8]) -> Result<Option<Vec<u8>>, PackError> {
+    let pe = Pe64::parse(input)?;
+    let headers = pe.size_of_headers as usize;
+    let needed =
+        pe.section_table_offset + (pe.number_of_sections as usize + 2) * 40; // + stub + payload
+    if needed <= headers {
+        return Ok(None);
+    }
+    let mut raw_ptrs: Vec<u32> = pe
+        .sections
+        .iter()
+        .filter(|s| s.raw_size > 0 && s.raw_ptr > 0)
+        .map(|s| s.raw_ptr)
+        .collect();
+    raw_ptrs.sort_unstable();
+    let Some(&first_raw) = raw_ptrs.first() else {
+        return Ok(None); // no raw data: nothing to shift around
+    };
+    let first_raw = first_raw as usize;
+    if first_raw < headers {
+        // Raw data starts inside the header block — not a layout the loader
+        // honors for grown headers; leave it to the fail-closed check.
+        return Ok(None);
+    }
+    let align = pe.file_align as usize;
+    if align < 512 || !align.is_power_of_two() {
+        return Err(PackError::Stub(format!(
+            "FileAlignment {align:#x} outside the PE range [512, 65536] or not a power of \
+             two — cannot grow the header block safely",
+        )));
+    }
+    let delta = (needed - headers).div_ceil(align) * align;
+    let mut out = Vec::with_capacity(input.len() + delta);
+    out.extend_from_slice(&input[..first_raw]);
+    out.resize(first_raw + delta, 0);
+    out.extend_from_slice(&input[first_raw..]);
+    for (i, sec) in pe.sections.iter().enumerate() {
+        let mut shifted = sec.clone();
+        if sec.raw_size > 0 && sec.raw_ptr > 0 {
+            shifted.raw_ptr = sec.raw_ptr.checked_add(delta as u32).ok_or_else(|| {
+                PackError::Stub(format!(
+                    "raw pointer {:#x} + {delta:#x} overflows u32 while growing the header \
+                     block — the input is larger than a 32-bit file layout allows",
+                    sec.raw_ptr
+                ))
+            })?;
+        }
+        pe.write_section_header(&mut out, i, &shifted)?;
+    }
+    pe.set_size_of_headers(&mut out, (headers + delta) as u32)?;
+    pe.zero_directory(&mut out, IMAGE_DIRECTORY_ENTRY_SECURITY)?;
+    // Fail closed on our own arithmetic: the shifted image must parse and
+    // actually satisfy the bound pack() is about to rely on.
+    let reparsed = Pe64::parse(&out)?;
+    let new_needed =
+        reparsed.section_table_offset + (reparsed.number_of_sections as usize + 2) * 40;
+    if new_needed > reparsed.size_of_headers as usize || reparsed.file_align as usize != align {
+        return Err(PackError::Stub(
+            "header-slack injection produced an inconsistent image (packer bug; report with \
+             the input image)"
+                .into(),
+        ));
+    }
+    Ok(Some(out))
 }
 
 /// Parsed CFG rewrite plan. `None` from `plan_cfg_rewrite` means the image is
