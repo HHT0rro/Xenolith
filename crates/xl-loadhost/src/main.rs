@@ -2,9 +2,21 @@
 //!
 //! Usage: xl-loadhost <dll-path> [export-name ...]
 //!
-//! Loads the DLL with LoadLibraryW(LOAD_WITH_ALTERED_SEARCH_PATH), resolves
-//! each named export with GetProcAddress, prints one JSON line, frees the
-//! library, exits. NEVER calls any export. See Cargo.toml for the contract.
+//! Loads the DLL with LoadLibraryExW(LOAD_WITH_ALTERED_SEARCH_PATH) - dependencies
+//! resolve against the module's own directory, matching the packed stub's runtime
+//! binding semantics - resolves each named export with GetProcAddress, prints one
+//! JSON line, frees the library, exits. NEVER calls any export.
+//!
+//! HISTORY BUG (fixed): this used to declare `LoadLibraryW(lpFileName, dwFlags)`
+//! and pass the flag - but LoadLibraryW takes ONE parameter, so the flag was
+//! silently ignored by the x64 ABI and every load ran under STANDARD search
+//! (host exe dir, CWD, system dirs, PATH) which never includes the module's own
+//! directory. Originals staged in-place next to their siblings therefore failed
+//! deterministically with 126 while the packed side (minimal on-disk imports +
+//! runtime stub resolving from the module dir) loaded fine - misattributed for
+//! two rounds as a "staged-copy freshness race". Verified in one process on a
+//! staged Qt6Gui.orig-test.dll copy: LoadLibraryW -> 126,
+//! LoadLibraryExW(ALTERED) -> OK (out/verify126/lh-diag).
 
 #[cfg(windows)]
 mod host {
@@ -32,11 +44,11 @@ mod host {
 
     #[link(name = "kernel32")]
     extern "system" {
-        fn LoadLibraryW(lpFileName: *const u16, dwFlags: u32) -> HModule;
+        fn LoadLibraryExW(lpFileName: *const u16, hFile: *mut core::ffi::c_void, dwFlags: u32) -> HModule;
         fn GetProcAddress(hModule: HModule, lpProcName: *const u8) -> *mut core::ffi::c_void;
         fn FreeLibrary(hLibModule: HModule) -> i32;
         fn GetLastError() -> u32;
-        fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> *mut core::ffi::c_void;
+        fn CreateToolhelp32Snapshot(dwFlags: u32, dwProcessID: u32) -> *mut core::ffi::c_void;
         fn Module32FirstW(hSnapshot: *mut core::ffi::c_void, lpme: *mut MODULEENTRY32W) -> i32;
         fn Module32NextW(hSnapshot: *mut core::ffi::c_void, lpme: *mut MODULEENTRY32W) -> i32;
         fn CloseHandle(hObject: *mut core::ffi::c_void) -> i32;
@@ -109,11 +121,26 @@ mod host {
         }
         let dll: Vec<u16> = OsStr::new(&args[0]).encode_wide().chain(Some(0)).collect();
 
-        let handle = unsafe { LoadLibraryW(dll.as_ptr(), LOAD_WITH_ALTERED_SEARCH_PATH) };
+        // LOAD_WITH_ALTERED_SEARCH_PATH belongs to LoadLibraryExW; passing it to
+        // the one-parameter LoadLibraryW was a silent no-op (see file header).
+        let handle = unsafe {
+            LoadLibraryExW(dll.as_ptr(), core::ptr::null_mut(), LOAD_WITH_ALTERED_SEARCH_PATH)
+        };
         if handle.is_null() {
             // capture immediately: formatting/allocation may clear last error
             let err = unsafe { GetLastError() };
-            emit(&format!("{{\"loaded\":false,\"lastWinError\":{err}}}"));
+            // Distinguish "the target file itself was not visible/readable" (freshly
+            // staged copy still settling through filter drivers -> transient
+            // ERROR_MOD_NOT_FOUND / ERROR_DLL_INIT_FAILED, verified in the compat
+            // harness) from "a dependency is genuinely missing" (file present and
+            // full-size). Diagnostics only - the exit code contract is unchanged.
+            let (exists, len) = match std::fs::metadata(&args[0]) {
+                Ok(m) => (true, m.len()),
+                Err(_) => (false, 0),
+            };
+            emit(&format!(
+                "{{\"loaded\":false,\"lastWinError\":{err},\"fileExists\":{exists},\"fileLen\":{len}}}"
+            ));
             return 3;
         }
 
@@ -150,6 +177,6 @@ fn main() {
 
 #[cfg(not(windows))]
 fn main() {
-    eprintln!("xl-loadhost is Windows-only (LoadLibraryW host for the compat harness)");
+    eprintln!("xl-loadhost is Windows-only (LoadLibraryExW host for the compat harness)");
     std::process::exit(2);
 }

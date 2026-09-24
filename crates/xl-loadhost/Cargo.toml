@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Test-only load host: LoadLibraryW a (packed) DLL, GetProcAddress exports, never call them"
+description = "Test-only load host: LoadLibraryExW(ALTERED_SEARCH) a (packed) DLL, GetProcAddress exports, never call them"
 publish = false
 
 # Companion to scripts/compat2/run_func.ps1 ("load" mode). NOT part of the
@@ -13,7 +13,7 @@ publish = false
 # loads and still resolves exports from an isolated, killable child process.
 #
 # Safety contract:
-#   - the only win32 calls are LoadLibraryW / GetProcAddress / FreeLibrary /
+#   - the only win32 calls are LoadLibraryExW / GetProcAddress / FreeLibrary /
 #     module enumeration; NO export is ever dereferenced or invoked
 #   - DllMain of the target runs implicitly as part of LoadLibraryW - that is
 #     exactly what "loads" is supposed to prove; the 60 s harness timeout and
