@@ -80,6 +80,16 @@ pub struct ImportSealed {
 /// loader directory makes sealing the envelope copy pointless.
 pub const FLAG_IMPORTS_SEALED: u32 = 0x2;
 
+/// Envelope flag: the on-disk import directory is retained (TLS/Fast/JNI
+/// bootstrap) and the OS loader fills the IAT before the stub runs. The
+/// injected runtime then SKIPS runtime import binding entirely: re-binding
+/// through a bare LoadLibraryA searches the host EXE's application
+/// directory first, so sibling DLLs shipped next to the packed module were
+/// invisible and the first such import failed the whole load
+/// (DllMain-false -> ERROR_DLL_INIT_FAILED) although the loader had
+/// already resolved the identical table correctly.
+pub const FLAG_LOADER_RESOLVED_IAT: u32 = 0x4;
+
 /// AAD for a sealed import record. Binds the ciphertext to its slot and the
 /// exact plaintext lengths so records cannot be swapped or respliced. The
 /// injected runtime mirrors this layout byte-for-byte. Lengths are passed
