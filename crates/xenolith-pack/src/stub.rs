@@ -270,6 +270,8 @@ fn emit_inner_g5(
     let mut l_veh_skip = a.create_label();
     let mut l_veh_name = a.create_label();
     let mut l_veh_remove_name = a.create_label();
+    let mut l_gmfn_name = a.create_label();
+    let mut l_llx_name = a.create_label();
     let mut l_quiesce_go = a.create_label();
 
     let g5_emit_code = g5.enabled && g5.fault_off != 0;
@@ -329,6 +331,8 @@ fn emit_inner_g5(
     a.mov(qword_ptr(rsp + 0x120), rax)?; // AddVectoredExceptionHandler (G5)
     a.mov(qword_ptr(rsp + 0xF0), rax)?; // G5 VEH handle
     a.mov(qword_ptr(rsp + 0xF8), rax)?; // G5 VEH remover
+    a.mov(qword_ptr(rsp + 0x128), rax)?; // GetModuleFileNameA (module-dir channel)
+    a.mov(qword_ptr(rsp + 0x130), rax)?; // LoadLibraryExA (altered-search loader)
     a.mov(dword_ptr(rsp + 0x1F8), r9d)?; // 1 = TLS callback, 0 = DllMain/EXE
     a.lea(rbx, ptr(meta))?;
 
@@ -556,6 +560,27 @@ fn emit_inner_g5(
         a.mov(qword_ptr(rsp + 0xF8), rax)?;
         a.set_label(&mut l_veh_skip)?;
     }
+    // Module-directory-first import resolution channel. A bare
+    // LoadLibraryA from the stub searches the HOST EXE's application
+    // directory first, so sibling DLLs shipped next to the packed module
+    // were invisible during the writeback binding and the load failed
+    // with ERROR_DLL_INIT_FAILED even though the original loaded fine in
+    // place. The core builds "<module dir>\<dep>" and binds through
+    // LoadLibraryExA(path, LOAD_WITH_ALTERED_SEARCH_PATH), mirroring how
+    // the OS loader resolves a module's dependencies. Both come through
+    // GetProcAddress so KERNELBASE forwarders are followed.
+    a.sub(rsp, 0x20i32)?;
+    a.mov(rcx, qword_ptr(rsp + 0x20 + 0x50))?; // kernel32 base
+    a.lea(rdx, ptr(l_gmfn_name))?;
+    a.call(qword_ptr(rsp + 0x20 + 0x38))?; // GetProcAddress("GetModuleFileNameA")
+    a.add(rsp, 0x20i32)?;
+    a.mov(qword_ptr(rsp + 0x128), rax)?;
+    a.sub(rsp, 0x20i32)?;
+    a.mov(rcx, qword_ptr(rsp + 0x20 + 0x50))?; // kernel32 base
+    a.lea(rdx, ptr(l_llx_name))?;
+    a.call(qword_ptr(rsp + 0x20 + 0x38))?; // GetProcAddress("LoadLibraryExA")
+    a.add(rsp, 0x20i32)?;
+    a.mov(qword_ptr(rsp + 0x130), rax)?;
     a.cmp(byte_ptr(rbx + 63i32), 1i32)?;
     a.je(l_core_call)?;
 
@@ -1257,6 +1282,10 @@ fn emit_inner_g5(
         a.mov(qword_ptr(rax + 88i32), rdx)?;
         a.mov(rdx, qword_ptr(rsp + 0xF8))?; // G5 VEH remover
         a.mov(qword_ptr(rax + 96i32), rdx)?;
+        a.mov(rdx, qword_ptr(rsp + 0x128))?; // GetModuleFileNameA
+        a.mov(qword_ptr(rax + 104i32), rdx)?;
+        a.mov(rdx, qword_ptr(rsp + 0x130))?; // LoadLibraryExA
+        a.mov(qword_ptr(rax + 112i32), rdx)?;
         a.lea(rcx, ptr(rsp + 0x200i32))?;
         a.sub(rsp, 0x20i32)?;
         a.lea(rax, ptr(l_core_bytes))?;
@@ -1327,13 +1356,6 @@ fn emit_inner_g5(
     a.jmp(l_forward)?;
 
     a.set_label(&mut l_fail)?;
-    // Fail closed, but observable. r11d carries the failing phase from the
-    // jump site (set with `mov`, which preserves the flags that selected the
-    // branch). IMAGE_FILE_DLL from the original header decides the exit
-    // contract: a DLL returns 0 — FALSE — because a nonzero DllMain return
-    // would tell the loader the boot succeeded (fail-open); an EXE exits with
-    // the phase code so "rc=0 with no output" names the failed stage. The
-    // code table lives in docs/SUPPORT.md.
     a.mov(eax, dword_ptr(r15 + 0x3C))?;
     a.movzx(eax, word_ptr(r15 + rax + 22))?;
     a.test(eax, 0x2000u32)?; // IMAGE_FILE_DLL
@@ -1537,6 +1559,10 @@ fn emit_inner_g5(
         a.set_label(&mut l_veh_remove_name)?;
         a.db(b"RemoveVectoredExceptionHandler\0")?;
     }
+    a.set_label(&mut l_gmfn_name)?;
+    a.db(b"GetModuleFileNameA ")?;
+    a.set_label(&mut l_llx_name)?;
+    a.db(b"LoadLibraryExA ")?;
     a.set_label(&mut wrap_dom)?;
     a.db(&WRAP_DOMAIN)?;
     a.set_label(&mut mac_dom)?;
@@ -1695,7 +1721,10 @@ fn emit_elf_inner(
     a.je(l_forward)?;
 
     // Build XlHostCtx at rsp+0x20 (below it: 0x20 shadow for Win64 callees).
-    a.sub(rsp, 0x80i32)?;
+    // 0xB0 covers the full 120-byte ctx (0x20 + 0x78) with slack: the old
+    // 0x80 reservation left the struct tail overlapping the saved-register
+    // slots, and zeroing ctx fields past +0x60 would clobber them on return.
+    a.sub(rsp, 0xB0i32)?;
     a.mov(qword_ptr(rsp + 0x20 + CTX_IMAGE_BASE), r15)?;
     a.mov(eax, dword_ptr(rbx + META_PAYLOAD_RVA as i32))?;
     a.lea(rax, ptr(r15 + rax))?;
@@ -1722,6 +1751,11 @@ fn emit_elf_inner(
         a.lea(rax, ptr(l_vp))?;
     }
     a.mov(qword_ptr(rsp + 0x20 + CTX_VPROTECT), rax)?;
+    // No module-dir channel on the ELF path (load_library/get_proc stay
+    // null and the core skips import binding); zero the slots so the core
+    // never sees a stale stack value as a function pointer.
+    a.mov(qword_ptr(rsp + 0x20 + 104i32), 0)?;
+    a.mov(qword_ptr(rsp + 0x20 + 112i32), 0)?;
 
     // xl_core_activate(ctx) — the argument register follows the HOST
     // compiler of the core object: Win64 RCX (MSVC COFF) or SysV RDI
@@ -1734,7 +1768,7 @@ fn emit_elf_inner(
     a.lea(rax, ptr(l_core_bytes))?;
     a.add(rax, core_entry as i32)?;
     a.call(rax)?;
-    a.add(rsp, 0x80i32)?;
+    a.add(rsp, 0xB0i32)?;
     a.test(eax, eax)?;
     a.jz(l_fail)?;
 
