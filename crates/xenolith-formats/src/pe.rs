@@ -9,6 +9,10 @@ pub const IMAGE_NT_OPTIONAL_HDR64_MAGIC: u16 = 0x20b;
 pub const IMAGE_DIRECTORY_ENTRY_EXPORT: usize = 0;
 pub const IMAGE_DIRECTORY_ENTRY_IMPORT: usize = 1;
 pub const IMAGE_DIRECTORY_ENTRY_BASERELOC: usize = 5;
+/// The security (Authenticode certificate) directory. Unlike every other
+/// directory its VA field is an absolute FILE OFFSET, so it does not survive
+/// any byte-level repack (the signature covered the original bytes).
+pub const IMAGE_DIRECTORY_ENTRY_SECURITY: usize = 4;
 pub const IMAGE_DIRECTORY_ENTRY_DEBUG: usize = 6;
 pub const IMAGE_DIRECTORY_ENTRY_TLS: usize = 9;
 pub const IMAGE_DIRECTORY_ENTRY_EXCEPTION: usize = 3;

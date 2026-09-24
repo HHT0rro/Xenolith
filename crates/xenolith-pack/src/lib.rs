@@ -26,7 +26,7 @@ use xenolith_formats::{
     align_up, classify, write_u64, FormatError, ImageKind, LoadConfigCfg, Pe64, Section,
     IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR,
     IMAGE_DIRECTORY_ENTRY_DEBUG, IMAGE_DIRECTORY_ENTRY_EXCEPTION,
-    IMAGE_DIRECTORY_ENTRY_IMPORT,
+    IMAGE_DIRECTORY_ENTRY_IMPORT, IMAGE_DIRECTORY_ENTRY_SECURITY,
     IMAGE_DIRECTORY_ENTRY_TLS, IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE,
     IMAGE_DLLCHARACTERISTICS_GUARD_CF, IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA,
     IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT, IMAGE_GUARD_XFG_ENABLED,
@@ -304,16 +304,110 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
         ));
     }
 
+    // Entry-less images (AddressOfEntryPoint == 0). Two shapes exist:
+    //
+    // 1. Resource-only DLLs (e.g. MSORES-class): no entry, no executable
+    //    section, no exports. The loader never calls anything, so there is
+    //    nothing to seal and nothing that could ever run the stub. These
+    //    pack structurally (envelope with 0 regions, entry stays 0) and a
+    //    vacuous GUARD_CF DllCharacteristics bit — set by blanket build
+    //    flags while the image ships no load-config/GFIDS and contains no
+    //    code — is cleared: nothing CFG-shaped can be enforced for code
+    //    that does not exist, and the OS itself loads this exact shape.
+    // 2. Entry-less images that DO carry executable code or exports: the
+    //    stub would never be invoked (nothing calls an entry that does not
+    //    exist), sealed pages could never decrypt, and repointed exports
+    //    would never initialize. Fail closed with the construction named.
+    let no_exec_sections = pe
+        .sections
+        .iter()
+        .all(|s| s.characteristics & IMAGE_SCN_MEM_EXECUTE == 0);
+    if pe.entry_rva == 0 && !no_exec_sections {
+        return Err(PackError::Invalid(
+            "entry-less image (AddressOfEntryPoint == 0) still carries executable sections: \
+             nothing would ever invoke the packed stub, so sealed pages could never decrypt — \
+             this shape is refused instead of silently broken",
+        ));
+    }
+    let entryless_exports = if pe.entry_rva == 0 {
+        let exports = pe.exports(request.input)?;
+        if !exports.is_empty() {
+            return Err(PackError::Invalid(
+                "entry-less image (AddressOfEntryPoint == 0) has exports: the stub cannot \
+                 initialize without an entry, so repointed exports would never resolve — \
+                 this shape is refused instead of silently broken",
+            ));
+        }
+        true
+    } else {
+        false
+    };
+    let entryless = pe.entry_rva == 0 && entryless_exports;
+
     // CFG: the loader invokes a GUARD_CF image's entry (and later any
     // export-repointed stub thunk) through the GuardCF indirect-call check.
     // Those RVAs must be in the on-disk GFIDS table or the process fast-fails
     // (0xC0000409) at load — before a single unpacked byte executes. Parse the
     // load-config now so every fail-closed case names the construction; the
     // table itself is rewritten after the stub/payload RVAs are known.
-    let cfg_plan = plan_cfg_rewrite(&pe, request.input)?;
+    // Entry-less images skip CFG work entirely: their entry is never invoked,
+    // so no GuardCF check can fire, and the vacuous GUARD_CF bit is cleared
+    // below (an entry-less image with a real GFIDS-carrying load config is
+    // still cleared: the table protects code that does not exist).
+    let cfg_plan = if entryless {
+        None
+    } else {
+        plan_cfg_rewrite(&pe, request.input)?
+    };
     let mut working = request.input.to_vec();
     pe.zero_directory(&mut working, IMAGE_DIRECTORY_ENTRY_DEBUG)?;
+    // Stale Authenticode, uniformly on every PE repack path. Any repack
+    // invalidates the signature (sealed pages, rewritten headers, appended
+    // stub/payload all change the digest it covers), and unlike every other
+    // directory the SECURITY VA is an absolute FILE OFFSET — after the
+    // header-slack shift it points at moved bytes. A nonzero entry would
+    // make loaders/verifiers treat the packed output as signed-and-invalid.
+    // This covers fast/standard/max, entryless, and the header-slack
+    // re-entry (which zeroes it again after shifting raw data), so no
+    // packed image ever claims to be signed.
+    pe.zero_directory(&mut working, IMAGE_DIRECTORY_ENTRY_SECURITY)?;
+    if entryless && pe.dll_characteristics & IMAGE_DLLCHARACTERISTICS_GUARD_CF != 0 {
+        pe.set_dll_characteristics(
+            &mut working,
+            pe.dll_characteristics & !IMAGE_DLLCHARACTERISTICS_GUARD_CF,
+        )?;
+    }
     let tls_first = pe.tls_first_callback(request.input)?;
+    // Entry-less + TLS CALLBACKS: fail closed (review: the combination was
+    // previously undefined — the generic TLS-wrap path below would have
+    // repointed the first callback slot at the stub trampoline).
+    //
+    // Why refuse instead of support: the loader invokes TLS callbacks before
+    // any entry, but an entry-less pack seals 0 pages and keeps
+    // AddressOfEntryPoint == 0 — there is no boot path that could ever run
+    // the packed stub, so the trampoline would bootstrap outside every
+    // invariant it was built for and then chain into the ORIGINAL callback,
+    // which by the no-executable-sections check above lives in non-executable
+    // memory: a guaranteed fault under the loader lock. Leaving the callback
+    // untouched is no better — unanalyzed code would run from an image whose
+    // packer assumed nothing ever executes. Real resource-only DLLs never
+    // carry this shape: a genuine TLS callback body needs an executable
+    // section, which the check above already refuses. What remains is
+    // hand-built or corrupt input — refuse it by name.
+    if entryless && tls_first.is_some() {
+        return Err(PackError::Invalid(
+            "entry-less image (AddressOfEntryPoint == 0) carries TLS callbacks: the loader \
+             invokes TLS callbacks before any entry, and with no entry the packed stub can \
+             never bootstrap, so the callback would either fault in non-executable memory \
+             or run unvirtualized — this shape is refused instead of silently broken; \
+             give the image an entry point or drop the TLS callbacks",
+        ));
+    }
+    // Entry-less + TLS directory WITHOUT callbacks: fully defined and
+    // supported. The directory is pure data — the loader allocates the TLS
+    // block from StartAddressOfRawData/SizeOfZeroFill and never calls
+    // anything — and entry-less packs seal no pages, so the directory and
+    // its callback list survive byte-identical in the output.
     // TLS callbacks run before the packed entry. Keep the directory and wrap
     // the first callback so CRT TLS sees decrypted pages. LoadLibraryA is
     // unsafe under the loader lock, so those images also keep the disk IAT.
@@ -344,14 +438,21 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
     // system loader applies ASLR. Relocs that land in protected pages are
     // re-applied by xl_core after AEAD open.
 
-    let stolen = steal_entry_bytes(&working, &pe)
-        .map_err(|e| PackError::Stub(format!("entry stolen-bytes read failed: {e}")))?;
-    let entry_off = pe.file_offset_of(pe.entry_rva).map_err(|_| {
-        PackError::Stub(format!(
-            "entry rva {:#x} does not map to file data; cannot plant stolen-byte traps",
-            pe.entry_rva
-        ))
-    })?;
+    // Entry-less images have no entry bytes to steal and no entry site to
+    // trap; RVA 0 maps onto the DOS header and must never be touched.
+    let (stolen, entry_off) = if entryless {
+        (Vec::new(), 0usize)
+    } else {
+        let stolen = steal_entry_bytes(&working, &pe)
+            .map_err(|e| PackError::Stub(format!("entry stolen-bytes read failed: {e}")))?;
+        let entry_off = pe.file_offset_of(pe.entry_rva).map_err(|_| {
+            PackError::Stub(format!(
+                "entry rva {:#x} does not map to file data; cannot plant stolen-byte traps",
+                pe.entry_rva
+            ))
+        })?;
+        (stolen, entry_off as usize)
+    };
     for i in 0..stolen.len().min(STOLEN_BYTES) {
         if entry_off + i < working.len() {
             working[entry_off + i] = 0xCC; // trap if executed without stub
@@ -678,7 +779,13 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
         }
     }
 
-    let mut keep: Vec<u32> = vec![pe.entry_rva & !0xfff];
+    // Entry-less images seal zero pages, so the keep set starts empty (an
+    // entry RVA of 0 would otherwise record page 0 for nothing).
+    let mut keep: Vec<u32> = if entryless {
+        Vec::new()
+    } else {
+        vec![pe.entry_rva & !0xfff]
+    };
     for exp in &exports {
         let page = exp.rva & !0xfff;
         if !keep.contains(&page) {
@@ -1003,7 +1110,12 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
     pe.write_section_header(&mut image, pe.number_of_sections as usize, &stub_section)?;
     pe.write_section_header(&mut image, pe.number_of_sections as usize + 1, &payload_section)?;
     let entry_rva = stub_section.virtual_address + pic.entry_off;
-    pe.set_entry_rva(&mut image, entry_rva)?;
+    // Entry-less images keep AddressOfEntryPoint == 0: the loader never
+    // calls it, and pointing it at the stub would make it run and then
+    // transfer to the nonexistent original entry.
+    if !entryless {
+        pe.set_entry_rva(&mut image, entry_rva)?;
+    }
     pe.set_size_of_image(&mut image, payload_section.virtual_address + payload_virt)?;
 
     image.resize((payload_section.raw_ptr + payload_section.raw_size) as usize, 0);
@@ -1160,15 +1272,31 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
         constants_protectable: const_plan.protectable,
         constants_encrypted: const_plan.encrypted,
         constants_native_referenced: const_plan.native_referenced,
-        notes: vec![
-            "backend=pic-stub+xl-core (PIC boot + freestanding EnvelopeV2 core)".into(),
-            "xenolith-loader is a host emulator, not injected".into(),
-            "rustc xenolith-runtime cdylib is not injected (imports/CRT)".into(),
-            "EnvelopeV2 ChaCha20-Poly1305; legacy NSEN/XOR is not decoded".into(),
-            "ASLR/relocs preserved; TLS directory kept and first callback wrapped; delay-load imports fail closed".into(),
-            "Pages copied RW then RX; no long-term RWX section".into(),
-            "C2 page re-encrypt is not jumped to; executing pages stay plaintext after unpack".into(),
-        ],
+        notes: {
+            let mut notes = vec![
+                "backend=pic-stub+xl-core (PIC boot + freestanding EnvelopeV2 core)".into(),
+                "xenolith-loader is a host emulator, not injected".into(),
+                "rustc xenolith-runtime cdylib is not injected (imports/CRT)".into(),
+                "EnvelopeV2 ChaCha20-Poly1305; legacy NSEN/XOR is not decoded".into(),
+                "ASLR/relocs preserved; TLS directory kept and first callback wrapped; delay-load imports fail closed".into(),
+                "Sealed pages decrypt through a transient RW window, then return to the \
+                 section's original loader protection (RX stays RX; an input section that \
+                 is legitimately RWX keeps RWX — such images are reported as \
+                 long_term_rwx, matching what the unpacked process actually runs)"
+                    .into(),
+                "C2 page re-encrypt is not jumped to; executing pages stay plaintext after unpack".into(),
+            ];
+            if entryless {
+                notes.push(
+                    "entry-less image (AddressOfEntryPoint=0, no executable sections, no \
+                     exports): structural pack — 0 pages sealed, entry stays 0, and a \
+                     vacuous GUARD_CF DllCharacteristics bit was cleared (the image ships \
+                     no load-config/GFIDS and no code to enforce it on)"
+                        .into(),
+                );
+            }
+            notes
+        },
     };
 
     Ok(PackOutput {
