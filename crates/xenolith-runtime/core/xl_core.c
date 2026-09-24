@@ -35,6 +35,8 @@ XL_NOINLINE void *memset(void *dst, int value, uint64_t n) {
 #define XL_PAGE_RWX 0x40u
 #endif
 
+
+
 typedef void *(*xl_load_fn)(const char *);
 typedef void *(*xl_gpa_fn)(void *, const char *);
 typedef int (*xl_vp_fn)(void *, uint64_t, uint32_t, uint32_t *);
@@ -70,6 +72,10 @@ static uint32_t rd32(const uint8_t *p) {
 
 static uint16_t rd16(const uint8_t *p) {
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint64_t rd64(const uint8_t *p) {
+    return (uint64_t)rd32(p) | ((uint64_t)rd32(p + 4) << 32);
 }
 
 static uint32_t rotl32(uint32_t x, int n) {
@@ -363,12 +369,82 @@ static int vp(XlHostCtx *ctx, void *addr, uint64_t size, uint32_t neu, uint32_t 
     return ctx->vprotect(addr, size, neu, old) != 0;
 }
 
+/* Final protection for a decrypted region, derived from the image's own
+ * headers — NOT from the `old` value reported by vp().
+ *
+ * Why not `old`: (1) on Windows, a region woken from our own sealed state
+ * reports PAGE_NOACCESS, and restoring that re-seals the page into an
+ * infinite fault loop; (2) the ELF mprotect shim cannot know the previous
+ * protection and echoes the REQUESTED constant back through *old, so an
+ * RW-window open followed by restore-old would leave text non-executable.
+ * Deriving from the section table is faithful on both hosts and preserves
+ * legitimately writable-executable sections (MinGW/Cygwin RWX .text,
+ * self-patching code): forcing RX there crashes the unpacked image on its
+ * first self-write. Ordinary RX .text still ends as RX. Only sealed regions
+ * (always executable sections) pass through here, so the result is always
+ * XL_PAGE_RX or XL_PAGE_RWX on well-formed inputs; RX is the fallback. */
+static uint32_t xl_final_protect(XlHostCtx *ctx, uint32_t rva) {
+    const uint8_t *b = ctx->image_base;
+    uint32_t i;
+    if (b[0] == 'M' && b[1] == 'Z') {
+        uint32_t lf = rd32(b + 0x3C);
+        uint32_t nsec, span;
+        const uint8_t *tbl, *s;
+        uint32_t vs, va, rs, ch;
+        if (lf < 0x40 || lf + 24 > 0x40000) return XL_PAGE_RX;
+        if (b[lf] != 'P' || b[lf + 1] != 'E') return XL_PAGE_RX;
+        nsec = rd16(b + lf + 6);
+        tbl = b + lf + 24 + rd16(b + lf + 20);
+        if (nsec > 96) nsec = 96;
+        for (i = 0; i < nsec; i++) {
+            s = tbl + i * 40;
+            vs = rd32(s + 8); va = rd32(s + 12); rs = rd32(s + 16); ch = rd32(s + 36);
+            span = vs > rs ? vs : rs;
+            if (rva >= va && rva - va < span) {
+                if ((ch & 0x20000000u) && (ch & 0x80000000u)) return XL_PAGE_RWX;
+                if (ch & 0x20000000u) return XL_PAGE_RX;
+                if (ch & 0x80000000u) return XL_PAGE_RW;
+                return 0x02u; /* PAGE_READONLY */
+            }
+        }
+        return XL_PAGE_RX;
+    }
+    if (b[0] == 0x7f && b[1] == 'E' && b[2] == 'L' && b[3] == 'F') {
+        uint64_t phoff = rd64(b + 0x20);
+        uint16_t phentsize = rd16(b + 0x36), phnum = rd16(b + 0x38);
+        const uint8_t *ph;
+        if (phentsize < 56 || phnum > 64) return XL_PAGE_RX;
+        if (phoff == 0 || phoff + (uint64_t)phnum * phentsize > 0x40000) return XL_PAGE_RX;
+        for (i = 0; i < phnum; i++) {
+            ph = b + phoff + (uint64_t)i * phentsize;
+            if (rd32(ph) != 1) continue; /* PT_LOAD */
+            {
+                uint64_t vaddr = rd64(ph + 0x10), memsz = rd64(ph + 0x28);
+                uint32_t fl = rd32(ph + 4);
+                if ((uint64_t)rva >= vaddr && (uint64_t)rva - vaddr < memsz) {
+                    if ((fl & 0x1u) && (fl & 0x2u)) return XL_PAGE_RWX; /* PF_X|PF_W */
+                    if (fl & 0x1u) return XL_PAGE_RX;
+                    if (fl & 0x2u) return XL_PAGE_RW;
+                    return 0x02u;
+                }
+            }
+        }
+        return XL_PAGE_RX;
+    }
+    return XL_PAGE_RX;
+}
+
+
 static int copy_rx(XlHostCtx *ctx, uint8_t *dst, const uint8_t *src, uint32_t n, uint32_t final_prot) {
     uint32_t old = 0;
+    uint32_t rva = (uint32_t)(dst - ctx->image_base);
     if (n == 0) return 1;
     if (!vp(ctx, dst, n, XL_PAGE_RW, &old)) return 0;
     xl_copy(dst, src, n);
-    if (!vp(ctx, dst, n, final_prot, &old)) return 0;
+    /* `final_prot` is only the fallback when the rva does not resolve to a
+     * section/segment; otherwise the destination returns to the protection
+     * its own header declares (see xl_final_protect). */
+    if (!vp(ctx, dst, n, rva ? xl_final_protect(ctx, rva) : final_prot, &old)) return 0;
     return 1;
 }
 
@@ -732,7 +808,7 @@ static int xl_region_open(XlHostCtx *ctx, XlRegionTable *rt, uint32_t i) {
     region_aad(aad, platform, profile, flags, index, rva, len, policy, rt->reloc_bytes);
     if (!vp(ctx, dst, len, XL_PAGE_RW, &old)) return 0;
     if (!aead_open(rt->runtime, nonce, aad, 32, ct, ct_len, tag, dst)) return 0;
-    if (!vp(ctx, dst, len, XL_PAGE_RX, &old)) return 0;
+    if (!vp(ctx, dst, len, xl_final_protect(ctx, rva), &old)) return 0;
     rt->st[i].state = XL_REGION_LIVE;
     return 1;
 }
@@ -759,10 +835,10 @@ static int xl_region_seal(XlHostCtx *ctx, XlRegionTable *rt, uint32_t i) {
     if (!vp(ctx, page, len, XL_PAGE_RW, &old)) return 0;
     aead_seal(rt->runtime, nonce, aad, 32, page, len, ct, tag);
     for (k = 0; k < len; k++) {
-        if (ct[k] != orig_ct[k]) { vp(ctx, page, len, XL_PAGE_RX, &old); return 0; }
+        if (ct[k] != orig_ct[k]) { vp(ctx, page, len, xl_final_protect(ctx, rva), &old); return 0; }
     }
     for (k = 0; k < 16; k++) {
-        if (tag[k] != orig_tag[k]) { vp(ctx, page, len, XL_PAGE_RX, &old); return 0; }
+        if (tag[k] != orig_tag[k]) { vp(ctx, page, len, xl_final_protect(ctx, rva), &old); return 0; }
     }
     for (k = 0; k < len; k++) page[k] = ct[k];
     if (!vp(ctx, page, len, 0x01u, &old)) return 0; /* PAGE_NOACCESS */
@@ -973,7 +1049,11 @@ int xl_core_activate(XlHostCtx *ctx) {
                 uint32_t old = 0;
                 if (!vp(ctx, dst, len, XL_PAGE_RW, &old)) return 0;
                 if (!aead_open(runtime, nonce, aad, 32, ct, ct_len, tag, dst)) return 0;
-                if (!vp(ctx, dst, len, XL_PAGE_RX, &old)) return 0;
+                /* xl_final_protect: restore what the region's own section/
+                 * segment declares (RX normally; RWX sections stay writable),
+                 * never the vp-reported `old` (sealed NOACCESS on wake, or the
+                 * echoed request constant on the ELF mprotect shim). */
+                if (!vp(ctx, dst, len, xl_final_protect(ctx, rva), &old)) return 0;
             }
         }
     } else {

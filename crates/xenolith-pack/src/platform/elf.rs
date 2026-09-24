@@ -496,7 +496,8 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
                 tls_census.0, tls_census.1, resolvers.len(), resolver_pages.len(), verneed, verdef
             ),
                 "fail-closed: TPOFF32-in-text, static linkage, RELATIVE into sealed page".into(),
-            "pages copied RW then RX via raw mprotect; no long-term RWX".into(),
+            "pages decrypt through a transient RW window, then return to the protection \n             their PT_LOAD declares (R+X normally; a W+X segment stays W+X via \n             raw mprotect)"
+                .into(),
             format!("payload section name: {:02x?}", section_name_from_seed(&opcode_seed, 0)),
         ],
     };
