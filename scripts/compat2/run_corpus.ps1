@@ -20,7 +20,17 @@
 
     Output: <ResultsDir>\summary.json = { "total": n, "passed": n, "results": [ ... ] }
     (ConvertTo-Json -Depth 6). run_one.ps1 also drops <ResultsDir>\<sample>.json per
-    sample and keeps packed artifacts under <ResultsDir>\packed\ for inspection.
+    sample and keeps packed artifacts under <ResultsDir>\packed\, keyed by the FULL
+    input file name with extension: <full-name>.xl.exe (IDA_ida.dll packs to
+    IDA_ida.dll.xl.exe) - extension included, so basename peers never collide.
+
+    Consistency self-checks (exit 2 - an orchestration error is never reported as
+    per-sample failures):
+      - duplicate artifact keys in the manifest (two entries with the same file
+        name) are rejected before anything runs;
+      - after the run, the packed\ directory must hold exactly one <full-name>.xl.exe
+        per entry whose tool invocation reached exit code 0, and every entry the
+        tool reported success for must have its key present on disk.
 
     Samples and packed artifacts are never executed; samples are never modified.
 
@@ -36,7 +46,9 @@
 
 .EXITCODES
     0 every sample passed | 1 at least one sample failed/crashed/timed out |
-    2 harness-level error (manifest or tool missing/unreadable, no samples listed)
+    2 harness-level error (manifest or tool missing/unreadable, no samples listed,
+    duplicate manifest names, packed\ missing/empty or artifact count inconsistent
+    with the run's outcomes)
 #>
 [CmdletBinding()]
 param(
@@ -204,6 +216,31 @@ if ($entries.Count -eq 0) {
     exit 2
 }
 
+# --- duplicate artifact-key pre-flight ------------------------------------------------
+function Get-SafeFileName {
+    param([string]$Value)
+    try { return [System.IO.Path]::GetFileName($Value) } catch { return $Value }
+}
+# The phase-1 artifact key is the input file name WITH extension + '.xl.exe', so two
+# manifest entries resolving to the same file name would map to one artifact and
+# silently overwrite each other (one phantom pass + one misattributed fail). Reject
+# before anything runs. 'Bad' entries (unresolvable paths) still participate by
+# their literal text so a dup among them cannot sneak through either.
+$keySeen = @{}
+$keyDupes = @()
+foreach ($e in $entries) {
+    $k = if ($e.Abs) { [System.IO.Path]::GetFileName($e.Abs) } else { Get-SafeFileName $e.Line }
+    if ($keySeen.ContainsKey($k)) {
+        if ($keyDupes -notcontains $k) { $keyDupes += $k }
+    } else {
+        $keySeen[$k] = $true
+    }
+}
+if ($keyDupes.Count -gt 0) {
+    Write-Diag ("manifest contains duplicate artifact keys (file names): " + ($keyDupes -join ', '))
+    exit 2
+}
+
 # --- dispatch: RunspacePool, max 4 concurrent samples ---------------------------
 $jobScript = @'
 param($RunOnePath, $InAbs, $OutDirAbs, $ToolAbs, $Label)
@@ -214,11 +251,6 @@ try {
     return ,@("RUNONE_EXCEPTION: $($_.Exception.Message)")
 }
 '@
-
-function Get-SafeFileName {
-    param([string]$Value)
-    try { return [System.IO.Path]::GetFileName($Value) } catch { return $Value }
-}
 
 $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, 4)
 $pool.Open()
@@ -312,4 +344,42 @@ try {
 }
 
 Write-Host ("corpus done: {0}/{1} passed; summary: {2}" -f $passed, $results.Count, $summaryPath)
+
+# --- artifact consistency self-check (fail-fast; exit 2) --------------------------------
+# run_one.ps1 writes exactly one artifact per invocation whose tool process reached
+# exit code 0 (artifacts survive a later validation failure on purpose - evidence).
+# After the run, packed\ must hold exactly that many <full-name>.xl.exe files, and
+# every tool-successful entry's key must exist. Any mismatch is an orchestration
+# defect (overwritten keys, purged dir, tool writing elsewhere) and MUST NOT be
+# reported as per-sample failures - the phase-2 lesson.
+$packedDirFinal = Join-Path $resultsDirAbs 'packed'
+$actualArtifacts = @()
+if (Test-Path -LiteralPath $packedDirFinal -PathType Container) {
+    $actualArtifacts = @(Get-ChildItem -LiteralPath $packedDirFinal -File -Filter '*.xl.exe' -ErrorAction SilentlyContinue)
+} else {
+    Write-Diag "packed artifact directory missing after run: $packedDirFinal"
+    exit 2
+}
+# NOTE: an EMPTY packed\ with zero tool-successful samples is a legitimate all-fail
+# product run (exit 1 from the per-sample results), not an orchestration error;
+# the count check below still catches the dangerous case (expected > 0, found 0).
+$expectedCount = 0
+$missingKeys = @()
+for ($i = 0; $i -lt $entries.Count; $i++) {
+    if ("$($results[$i].toolExitCode)" -eq '0' -and $entries[$i].Abs) {
+        $expectedCount++
+        $key = [System.IO.Path]::GetFileName($entries[$i].Abs) + '.xl.exe'
+        $kpath = Join-Path $packedDirFinal $key
+        if (-not (Test-Path -LiteralPath $kpath -PathType Leaf)) { $missingKeys += $key }
+    }
+}
+if ($missingKeys.Count -gt 0) {
+    Write-Diag ("tool reported success but artifact keys are missing: " + (($missingKeys | Select-Object -First 5) -join ', '))
+    exit 2
+}
+if ($actualArtifacts.Count -ne $expectedCount) {
+    Write-Diag ("artifact count mismatch: packed\ holds {0} *.xl.exe for {1} tool-successful samples" -f $actualArtifacts.Count, $expectedCount)
+    exit 2
+}
+
 if ($passed -eq $results.Count) { exit 0 } else { exit 1 }

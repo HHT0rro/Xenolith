@@ -25,7 +25,11 @@
 
 .PARAMETER OutDir
     Result directory. Per-sample JSON is written to <OutDir>\<sample-file-name>.json.
-    The packed artifact is kept for inspection at <OutDir>\packed\<name>.xl.exe.
+    The packed artifact is kept for inspection at <OutDir>\packed\<full-name>.xl.exe
+    where <full-name> is the input file name WITH its extension (IDA_ida.dll packs to
+    IDA_ida.dll.xl.exe, IDA_ida.exe to IDA_ida.exe.xl.exe) - the extension is part of
+    the artifact key so basename peers (foo.dll / foo.exe) can never overwrite each
+    other. run_func.ps1 / run_corpus.ps1 locate artifacts by this exact convention.
 
 .PARAMETER ToolPath
     Path to xenolith.exe.
@@ -96,19 +100,34 @@ function Test-PackedImage {
     param([string]$Path)
 
     $bad = New-Object System.Collections.Generic.List[string]
+    # The tool wrote this file moments ago; a freshly created file can be briefly
+    # unresolvable/incomplete through filter drivers under concurrent I/O (same
+    # transient class the functional harness measured: staged copy loaded the
+    # instant the copy returned -> false 1114/126; settled -> clean). Bounded
+    # retry around stat+read fixes the measurement window only - a persistently
+    # missing/tiny/unreadable output still fails exactly as strictly as before.
+    $bytes = $null
+    $len = 0
+    $lastErr = ''
+    for ($ri = 0; $ri -lt 4 -and $null -eq $bytes; $ri++) {
+        try {
+            if (Test-Path -LiteralPath $Path -PathType Leaf) {
+                $len = (Get-Item -LiteralPath $Path).Length
+                if ($len -ge 0x100) { $bytes = [System.IO.File]::ReadAllBytes($Path) }
+            }
+        } catch { $lastErr = $_.Exception.Message }
+        if ($null -eq $bytes) { Start-Sleep -Milliseconds 250 }
+    }
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         $bad.Add("output file missing: $Path")
         return ,$bad.ToArray()
     }
-    $len = (Get-Item -LiteralPath $Path).Length
     if ($len -lt 0x100) {
         $bad.Add("output file too small ($len bytes)")
         return ,$bad.ToArray()
     }
-    try {
-        $bytes = [System.IO.File]::ReadAllBytes($Path)
-    } catch {
-        $bad.Add("output file unreadable: $($_.Exception.Message)")
+    if ($null -eq $bytes) {
+        $bad.Add("output file unreadable: $lastErr")
         return ,$bad.ToArray()
     }
     $n = $bytes.Length
@@ -318,7 +337,11 @@ if (-not $inAbs) {
     if (-not (Test-Path -LiteralPath $packedDir -PathType Container)) {
         $null = New-Item -ItemType Directory -Path $packedDir -Force
     }
-    $packedPath = Join-Path $packedDir ([System.IO.Path]::GetFileNameWithoutExtension($name) + '.xl.exe')
+    # Artifact key = input file name WITH extension + '.xl.exe'. The extension is
+    # part of the key: basename peers (IDA_ida.dll vs IDA_ida.exe) map to distinct
+    # artifacts instead of overwriting each other into one phantom pass + one
+    # misattributed fail (phase-2 review finding, severity medium).
+    $packedPath = Join-Path $packedDir ($name + '.xl.exe')
     if (Test-Path -LiteralPath $packedPath) { Remove-Item -LiteralPath $packedPath -Force }   # no stale-pass
 
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
