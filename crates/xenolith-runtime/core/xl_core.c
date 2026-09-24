@@ -40,6 +40,9 @@ XL_NOINLINE void *memset(void *dst, int value, uint64_t n) {
 typedef void *(*xl_load_fn)(const char *);
 typedef void *(*xl_gpa_fn)(void *, const char *);
 typedef int (*xl_vp_fn)(void *, uint64_t, uint32_t, uint32_t *);
+/* Module-directory-first dependency resolution (see xl_resolve_moddir). */
+typedef uint32_t (*xl_gmfn_fn)(void *, char *, uint32_t);      /* GetModuleFileNameA */
+typedef void *(*xl_llx_fn)(const char *, void *, uint32_t);    /* LoadLibraryExA(name, hFile, flags) */
 
 typedef struct XlHostCtx {
     uint8_t *image_base;
@@ -54,6 +57,8 @@ typedef struct XlHostCtx {
     xl_vp_fn vprotect;
     void *veh_handle;   /* G5: AddVectoredExceptionHandler registration */
     void *(*veh_remove)(void *); /* G5: RemoveVectoredExceptionHandler */
+    xl_gmfn_fn get_module_file; /* module-path channel, NULL when unresolved */
+    xl_llx_fn load_library_ex;  /* altered-search loader, NULL when unresolved */
 } XlHostCtx;
 
 static void xl_copy(uint8_t *d, const uint8_t *s, uint32_t n) {
@@ -688,9 +693,44 @@ __attribute__((section(".xlg"), used))
 /* Nonzero pad forces an INITIALIZED section: a zero initializer would land
  * in .bss, whose bytes the injected image cannot carry. */
 static XlGState g_xl = { {0}, 0u, 0x4E35u, 0u, {0}, {0} };
+
+/* Module-directory-first import resolution.
+ *
+ * The OS loader resolves a module's DEPENDENCIES starting from that
+ * module's own directory (and LoadLibraryExW(...,
+ * LOAD_WITH_ALTERED_SEARCH_PATH) pins the same start directory for the
+ * loaded file). The stub's bare LoadLibraryA instead searches the HOST
+ * EXE's application directory first, so sibling DLLs that ship next to
+ * the packed module were invisible during the writeback binding and the
+ * FIRST such import failed the whole load (DllMain-false -> loader exit
+ * ERROR_DLL_INIT_FAILED) even though the original loaded fine in place
+ * (observed: libclang-cpp.dll + libLLVM-19/libstdc++-6/... siblings).
+ * Resolve "<module dir>\<dep>" through LoadLibraryExA with the altered
+ * search flag to mirror the loader; the bare-name call stays as the
+ * fallback for when the channel is unavailable. State machine in
+ * g_xl_moddir[0]: 2 = not resolved yet, 0 = failed, else first char of
+ * the directory (with trailing separator, NUL-terminated). Touched only
+ * under the loader lock during DLL_PROCESS_ATTACH. */
+/* Resolve the packed module's own directory into `buf` (stack): returns
+ * the directory length INCLUDING the trailing separator, 0 when the
+ * channel is unavailable or the path does not fit. Stack-only by design:
+ * the .xlg state page is not writable until the G5 publish, which runs
+ * AFTER import binding. */
+static uint32_t xl_module_dir(XlHostCtx *ctx, char *buf, uint32_t cap) {
+    uint32_t n, i;
+    if (!ctx || !ctx->get_module_file || cap < 8) return 0;
+    n = ctx->get_module_file(ctx->image_base, buf, cap - 1);
+    if (n == 0 || n >= cap - 1) return 0;
+    i = n;
+    while (i > 0 && buf[i - 1] != 0x5C /* backslash */ && buf[i - 1] != '/') i--;
+    if (i == 0) return 0;
+    buf[i] = 0;
+    return i;
+}
 #if defined(_MSC_VER)
 #pragma data_seg()
 #endif
+
 
 /* Offset of the envelope policy u32 (after stolen+program). */
 static uint32_t xl_policy_off(const uint8_t *env) {
@@ -876,6 +916,7 @@ int xl_core_fault(void *exc) {
     fault_addr = (nparams >= 2) ? *(const uint64_t *)(rec + 0x28) : exec_addr;
     if (!xl_build_region_table(&g_xl.ctx, &rt)) { g_xl.dbg[2] = 3; return 0; }
     if (!xl_state_overlay(&g_xl, &rt)) { g_xl.dbg[2] = 4; return 0; }
+    (void)0;
     base = (uint64_t)(uintptr_t)g_xl.ctx.image_base;
     g_xl.dbg[3] = (uint32_t)(fault_addr - base);
     for (i = 0; i < rt.count; i++) {
@@ -1011,8 +1052,7 @@ int xl_core_activate(XlHostCtx *ctx) {
     policy = rd32(env + cur); cur += 4;
     (void)platform;
     (void)flags;
-
-    if (!reconstruct_mba(mba, secret)) return 0;
+    if (!reconstruct_mba(mba, secret)) { return 0; }
     mix_key(secret, ctx->measurement, runtime);
 
     /* The region AAD must carry the reloc-table byte length exactly like the
@@ -1047,13 +1087,13 @@ int xl_core_activate(XlHostCtx *ctx) {
             {
                 uint8_t *dst = ctx->image_base + rva;
                 uint32_t old = 0;
-                if (!vp(ctx, dst, len, XL_PAGE_RW, &old)) return 0;
-                if (!aead_open(runtime, nonce, aad, 32, ct, ct_len, tag, dst)) return 0;
+                if (!vp(ctx, dst, len, XL_PAGE_RW, &old)) { return 0; }
+                if (!aead_open(runtime, nonce, aad, 32, ct, ct_len, tag, dst)) { return 0; }
                 /* xl_final_protect: restore what the region's own section/
                  * segment declares (RX normally; RWX sections stay writable),
                  * never the vp-reported `old` (sealed NOACCESS on wake, or the
                  * echoed request constant on the ELF mprotect shim). */
-                if (!vp(ctx, dst, len, xl_final_protect(ctx, rva), &old)) return 0;
+                if (!vp(ctx, dst, len, xl_final_protect(ctx, rva), &old)) { return 0; }
             }
         }
     } else {
@@ -1093,8 +1133,17 @@ int xl_core_activate(XlHostCtx *ctx) {
         for (i = 0; i < import_count; i++) {
             uint32_t iat_rva;
             uint16_t name_len, dll_len;
-            char name[256];
-            char dll[256];
+            /* Import names ride the envelope as raw u16-length bytes; real
+             * C++ mangled names run well past 255 (libclang-cpp ships 526-
+             * byte symbols). The old 256-byte buffers made activate fail
+             * closed on every such import (DllMain-false -> loader exit
+             * ERROR_DLL_INIT_FAILED) although the original DLL loaded fine.
+             * 2 KB covers the mangled-name ceiling on all toolchains; the
+             * length check below now derives from the buffer, not a magic
+             * constant, so overlong records still fail closed - just at the
+             * true buffer limit instead of 255. */
+            char name[2048];
+            char dll[2048];
             void *mod;
             void *fn;
             uint32_t old = 0;
@@ -1104,35 +1153,77 @@ int xl_core_activate(XlHostCtx *ctx) {
             iat_rva = rd32(env + cur); cur += 4;
             name_len = rd16(env + cur); cur += 2;
             dll_len = rd16(env + cur); cur += 2;
-            if (name_len >= 255 || dll_len >= 255) return 0;
+            if ((uint32_t)name_len >= sizeof(name) || (uint32_t)dll_len >= sizeof(dll)) return 0;
             if (imp_sealed) {
                 /* TASK-024: sealed name||dll. Fail closed on any tamper. */
                 const uint8_t *nonce = env + cur;
                 const uint8_t *tag = nonce + 12;
                 const uint8_t *ct = tag + 16;
                 uint8_t aad[32];
-                uint8_t pt[512];
+                uint8_t pt[2048 + 2048];  /* name||dll sealed payload cap */
                 if (cur + 12 + 16 + (uint32_t)name_len + dll_len > env_len) return 0;
                 import_aad(aad, platform, flags, iat_rva, name_len, dll_len, i);
                 if (!aead_open(runtime, nonce, aad, 32, ct,
                                (uint32_t)name_len + dll_len, tag, pt)) return 0;
-                xl_zero((uint8_t *)name, 256);
-                xl_zero((uint8_t *)dll, 256);
+                xl_zero((uint8_t *)name, sizeof(name));
+                xl_zero((uint8_t *)dll, sizeof(dll));
                 xl_copy((uint8_t *)name, pt, name_len);
                 xl_copy((uint8_t *)dll, pt + name_len, dll_len);
                 cur += 12 + 16 + (uint32_t)name_len + dll_len;
             } else {
                 if (cur + (uint32_t)name_len + dll_len > env_len) return 0;
-                xl_zero((uint8_t *)name, 256);
-                xl_zero((uint8_t *)dll, 256);
+                xl_zero((uint8_t *)name, sizeof(name));
+                xl_zero((uint8_t *)dll, sizeof(dll));
                 xl_copy((uint8_t *)name, env + cur, name_len); cur += name_len;
                 xl_copy((uint8_t *)dll, env + cur, dll_len); cur += dll_len;
             }
             if (!ctx->load_library || !ctx->get_proc) {
                 continue;
             }
-
+            if (flags & 0x4u) {
+                /* FLAG_LOADER_RESOLVED_IAT: the on-disk import directory is
+                 * retained, so the OS loader has already filled the IAT
+                 * before this stub ran. Re-binding through our own search
+                 * order only risks failure (the host EXE's directory is
+                 * searched first, not this module's), so skip binding and
+                 * just walk the records to reach the keep-list/relocs. */
+                continue;
+            }
+            /* Loader-faithful binding order. The OS loader resolves a
+             * module's dependencies through the STANDARD search order
+             * (host exe dir, system dirs, ..., CWD); the dependent-DLL
+             * search does NOT put this module's own directory ahead of
+             * system32. Two failure modes shaped this code:
+             *  - preferring the module directory first picked up shipping
+             *    apps' stale LOCAL copies of system DLLs (an old
+             *    msvcrt.dll shipped next to dbgeng.dll) whose load
+             *    poisons later system-module loads (ADVAPI32 then fails
+             *    with ERROR_PROC_NOT_FOUND);
+             *  - a bare name alone loses sibling DLLs when the host CWD
+             *    is not the module directory.
+             * Bind by plain name first (exactly what the loader does),
+             * and only when that fails fall back to "<module dir>\<dep>"
+             * via LoadLibraryExA. API-set names (api-ms-*, ext-ms-*) are
+             * virtual: the loader never touches disk for them and apps
+             * ship real stub FILES with those names, so they never take
+             * the path fallback. */
             mod = ctx->load_library(dll);
+            if (!mod && ctx->load_library_ex && dll_len < 256
+                && !(dll_len >= 7
+                     && (dll[0] == 'a' || dll[0] == 'e')
+                     && dll[1] == 'p' && dll[2] == 'i' && dll[3] == '-'
+                     && dll[4] == 'm' && dll[5] == 's' && dll[6] == '-')) {
+                char dir[264];
+                char dep[536];
+                uint32_t dl = xl_module_dir(ctx, dir, (uint32_t)sizeof(dir));
+                if (dl != 0 && dl + dll_len + 1 <= (uint32_t)sizeof(dep)) {
+                    uint32_t k;
+                    for (k = 0; k < dl; k++) dep[k] = dir[k];
+                    for (k = 0; k < dll_len; k++) dep[dl + k] = dll[k];
+                    dep[dl + dll_len] = 0;
+                    mod = ctx->load_library_ex(dep, (void *)0, 0x8u);
+                }
+            }
             if (!mod) return 0;
             /* Ordinal imports arrive under the reserved display name
              * "#<decimal ordinal>" (packer convention; see docs/SUPPORT.md).
@@ -1158,11 +1249,11 @@ int xl_core_activate(XlHostCtx *ctx) {
                     ? ctx->get_proc(mod, (const char *)(uintptr_t)ord)
                     : ctx->get_proc(mod, name);
             }
-            if (!fn) return 0;
+            if (!fn) { return 0; }
             slot = ctx->image_base + iat_rva;
-            if (!vp(ctx, slot, 8, XL_PAGE_RW, &old)) return 0;
+            if (!vp(ctx, slot, 8, XL_PAGE_RW, &old)) { return 0; }
             *(void **)slot = fn;
-            if (!vp(ctx, slot, 8, old, &old)) return 0;
+            if (!vp(ctx, slot, 8, old, &old)) { return 0; }
         }
     }
 
