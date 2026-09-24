@@ -47,3 +47,7 @@ Desktop.ini
 .codegraph/
 .claude/
 CLAUDE.md
+
+# --- Workflow test workspace (corpus, artifacts, diag) ---
+/out/
+/.rivet/
