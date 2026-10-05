@@ -9,13 +9,14 @@ use iced_x86::code_asm::*;
 use iced_x86::BlockEncoderOptions;
 use xenolith_crypto::{PAGE_MAC_DOMAIN, WRAP_DOMAIN};
 
-/// Meta block appended after the code (also embedded as a label below).
-pub const STUB_META_LEN: usize = 80;
-pub const META_PAYLOAD_RVA: usize = 0;
-pub const META_ENVELOPE_LEN: usize = 4;
-pub const META_ORIGINAL_ENTRY: usize = 8;
-pub const META_UNPACKED: usize = 12;
-pub const META_MEASUREMENT: usize = 16;
+// Meta-block and host-ctx field offsets live in stub_meta.rs, shared with
+// the aarch64 emitter; re-exported here for existing consumers.
+pub use crate::stub_meta::{
+    CTX_ENVELOPE, CTX_ENVELOPE_LEN, CTX_GATE, CTX_IMAGE_BASE, CTX_LOAD_LIBRARY, CTX_MEASUREMENT,
+    CTX_GET_PROC, CTX_ORIG_ENTRY, CTX_PHDR_VA, CTX_VPROTECT, META_ENVELOPE_LEN, META_MEASUREMENT,
+    META_ORIGINAL_ENTRY, META_PAGE_SIZE, META_PAYLOAD_RVA, META_SELF_RVA, META_TABLE_RVA,
+    META_TLS_CALLBACK, META_UNPACKED, STUB_META_LEN,
+};
 
 /// Failure phases for the fail-closed exit (PE `l_fail`). Every jump site
 /// loads its phase into r11d right before branching (a `mov` cannot disturb
@@ -38,9 +39,6 @@ pub const STAGE_PROTECT: u32 = 10; // VirtualProtect failed
 pub const STAGE_RESOLVE: u32 = 11; // LoadLibraryA/GetProcAddress failed on an import
 pub const STAGE_PE: u32 = 12; // no PE signature at the image base
 pub const STAGE_DLL_STATE: u32 = 13; // DLL attach state not process-attach
-/// Original first TLS callback RVA; 0 if the image has no TLS callbacks.
-pub const META_TLS_CALLBACK: usize = 64;
-
 const HASH_KERNEL32: u32 = 0x7040_ee75;
 const HASH_GET_PROC: u32 = 0xcf31_bb1f;
 const HASH_LOAD_LIB: u32 = 0x5fbf_f0fb;
@@ -1644,20 +1642,6 @@ fn emit_db(a: &mut CodeAssembler, data: &[u8]) -> Result<(), iced_x86::IcedError
     Ok(())
 }
 
-/// Pack-time offset of the stub's own load-relative VA inside meta. The ELF
-/// stub recovers the image base from it (`base = meta_runtime_va - self_rva`).
-pub const META_SELF_RVA: usize = 68;
-
-/// Offsets inside the Win64-layout `XlHostCtx` built by both stubs.
-const CTX_IMAGE_BASE: i32 = 0;
-const CTX_ENVELOPE: i32 = 8;
-const CTX_ENVELOPE_LEN: i32 = 16;
-const CTX_ORIG_ENTRY: i32 = 20;
-const CTX_GATE: i32 = 24;
-const CTX_MEASUREMENT: i32 = 32;
-const CTX_LOAD_LIBRARY: i32 = 64;
-const CTX_GET_PROC: i32 = 72;
-const CTX_VPROTECT: i32 = 80;
 
 pub struct ElfStub {
     pub bytes: Vec<u8>,
@@ -1698,6 +1682,7 @@ fn emit_elf_inner(
     let mut l_vp_rx = a.create_label();
     let mut l_vp_rwx = a.create_label();
     let mut l_vp_old = a.create_label();
+    let mut l_vp_zero = a.create_label();
     let mut l_core_bytes = a.create_label();
     let mut l_meta = a.create_label();
     let mut l_fail = a.create_label();
@@ -1721,7 +1706,7 @@ fn emit_elf_inner(
     a.je(l_forward)?;
 
     // Build XlHostCtx at rsp+0x20 (below it: 0x20 shadow for Win64 callees).
-    // 0xB0 covers the full 120-byte ctx (0x20 + 0x78) with slack: the old
+    // 0xB0 covers the full 128-byte ctx (0x20 + 0x80) with slack: the old
     // 0x80 reservation left the struct tail overlapping the saved-register
     // slots, and zeroing ctx fields past +0x60 would clobber them on return.
     a.sub(rsp, 0xB0i32)?;
@@ -1756,6 +1741,10 @@ fn emit_elf_inner(
     // never sees a stale stack value as a function pointer.
     a.mov(qword_ptr(rsp + 0x20 + 104i32), 0)?;
     a.mov(qword_ptr(rsp + 0x20 + 112i32), 0)?;
+    // phdr_va: the packed image's e_phoff is a file offset into the
+    // appended PT_LOAD — the core must walk the table at its mapped VA.
+    a.mov(eax, dword_ptr(rbx + META_TABLE_RVA as i32))?;
+    a.mov(qword_ptr(rsp + 0x20 + CTX_PHDR_VA as i32), rax)?;
 
     // xl_core_activate(ctx) — the argument register follows the HOST
     // compiler of the core object: Win64 RCX (MSVC COFF) or SysV RDI
@@ -1846,13 +1835,24 @@ fn emit_elf_inner(
     a.jz(l_vp_old)?;
     a.mov(dword_ptr(r9), r11d)?;
     a.set_label(&mut l_vp_old)?;
-    // Page-align: addr down, len covers the head and rounds to 4K.
-    a.mov(r10, rcx)?;
-    a.and(rcx, -4096i32)?;
-    a.sub(r10, rcx)?;
-    a.add(rdx, r10)?;
-    a.add(rdx, 4095i32)?;
-    a.and(rdx, -4096i32)?;
+    // Page-align from meta[META_PAGE_SIZE]: 4K chunks on x86-64 images, up
+    // to 16K when the packer sealed bigger chunks. The shim locates meta
+    // RIP-RELATIVELY — it must not depend on any callee-saved register
+    // surviving the core's own code (the injected core is freestanding C;
+    // assuming it preserved RBX crashed real loads).
+    a.lea(r10, ptr(l_meta))?;
+    a.mov(r10d, dword_ptr(r10 + META_PAGE_SIZE as i32))?;
+    a.test(r10d, r10d)?;
+    a.jz(l_vp_zero)?; // page size 0 = corrupt meta: fail closed
+    a.neg(r10)?;
+    a.mov(r11, rcx)?;
+    a.and(rcx, r10)?;
+    a.sub(r11, rcx)?;
+    a.add(rdx, r11)?;
+    a.mov(r11, r10)?;
+    a.not(r11)?; // r11 = page - 1
+    a.add(rdx, r11)?;
+    a.and(rdx, r10)?;
     // Win64 args (rcx=addr, rdx=len, r8=prot) → syscall ABI (rdi, rsi, rdx).
     a.mov(rdi, rcx)?;
     a.mov(rsi, rdx)?;
@@ -1862,6 +1862,11 @@ fn emit_elf_inner(
     a.test(eax, eax)?;
     a.sete(al)?;
     a.movzx(eax, al)?;
+    a.ret()?;
+
+    // Corrupt/zero META_PAGE_SIZE: refuse instead of aligning to garbage.
+    a.set_label(&mut l_vp_zero)?;
+    a.xor(eax, eax)?;
     a.ret()?;
 
     a.set_label(&mut l_core_bytes)?;

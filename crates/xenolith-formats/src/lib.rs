@@ -4,6 +4,7 @@
 //! still fails closed until the G3 injected bootstrap exists.
 
 pub mod elf;
+pub mod elf_aarch64;
 mod pe;
 
 pub use pe::{

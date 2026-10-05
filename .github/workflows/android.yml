@@ -1,0 +1,116 @@
+name: android
+
+# Android arm64/x86_64 ELF .so packing — structural layer only (design
+# .apk-compat/xenolith/design.md §2.11): cross-build, pack, inspect and
+# llvm-readelf assertions. No emulator: hosted runners have no KVM and
+# bionic binaries cannot execute on the Ubuntu host. OS-load and functional
+# gates live in the local android-e2e checklist (SUPPORT.md records that
+# split honestly).
+on:
+  push:
+  pull_request:
+
+jobs:
+  android-structural:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned NDK (r27c)
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;27.2.12479018" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+      - name: Build CLI with both cores
+        run: cargo build -p xenolith-cli --release
+      - name: Unit tests (formats/pack cover the aarch64 matrix)
+        run: cargo test -p xenolith-formats -p xenolith-protocol -p xenolith-pack --lib
+      - name: Build dual-ABI victims, pack, assert structure
+        env:
+          NDK: ${{ env.ANDROID_NDK_HOME }}
+          CLI: target/release/xenolith
+        run: |
+          set -eu
+          CLANG="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          mkdir -p target/android-ci
+          cat > target/android-ci/victim.c <<'EOF'
+          static volatile int xl_gate;
+          __attribute__((constructor)) static void xl_boot_gate(void) { xl_gate = 1; }
+          int hello_add(int a, int b) { return a + b; }
+          const char *hello_string(void) { return "xenolith-android-ci"; }
+          EOF
+          for abi_page in aarch64:4096 aarch64:16384 x86_64:4096; do
+            abi=${abi_page%%:*}; page=${abi_page##*:}
+            tgt=$([ "$abi" = aarch64 ] && echo aarch64-linux-android24 || echo x86_64-linux-android24)
+            "$CLANG/clang" --target=$tgt -fPIC -shared -O1 -Wl,-z,max-page-size=$page \
+              -o target/android-ci/libvictim-$abi-$page.so target/android-ci/victim.c
+            "$CLI" pack target/android-ci/libvictim-$abi-$page.so -o target/android-ci/out-$abi-$page.xl.so
+            "$CLI" inspect target/android-ci/out-$abi-$page.xl.so --json > target/android-ci/inspect-$abi-$page.json
+            python3 - "$abi" "$page" <<'EOF'
+          import json, struct, sys
+          abi, page = sys.argv[1], int(sys.argv[2])
+          info = json.load(open(f"target/android-ci/inspect-{abi}-{page}.json"))
+          assert info["packed"] is True, info
+          assert info["machine"] == abi, info
+          data = open(f"target/android-ci/out-{abi}-{page}.xl.so", "rb").read()
+          phoff = struct.unpack_from("<Q", data, 32)[0]
+          phnum = struct.unpack_from("<H", data, 56)[0]
+          loads = []
+          for i in range(phnum):
+              o = phoff + i * 56
+              if struct.unpack_from("<I", data, o)[0] == 1:
+                  off, va = struct.unpack_from("<QQ", data, o + 8)
+                  fsz = struct.unpack_from("<Q", data, o + 32)[0]
+                  al = struct.unpack_from("<Q", data, o + 48)[0]
+                  flags = struct.unpack_from("<I", data, o + 4)[0]
+                  loads.append((off, va, fsz, al, flags))
+          last = loads[-1]
+          assert last[3] == page, f"appended LOAD align {last[3]} != {page}"
+          assert last[4] & 1, "appended LOAD must be executable"
+          assert (last[1] - last[0]) % last[3] == 0, "PT_LOAD congruence broken"
+          assert phoff >= page, "e_phoff must point at the tail table"
+          print(f"{abi}/{page}KiB structural assertions OK")
+          EOF
+          done
+      - name: llvm-readelf deep assertions (C-1..C-4)
+        env:
+          NDK: ${{ env.ANDROID_NDK_HOME }}
+        run: |
+          set -eu
+          RE="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          OUT=target/android-ci/out-aarch64-4096.xl.so
+          IN=target/android-ci/libvictim-aarch64-4096.so
+          # C-1: machine + relocated phdr table
+          "$RE" -hW "$OUT" | grep -q "Machine:.*AArch64"
+          # C-3: DT_INIT absent, INIT_ARRAY kept
+          ! "$RE" -dW "$OUT" | grep -q "(INIT) "
+          "$RE" -dW "$OUT" | grep -q "INIT_ARRAY"
+          # C-2: appended R+X LOAD exists; no W+X LOAD
+          "$RE" -lW "$OUT" | grep -qE "LOAD.*R E"
+          ! "$RE" -lW "$OUT" | grep -qE "LOAD.*RWE"
+          # C-4: INIT_ARRAY[0] RELATIVE(1027) addend lands in the appended LOAD
+          ADDEND=$("$RE" -rW "$OUT" | awk '/R_AARCH64_RELATIVE/ {print $4}' | head -1)
+          python3 - "$ADDEND" <<'EOF'
+          import struct, sys
+          addend = int(sys.argv[1], 16)
+          data = open("target/android-ci/out-aarch64-4096.xl.so", "rb").read()
+          phoff = struct.unpack_from("<Q", data, 32)[0]
+          phnum = struct.unpack_from("<H", data, 56)[0]
+          o = phoff + (phnum - 2) * 56
+          va = struct.unpack_from("<Q", data, o + 16)[0]
+          msz = struct.unpack_from("<Q", data, o + 40)[0]
+          assert va <= addend < va + msz, f"addend {addend:#x} outside appended LOAD [{va:#x},{va+msz:#x})"
+          print("INIT_ARRAY[0] addend lands in the appended LOAD: OK")
+          EOF
+      - name: Tamper control (flip one envelope byte → inspect stays packed, envelope refuses)
+        run: |
+          set -eu
+          python3 - <<'EOF'
+          data = bytearray(open("target/android-ci/out-aarch64-4096.xl.so", "rb").read())
+          i = data.find(b"XLV2")
+          data[i + 100] ^= 1
+          open("target/android-ci/tampered.xl.so", "wb").write(bytes(data))
+          EOF
+          # The structural layer only asserts the tampered artifact still parses
+          # as an ELF; AEAD rejection happens inside the injected core at load
+          # time and is exercised by the local android-e2e gates.
+          target/release/xenolith inspect target/android-ci/tampered.xl.so --json | grep -q '"format": "elf64-dyn"'

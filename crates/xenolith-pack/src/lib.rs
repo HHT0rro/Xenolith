@@ -9,6 +9,8 @@ pub mod platform;
 pub mod runtime_image;
 pub mod selection;
 pub mod stub;
+pub mod stub_aarch64;
+mod stub_meta;
 
 pub use stub::{emit_pic_stub, emit_pic_stub_with_guest, GuestEmit, PicStub, STUB_META_LEN};
 pub use lift::{forbidden_vm_name, lift_export, lift_function, LiftError, LiftedExport};
@@ -95,6 +97,9 @@ pub struct PackReport {
     pub report_version: u32,
     pub profile: String,
     pub format: String,
+    /// Input machine ("x86_64" | "aarch64"). PE is always x86_64; ELF
+    /// follows e_machine. Additive field — existing parsers ignore it.
+    pub machine: String,
     /// TASK-038: on-disk sizes feeding the G8 size budget (output/input).
     pub input_bytes: usize,
     pub output_bytes: usize,
@@ -606,7 +611,7 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
         );
     }
     let guest_emit = GuestEmit { functions };
-    let core_img = runtime_image::load_builtin()
+    let core_img = runtime_image::load_builtin(runtime_image::CoreArch::X8664)
         .map_err(|e| PackError::Runtime(e.to_string()))?;
     let is_dll = matches!(kind, ImageKind::Pe64Dll);
     let pic = stub::emit_pic_stub_with_core_g5(
@@ -1271,6 +1276,7 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
             ImageKind::Elf64Exec => "elf64-exec".into(),
             ImageKind::Elf64Dyn => "elf64-dyn".into(),
         },
+        machine: "x86_64".into(), // PE path is AMD64-only
         input_bytes: request.input.len(),
         output_bytes: image.len(),
         backend: BACKEND_PIC_STUB.into(),
@@ -1789,6 +1795,14 @@ pub fn inspect_bytes(image: &[u8]) -> Result<serde_json::Value, PackError> {
                     ImageKind::Elf64Exec => "elf64-exec",
                     ImageKind::Elf64Dyn => "elf64-dyn",
                     _ => "elf64",
+                },
+                "machine": match elf.machine {
+                    xenolith_formats::elf::ElfMachine::Amd64 => "x86_64",
+                    xenolith_formats::elf::ElfMachine::Aarch64 => "aarch64",
+                },
+                "platform": match elf.machine {
+                    xenolith_formats::elf::ElfMachine::Amd64 => 1,
+                    xenolith_formats::elf::ElfMachine::Aarch64 => 2,
                 },
                 "image_bytes": image.len(),
                 "pie": elf.pie,

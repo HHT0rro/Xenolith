@@ -13,7 +13,7 @@
   <a href="docs/WHITEBOX.md">White-box model</a>
 </p>
 
-**Xenolith is a post-link binary protector for Windows x86-64 PE64 (experimental Linux AMD64 ELF64).** Give it a compiled binary — no source code, no recompilation — and it compiles the functions you select into position-independent native code that exists only in that one build. The protected image contains **no guest bytecode, no reusable opcode table, no central dispatcher**. Payload is sealed with per-page ChaCha20-Poly1305 and unsealed at load time by an injected PIC boot stub plus a freestanding C core.
+**Xenolith is a post-link binary protector for Windows x86-64 PE64 (experimental Linux AMD64 ELF64; Android arm64/x86_64 ELF `.so` packing at the structural layer).** Give it a compiled binary — no source code, no recompilation — and it compiles the functions you select into position-independent native code that exists only in that one build. The protected image contains **no guest bytecode, no reusable opcode table, no central dispatcher**. Payload is sealed with per-page ChaCha20-Poly1305 and unsealed at load time by an injected PIC boot stub plus a freestanding C core.
 
 <p align="center">
   <img src="assets/demo-before-after.png" width="860" alt="check_license before packing vs. after Xenolith pack (--vm-export check_license): same input, same return value, nothing left to pattern-match" />
@@ -72,6 +72,8 @@ The packed DLL still exports `check_license`, but its body now lives inside the 
 Load-time flow (Windows): system loader → PIC stub boot (PEB walk, resolves `LoadLibrary`/`GetProcAddress`/`VirtualProtect`) → `xl_core` authenticated per-page decryption (RW→RX, no long-lived RWX) → hashed imports resolved and written back to the original IAT slots → keyed FNV page digests verify → stolen OEP bytes restored → jump to original entry. ASLR/DEP/CFG/CET, TLS callbacks and exception unwinding (`.pdata`/XDATA; C++ exceptions, `setjmp/longjmp`, varargs, struct returns verified on packed images) all keep working.
 
 On Linux the loader stays `ld.so`: Xenolith appends one R+X `PT_LOAD` and redirects `INIT_ARRAY[0]`; PIE/RELRO/GOT-PLT untouched. Verified on Ubuntu 24.04 (WSL): packed executables run, `.so` files survive `dlopen`/`dlclose`, symbol versioning and IFUNC resolvers work.
+
+On Android the same strategy packs arm64 (EM_AARCH64) and x86_64 ELF64 `.so` files with a hand-encoded AArch64 stub and an NDK-built arm64 core; page size is derived from the input (4-KiB and 16-KiB devices). Android strength is **page-level AEAD sealing only** — no per-function virtualization (ELF selection stays fail-closed) and no anti-debug probes; OS-load on device/emulator is a follow-up gate, not a claim.
 
 ## How it compares
 

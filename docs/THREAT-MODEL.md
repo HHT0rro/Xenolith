@@ -51,6 +51,7 @@ not a claim under GPL.
 | Raise cost of generic VM lifting | No shared handler table, no `GuestMap` stream, no `l_gloop` in the image | Selected-export PIC only |
 | Raise cost of naive trace alignment | W3 `--trace-diverge`, TEB⊕heap⊕RSP coin | Implemented; identical stream hashes in one run are still allowed by the old gate |
 | Honest packing | Fail closed on unsupported semantics | Yes for mem/call/rip-rel/SEH/ELF |
+| Android (arm64/x86_64 `.so`) | Page-level AEAD sealing with input-derived page size (4K/16K); protocol platform byte 2 fails closed in older cores | No per-function virtualization (ELF selection fails closed), no anti-debug probes (guard stays an empty set) — the threat model does not import the Windows virtualization claims |
 | Limit long-term plaintext | Dormant protected regions wiped; no long-term RWX | **Partial**: stub and restored pages are RX (temporary RW then RX). After unpack, executable pages stay plaintext. C2 re-encrypt is not jumped to |
 | Protect proven import sites / constants | Separate Windows IAT and Linux GOT/PLT models | Disk import directory RVA 0 + writeback only |
 | Optional kernel access control | Signed callbacks / supported LSM; `off/optional/required` | Absent |

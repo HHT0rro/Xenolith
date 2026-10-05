@@ -17,6 +17,9 @@ pub const KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 12;
 pub const AEAD_NONCE_LEN: usize = 12;
 pub const AEAD_TAG_LEN: usize = 16;
+/// Default x86-path seal-chunk size. NOT a protocol ceiling: the envelope
+/// bound is `xenolith_protocol::XL_MAX_REGION` (16384) so 16-KiB-page
+/// Android images can seal full-size chunks.
 pub const PAGE_SIZE: usize = 0x1000;
 pub const MBA_LIMBS: usize = 8;
 /// Domain is binary on purpose: it must not appear as searchable ASCII in images.

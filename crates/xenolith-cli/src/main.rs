@@ -84,7 +84,7 @@ fn main() -> Result<()> {
                 resolved.output.display()
             );
             let packed = pack(PackRequest {
-                debug_gate: 3,
+                debug_gate: std::env::var("XL_DEBUG_GATE").ok().and_then(|v| v.parse().ok()).unwrap_or(3),
                 input: &resolved.bytes,
                 profile: resolved.profile,
                 vm_exports: resolved.vm_exports,

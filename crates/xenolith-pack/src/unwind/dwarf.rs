@@ -21,6 +21,10 @@ const REG_RSP: u8 = 7;
 const REG_RBX: u8 = 3;
 const REG_R15: u8 = 15;
 const REG_RA: u8 = 16;
+const REG_X30: u8 = 30; // aarch64 link register
+const REG_X29: u8 = 29;
+const REG_X19: u8 = 19;
+const REG_X20: u8 = 20;
 
 /// Built .eh_frame plus patch/bookkeeping offsets.
 pub struct EhFrame {
@@ -119,6 +123,75 @@ pub fn eh_frame_hdr(entries: &[(i32, i32)]) -> Vec<u8> {
     out
 }
 
+/// AArch64 twin of `eh_frame_stub`: the CIE's return-address column is x30
+/// (not RAX) and the FDE describes the aarch64 stub's fixed prologue
+/// `stp x29,x30,[sp,#-16]!; stp x19,x20,[sp,#-16]!` (4+4 bytes).
+pub fn eh_frame_stub_aarch64(stub_len: u32) -> EhFrame {
+    let mut out = Vec::new();
+    // ---- CIE: version 1, "zR", pcrel|sdata4 ----
+    let mut cie = Vec::new();
+    cie.push(1);
+    cie.extend_from_slice(b"zR");
+    cie.push(0);
+    cie.push(1); // code alignment factor
+    cie.push(0x78); // data alignment factor = -8
+    cie.push(REG_X30);
+    cie.push(1); // augmentation data length
+    cie.push(0x1B); // R = DW_EH_PE_pcrel | sdata4
+    cie.push(DW_CFA_DEF_CFA); // initial CFA = SP + 0
+    cie.push(31); // SP
+    cie.push(0);
+    while (4 + 4 + cie.len()) % 8 != 0 {
+        cie.push(DW_CFA_NOP);
+    }
+    out.extend_from_slice(&((cie.len() + 4) as u32).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&cie);
+
+    // ---- FDE for the two 4-byte STP steps ----
+    let mut fde = Vec::new();
+    fde.extend_from_slice(&0i32.to_le_bytes()); // pc_begin (patched)
+    fde.extend_from_slice(&stub_len.to_le_bytes());
+    fde.push(0); // augmentation-data length (z CIE)
+    // stp x29, x30, [sp,#-16]!: CFA stays at the entry SP, i.e. sp'+16;
+    // x30 at [sp'] = CFA-16, x29 at [sp'+8] = CFA-8. Factored offsets are
+    // against data_align -8: location = CFA + f*(-8).
+    fde.push(DW_CFA_ADVANCE_LOC1);
+    fde.push(4);
+    fde.push(DW_CFA_DEF_CFA);
+    fde.push(31); // SP
+    fde.push(16);
+    fde.push(DW_CFA_OFFSET | REG_X30);
+    fde.push(2); // CFA-16
+    fde.push(DW_CFA_OFFSET | REG_X29);
+    fde.push(1); // CFA-8
+    // stp x19, x20, [sp,#-16]!: CFA = sp''+32; x20 at [sp''] = CFA-32,
+    // x19 at [sp''+8] = CFA-24.
+    fde.push(DW_CFA_ADVANCE_LOC1);
+    fde.push(4);
+    fde.push(DW_CFA_DEF_CFA);
+    fde.push(31);
+    fde.push(32);
+    fde.push(DW_CFA_OFFSET | REG_X20);
+    fde.push(4); // CFA-32
+    fde.push(DW_CFA_OFFSET | REG_X19);
+    fde.push(3); // CFA-24
+    while (4 + 4 + fde.len()) % 8 != 0 {
+        fde.push(DW_CFA_NOP);
+    }
+    out.extend_from_slice(&(fde.len() as u32).to_le_bytes());
+    let fde_len_field = out.len();
+    out.extend_from_slice(&((fde_len_field - 4) as i32).to_le_bytes()); // cie_ptr
+    let pc_begin_off = out.len();
+    out.extend_from_slice(&fde);
+    let fde_off = pc_begin_off - 8;
+    EhFrame {
+        bytes: out,
+        pc_begin_off,
+        fde_off,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +220,40 @@ mod tests {
         );
         assert_eq!(range, 0x100);
         assert_eq!(b[eh.pc_begin_off + 8], 0, "FDE augmentation length = 0");
+    }
+
+    #[test]
+    fn aarch64_cie_and_fde_structure() {
+        let eh = eh_frame_stub_aarch64(0x100);
+        let b = &eh.bytes;
+        let cie_len = u32::from_le_bytes(b[0..4].try_into().unwrap()) as usize;
+        assert_eq!(b[8], 1, "CIE version");
+        assert_eq!(&b[9..11], b"zR");
+        assert_eq!(b[13], 0x78, "data alignment -8");
+        assert_eq!(b[14], REG_X30, "return register is x30");
+        let fde_field = 4 + cie_len;
+        let range = u32::from_le_bytes(
+            b[eh.pc_begin_off + 4..eh.pc_begin_off + 8].try_into().unwrap(),
+        );
+        assert_eq!(range, 0x100);
+        assert_eq!(b[eh.pc_begin_off + 8], 0, "FDE augmentation length = 0");
+        assert_eq!(b.len() % 8, 0);
+        // Body walk: advance(4) def_cfa(sp,16) offset(x30,2) offset(x29,1)
+        // advance(4) def_cfa(sp,32) offset(x20,4) offset(x19,3).
+        let body = &b[eh.pc_begin_off + 9..];
+        let want = [
+            DW_CFA_ADVANCE_LOC1, 4,
+            DW_CFA_DEF_CFA, 31, 16,
+            DW_CFA_OFFSET | REG_X30, 2,
+            DW_CFA_OFFSET | REG_X29, 1,
+            DW_CFA_ADVANCE_LOC1, 4,
+            DW_CFA_DEF_CFA, 31, 32,
+            DW_CFA_OFFSET | REG_X20, 4,
+            DW_CFA_OFFSET | REG_X19, 3,
+        ];
+        for (i, w) in want.iter().enumerate() {
+            assert_eq!(body[i], *w, "FDE op {i}");
+        }
     }
 
     #[test]

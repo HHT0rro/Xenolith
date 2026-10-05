@@ -5,7 +5,6 @@
 
 use xenolith_crypto::{
     aead_open, aead_seal, random_nonce12, AeadError, Secret32, AEAD_NONCE_LEN, AEAD_TAG_LEN,
-    PAGE_SIZE,
 };
 use thiserror::Error;
 
@@ -15,6 +14,23 @@ pub const LEGACY_MAGIC: &[u8; 4] = b"NSEN";
 
 pub const PLATFORM_PE64: u8 = 0;
 pub const PLATFORM_ELF64: u8 = 1;
+/// Android arm64 (EM_AARCH64) ELF64 shared objects. Distinct from
+/// PLATFORM_ELF64 (AMD64) so an old core/cli cannot open an arm64 envelope
+/// (the platform byte is authenticated in every region/import AAD).
+pub const PLATFORM_ELF64_AARCH64: u8 = 2;
+
+/// Maximum sealed-region plaintext/ciphertext length. Shared with the
+/// injected C core (`xl_core.c` `XL_MAX_REGION`). 16 KiB covers the largest
+/// chunk the packer can emit on 16-KiB-page Android devices; the x86 path
+/// chunks at xenolith_crypto::PAGE_SIZE (4 KiB) but is bound by this same
+/// ceiling. Rust and C sides must stay identical — fail-closed otherwise.
+pub const XL_MAX_REGION: usize = 16384;
+
+/// Platforms understood by this protocol revision. Anything else fails
+/// closed in `encode()` and `parse()`.
+pub fn platform_known(platform: u8) -> bool {
+    matches!(platform, PLATFORM_PE64 | PLATFORM_ELF64 | PLATFORM_ELF64_AARCH64)
+}
 
 pub const FLAG_LONG_TERM_RWX: u32 = 1 << 0;
 pub const FLAG_ASLR: u32 = 1 << 1;
@@ -181,6 +197,9 @@ pub fn region_aad(env: &EnvelopeV2, region: &Region) -> [u8; 32] {
 }
 
 pub fn encode(env: &EnvelopeV2) -> Result<Vec<u8>, ProtocolError> {
+    if !platform_known(env.platform) {
+        return Err(ProtocolError::Invalid);
+    }
     if env.stolen.len() > 0xffff {
         return Err(ProtocolError::Invalid);
     }
@@ -201,7 +220,7 @@ pub fn encode(env: &EnvelopeV2) -> Result<Vec<u8>, ProtocolError> {
     out.extend_from_slice(&env.program);
     out.extend_from_slice(&env.policy.to_le_bytes());
     for r in &env.regions {
-        if r.ciphertext.len() > PAGE_SIZE {
+        if r.ciphertext.len() > XL_MAX_REGION {
             return Err(ProtocolError::Invalid);
         }
         out.extend_from_slice(&r.index.to_le_bytes());
@@ -268,6 +287,9 @@ pub fn parse(bytes: &[u8]) -> Result<EnvelopeV2, ProtocolError> {
         return Err(ProtocolError::Version);
     }
     let platform = bytes[6];
+    if !platform_known(platform) {
+        return Err(ProtocolError::Invalid);
+    }
     let profile = bytes[7];
     let flags = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
     let region_count = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
@@ -301,7 +323,7 @@ pub fn parse(bytes: &[u8]) -> Result<EnvelopeV2, ProtocolError> {
         let mut nonce = [0u8; AEAD_NONCE_LEN];
         nonce.copy_from_slice(take(bytes, &mut cur, AEAD_NONCE_LEN)?);
         let ct_len = u32::from_le_bytes(take(bytes, &mut cur, 4)?.try_into().unwrap()) as usize;
-        if ct_len > PAGE_SIZE {
+        if ct_len > XL_MAX_REGION {
             return Err(ProtocolError::Invalid);
         }
         let ciphertext = take(bytes, &mut cur, ct_len)?.to_vec();
@@ -436,7 +458,7 @@ pub fn seal_region(
     plaintext: &[u8],
     nonce: [u8; AEAD_NONCE_LEN],
 ) -> Result<Region, ProtocolError> {
-    if plaintext.len() > PAGE_SIZE {
+    if plaintext.len() > XL_MAX_REGION {
         return Err(ProtocolError::Invalid);
     }
     let region = Region {
@@ -532,5 +554,55 @@ mod tests {
         let bytes = encode(&env).unwrap();
         let parsed = parse(&bytes).unwrap();
         assert!(open_region(&key, &parsed, &parsed.regions[0]).is_err());
+    }
+
+    #[test]
+    fn aarch64_platform_roundtrip_and_opens() {
+        let key = Secret32::from_bytes([0x22; 32]);
+        let mut env = sample_env();
+        env.platform = PLATFORM_ELF64_AARCH64;
+        let nonce = random_nonce12();
+        // A 16-KiB region: the largest chunk a 16-KiB-page Android pack emits.
+        let pt = vec![0xA5u8; XL_MAX_REGION];
+        env.regions
+            .push(seal_region(&key, &env, 0, 0x1000, &pt, nonce).unwrap());
+        let bytes = encode(&env).unwrap();
+        let parsed = parse(&bytes).unwrap();
+        assert_eq!(parsed.platform, PLATFORM_ELF64_AARCH64);
+        assert_eq!(parsed.regions[0].len as usize, XL_MAX_REGION);
+        assert_eq!(open_region(&key, &parsed, &parsed.regions[0]).unwrap(), pt);
+    }
+
+    #[test]
+    fn unknown_platform_rejected_both_ways() {
+        let mut env = sample_env();
+        env.platform = 3;
+        assert!(matches!(encode(&env), Err(ProtocolError::Invalid)));
+        // On the wire the platform byte is offset 6: flip a valid encode.
+        env.platform = PLATFORM_ELF64_AARCH64;
+        let mut bytes = encode(&env).unwrap();
+        bytes[6] = 9;
+        assert!(matches!(parse(&bytes), Err(ProtocolError::Invalid)));
+    }
+
+    #[test]
+    fn max_region_boundary() {
+        let key = Secret32::from_bytes([0x33; 32]);
+        let mut env = sample_env();
+        let nonce = random_nonce12();
+        // 16384 bytes seal fine...
+        env.regions.push(
+            seal_region(&key, &env, 0, 0x1000, &vec![1u8; XL_MAX_REGION], nonce).unwrap(),
+        );
+        // ...one byte more fails closed at seal time...
+        assert!(matches!(
+            seal_region(&key, &env, 1, 0x1000, &vec![1u8; XL_MAX_REGION + 1], nonce),
+            Err(ProtocolError::Invalid)
+        ));
+        // ...and a forged oversized ciphertext is refused by encode/parse.
+        let mut forged = env.regions[0].clone();
+        forged.ciphertext = vec![0u8; XL_MAX_REGION + 1];
+        env.regions.push(forged);
+        assert!(matches!(encode(&env), Err(ProtocolError::Invalid)));
     }
 }

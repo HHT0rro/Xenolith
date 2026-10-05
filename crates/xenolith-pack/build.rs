@@ -3,6 +3,9 @@ use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-changed=../xenolith-runtime/core/xl_core.c");
+    println!("cargo:rerun-if-env-changed=ANDROID_NDK_HOME");
+    println!("cargo:rerun-if-env-changed=ANDROID_NDK_ROOT");
+    println!("cargo:rerun-if-env-changed=ANDROID_HOME");
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let src = manifest.join("../xenolith-runtime/core/xl_core.c");
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -57,4 +60,111 @@ fn main() {
         }
     }
     println!("cargo:rustc-env=XL_CORE_OBJ_PATH={}", obj.display());
+
+    // AArch64 core for Android packing: cross-compiled with the NDK clang.
+    // A missing NDK must NOT fail the build (PE/x86-64 packing is unaffected);
+    // the marker makes arm64 packing fail closed with a named error instead.
+    match compile_aarch64_core(&src, &out) {
+        Ok(path) => println!("cargo:rustc-env=XL_CORE_OBJ_AARCH64_PATH={}", path.display()),
+        Err(reason) => {
+            println!("cargo:rustc-env=XL_CORE_OBJ_AARCH64_PATH=NONE");
+            eprintln!("xenolith-pack: aarch64 core not built: {reason}");
+        }
+    }
+}
+
+/// Locate an NDK (ANDROID_NDK_HOME / ANDROID_NDK_ROOT / ANDROID_HOME/ndk/*)
+/// and cross-compile xl_core.c for aarch64-linux-android.
+fn compile_aarch64_core(src: &PathBuf, out: &PathBuf) -> Result<PathBuf, String> {
+    let ndk = find_ndk()?;
+    let bin = ndk.join("toolchains/llvm/prebuilt");
+    let prebuilt = std::fs::read_dir(&bin)
+        .map_err(|e| format!("NDK at {} has no prebuilt toolchain: {e}", ndk.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.is_dir())
+        .ok_or_else(|| format!("NDK at {} has no prebuilt/<tag> directory", ndk.display()))?;
+    let obj = out.join("xl_core_aarch64.o");
+
+    // Prefer the API-level wrapper (sets target + sysroot); fall back to the
+    // bare clang with an explicit --target for NDK layouts without wrappers.
+    let wrapper = prebuilt.join("bin/aarch64-linux-android24-clang");
+    let wrapper_cmd = prebuilt.join("bin/aarch64-linux-android24-clang.cmd");
+    let mut cmd;
+    if wrapper_cmd.exists() {
+        cmd = std::process::Command::new(&wrapper_cmd);
+    } else if wrapper.exists() {
+        cmd = std::process::Command::new(&wrapper);
+    } else {
+        let clang = prebuilt.join("bin/clang.exe");
+        let clang = if clang.exists() {
+            clang
+        } else {
+            prebuilt.join("bin/clang")
+        };
+        cmd = std::process::Command::new(&clang);
+        cmd.arg("--target=aarch64-linux-android24");
+    }
+    cmd.arg("-O1")
+        .arg("-ffreestanding")
+        .arg("-fno-stack-protector")
+        .arg("-fno-asynchronous-unwind-tables")
+        // Same flat-blob PIC contract as the x86-64 core: every intra-object
+        // reference must be PC-relative, never absolute.
+        .arg("-fpie")
+        // Pin branch protection OFF: the stub BLs the core directly (no BTI
+        // needed at its entry) and NDK clang versions drift on defaults.
+        .arg("-mbranch-protection=none")
+        // NDK r21+ defaults to outline atomics, which emit calls into
+        // compiler-rt (`__aarch64_cas*_acq` etc.) — external references the
+        // injected flat blob cannot resolve. Keep the ldaxr/stlxr inline
+        // forms (the C already has a same-behavior inline path).
+        .arg("-mno-outline-atomics")
+        .arg("-c")
+        .arg("-o")
+        .arg(&obj)
+        .arg(src);
+    let status = cmd
+        .status()
+        .map_err(|e| format!("spawn NDK clang {:?}: {e}", cmd.get_program()))?;
+    if !status.success() || !obj.exists() {
+        return Err(format!("NDK clang exited {status}"));
+    }
+    Ok(obj)
+}
+
+fn find_ndk() -> Result<PathBuf, String> {
+    for var in ["ANDROID_NDK_HOME", "ANDROID_NDK_ROOT"] {
+        if let Ok(v) = env::var(var) {
+            if !v.is_empty() {
+                let p = PathBuf::from(&v);
+                if p.join("toolchains").is_dir() {
+                    return Ok(p);
+                }
+                return Err(format!("{var}={v} has no toolchains/ directory"));
+            }
+        }
+    }
+    if let Ok(home) = env::var("ANDROID_HOME") {
+        if !home.is_empty() {
+            let ndkroot = PathBuf::from(&home).join("ndk");
+            if let Some(v) = newest_dir(&ndkroot) {
+                return Ok(v);
+            }
+            return Err(format!("ANDROID_HOME={home} has no ndk/<version>"));
+        }
+    }
+    Err("NDK not found (set ANDROID_NDK_HOME/ANDROID_NDK_ROOT or ANDROID_HOME)".into())
+}
+
+/// Highest-versioned `ndk/<dir>` entry (rNN sort falls back to name sort).
+fn newest_dir(root: &PathBuf) -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && p.join("toolchains").is_dir())
+        .collect();
+    dirs.sort();
+    dirs.pop()
 }

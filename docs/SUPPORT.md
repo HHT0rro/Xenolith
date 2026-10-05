@@ -33,7 +33,9 @@ The following are **not** the product runtime:
 | Windows AMD64 PE64 DLL | Yes | Yes, via system `LoadLibrary` (`GATE 3 OK result=Some(7)`) |
 | Windows AMD64 PE64 EXE | Yes | Yes on this Windows host (`hello-exe` prints `xenolith-hello`); selected-export VM still needs a named export or `--select-rva` |
 | Linux AMD64 ELF64 ET_DYN / ET_EXEC / .so | Yes — appends an R+X PT_LOAD (relocated PHDR table + PIC stub + `xl_core` + EnvelopeV2) and redirects INIT_ARRAY[0] to the stub; ld.so stays the loader (PIE/RELRO/GOT-PLT untouched) | Verified in WSL Ubuntu 24.04: packed `hello-elf` prints `xenolith-hello-elf`; packed `libhello-elf.so` dlopen/dlclose OK (`packed_elf_prints_hello`). PT_TLS, IFUNC, TLSDESC, copy reloc, static, RELATIVE-into-RX fail closed |
-| ARM64, x86-32, macOS, Android | Rejected or unparsed | Out of scope for this version |
+| Android arm64 ELF64 ET_DYN `.so` (EM_AARCH64, no PT_INTERP) | Yes — same appended R+X PT_LOAD + INIT_ARRAY[0] bootstrap strategy, `stub_aarch64` hand-encoded stub + NDK r27c-compiled aarch64 `xl_core`; page size derived from the input (`clamp(max PT_LOAD p_align, 4K, 16K)`) threads through chunking, the protocol (`XL_MAX_REGION` 16384), `META_PAGE_SIZE` and both stubs' vprotect shims — 16-KiB-page devices are first-class | Structural CI layer only (build/pack/`llvm-readelf` assertions). OS-load on Android is **not** claimed here: emulator `ndk_translation` and real-device matrices are follow-up gates (design `.apk-compat/xenolith/design.md` §8) |
+| Android x86_64 ELF64 `.so` | Yes — reuses the Linux AMD64 path (same stub/ABI/`__NR_mprotect`) with bionic-incompatible inputs failing closed | Same as arm64: structural layer; bionic OS-load is a follow-up gate |
+| ARM32 / any ELF32 (armeabi-v7a), macOS | **Rejected** with a named diagnostic | Out of scope for this version |
 | .NET mixed-mode images (COM descriptor / CLR header, datadir 14 present) | **Rejected** with a named diagnostic | Out of scope for this version |
 | CFG-instrumented images (`DllCharacteristics GUARD_CF` or load-config `GuardFlags` instrumented) | **Rejected** with a named diagnostic | The loader GuardCF-checks a CFG image's entry against GFIDS; the packed stub entry is not registered there and the process fast-fails (0xC0000409) at load. Rebuild without `/guard:cf`, or wait for GFIDS-aware packing |
 
@@ -185,7 +187,13 @@ The first production version, if and only if G0–G8 in the architecture plan pa
 | Kernel | Optional signed / supported access control: `off` / `optional` / `required`. Not "move the user program into the kernel". Not resistance to a malicious kernel or hypervisor. |
 | Architecture | Default remains per-function / per-region unique superoperator native code. A shared bytecode table plus central dispatcher is forbidden as the default product. |
 
-ARM64, 32-bit x86, Android, and macOS are **not** completion criteria for this version.
+ARM32/ELF32 and macOS are **not** completion criteria for this version. Android
+support covers ELF64 `.so` packing (arm64 + x86_64) at the structural layer:
+CLI pack/inspect, protocol platform byte 2, page-size-parameterized sealing and
+readelf-level artifact assertions. Android OS-load (emulator + real device),
+per-function virtualization (`--vm-export` stays fail-closed on ELF) and
+anti-debug probes (guard stays an empty set) are **not** claimed — Android
+strength is page-level AEAD sealing, no more.
 
 ## Fail-closed rules
 

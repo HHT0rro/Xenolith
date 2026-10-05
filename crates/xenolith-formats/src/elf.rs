@@ -1,10 +1,12 @@
-//! ELF64 AMD64 parser. Unsupported features fail closed.
+//! ELF64 AMD64/AArch64 parser. Unsupported features fail closed.
 
+use crate::elf_aarch64;
 use crate::{read_u16, read_u32, read_u64, FormatError, ImageKind};
 
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
 const EM_X86_64: u16 = 62;
+const EM_AARCH64: u16 = 183;
 pub const PT_LOAD: u32 = 1;
 pub const PT_DYNAMIC: u32 = 2;
 pub const PT_INTERP: u32 = 3;
@@ -35,6 +37,53 @@ const PN_XNUM: usize = 0xFFFF;
 /// Sane phdr-table bound: real images stay below ~30 entries.
 const MAX_PHNUM: usize = 4096;
 
+/// AArch64 packed-relocation/RELR dynamic tags (DT_LOOS = 0x6000000D). Any
+/// input carrying them fails closed: scan_rela only walks DT_RELA, so a
+/// packed table would let ld.so apply relative fixups into sealed RX pages
+/// that the stub later restores to link-time plaintext.
+const DT_ANDROID_REL: u64 = 0x6000_000F; // DT_LOOS + 2
+const DT_ANDROID_RELSZ: u64 = 0x6000_0010; // DT_LOOS + 3
+const DT_ANDROID_RELA: u64 = 0x6000_0011; // DT_LOOS + 4
+const DT_ANDROID_RELASZ: u64 = 0x6000_0012; // DT_LOOS + 5
+const DT_RELRSZ: u64 = 35;
+const DT_RELR: u64 = 36;
+const DT_RELRENT: u64 = 37;
+
+/// Input ELF machine. Drives per-architecture constants and stub dispatch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ElfMachine {
+    Amd64,
+    Aarch64,
+}
+
+impl ElfMachine {
+    /// e_machine discriminator.
+    pub fn from_em(em: u16) -> Option<Self> {
+        match em {
+            EM_X86_64 => Some(ElfMachine::Amd64),
+            EM_AARCH64 => Some(ElfMachine::Aarch64),
+            _ => None,
+        }
+    }
+
+    /// The RELATIVE relocation type ld.so applies before INIT_ARRAY — the
+    /// relocation the INIT_ARRAY[0] bootstrap redirects.
+    pub fn relative_type(self) -> u32 {
+        match self {
+            ElfMachine::Amd64 => 8, // R_X86_64_RELATIVE
+            ElfMachine::Aarch64 => elf_aarch64::R_AARCH64_RELATIVE,
+        }
+    }
+
+    /// The IRELATIVE type whose addends are IFUNC resolver addresses.
+    pub fn ifunc_type(self) -> u32 {
+        match self {
+            ElfMachine::Amd64 => R_X86_64_IRELATIVE,
+            ElfMachine::Aarch64 => elf_aarch64::R_AARCH64_IRELATIVE,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ProgramHeader {
     pub p_type: u32,
@@ -50,6 +99,7 @@ pub struct ProgramHeader {
 #[derive(Clone, Debug)]
 pub struct Elf64 {
     pub kind: ImageKind,
+    pub machine: ElfMachine,
     pub pie: bool,
     pub relro: bool,
     pub has_tls: bool,
@@ -65,14 +115,22 @@ pub fn parse(bytes: &[u8]) -> Result<Elf64, FormatError> {
     if bytes.len() < 64 || &bytes[0..4] != b"\x7fELF" {
         return Err(FormatError::Unsupported);
     }
-    if bytes[4] != 2 || bytes[5] != 1 {
-        return Err(FormatError::Invalid("only ELF64 little-endian AMD64"));
+    if bytes[4] == 1 {
+        return Err(FormatError::Invalid(
+            "ELF32 images (armeabi-v7a and every other 32-bit target) are not \
+             packed in this release: only ELF64 AMD64/AArch64 is accepted",
+        ));
+    }
+    if bytes[5] != 1 {
+        return Err(FormatError::Invalid("only ELF64 little-endian is accepted"));
     }
     let etype = read_u16(bytes, 16)?;
     let machine = read_u16(bytes, 18)?;
-    if machine != EM_X86_64 {
-        return Err(FormatError::Invalid("ELF machine is not AMD64"));
-    }
+    let Some(machine) = ElfMachine::from_em(machine) else {
+        return Err(FormatError::Invalid(
+            "ELF machine is not AMD64 (62) or AArch64 (183)",
+        ));
+    };
     let kind = match etype {
         ET_EXEC => ImageKind::Elf64Exec,
         ET_DYN => ImageKind::Elf64Dyn,
@@ -151,14 +209,28 @@ pub fn parse(bytes: &[u8]) -> Result<Elf64, FormatError> {
                 pie = pie || (val & DF_1_PIE) != 0;
             }
             DT_VERSYM => {}
+            // A-8: RELR and Android packed relocations fail closed with the
+            // relink workaround in the message — scan_rela only walks DT_RELA,
+            // so silently accepting a packed table would leak relative fixups
+            // into pages the stub restores to link-time plaintext.
+            DT_RELR | DT_RELRSZ | DT_RELRENT | DT_ANDROID_REL | DT_ANDROID_RELSZ
+            | DT_ANDROID_RELA | DT_ANDROID_RELASZ => {
+                return Err(FormatError::Invalid(
+                    "ELF input uses RELR or Android packed relocations \
+                     (DT_RELR/DT_ANDROID_*): relink with -Wl,--pack-dyn-relocs=none \
+                     (CMake: ANDROID_PACK_DYN_RELOCS_OFF) — packed tables apply \
+                     relative fixups into pages the packer seals",
+                ));
+            }
             _ => {}
         }
         let _ = (DT_NEEDED, DT_SYMTAB, DT_FLAGS);
         i += 16;
     }
-    scan_rela(bytes, phoff, phentsize, phnum, rela_off, rela_sz)?;
+    scan_rela(bytes, machine, phoff, phentsize, phnum, rela_off, rela_sz)?;
     Ok(Elf64 {
         kind,
+        machine,
         pie,
         relro,
         has_tls,
@@ -225,6 +297,251 @@ pub fn vaddr_file_offset(bytes: &[u8], elf: &Elf64, vaddr: u64) -> Result<usize,
         elf.phnum as usize,
         vaddr,
     )
+}
+
+/// File ranges the ELF loader parses BEFORE any DT_INIT/INIT_ARRAY code
+/// runs: the ELF header + program-header table (pread straight from the
+/// file), the PT_DYNAMIC array itself, and every dynamic-table-pointed
+/// structure it walks from the mapped image (dynsym/dynstr, hash tables,
+/// relocation tables, init/fini arrays, symbol versioning). On toolchain
+/// layouts that merge read-only metadata into the executable PT_LOAD
+/// (NDK `--no-rosegment`, old defaults), these bytes MUST stay plaintext
+/// on disk — sealing them breaks ld.so's dependency/relocation phase with
+/// garbled NEEDED strings long before the unpack stub could run.
+///
+/// Returns file-offset ranges (start, len). Anything unparseable is a named
+/// failure (fail-closed), never a silently short carve-out.
+pub fn loader_metadata_file_ranges(
+    bytes: &[u8],
+    elf: &Elf64,
+) -> Result<Vec<(usize, usize)>, FormatError> {
+    const DT_PLTRELSZ: u64 = 2;
+    const DT_STRSZ: u64 = 10;
+    const DT_JMPREL: u64 = 23;
+    const DT_PREINIT_ARRAY: u64 = 32;
+    const DT_PREINIT_ARRAYSZ: u64 = 33;
+    const DT_FINI_ARRAYSZ: u64 = 28;
+    const DT_VERNEED: u64 = 0x6fff_fffe;
+    const DT_VERNEEDNUM: u64 = 0x6fff_ffff;
+    const DT_VERDEF: u64 = 0x6fff_fffc;
+    const DT_VERDEFNUM: u64 = 0x6fff_fffd;
+    const DT_VERSYM: u64 = 0x6fff_fff0;
+    const MAX_WALK: usize = 1 << 16;
+
+    let mut out = Vec::new();
+    // 1. ELF header + phdr table: dlopen preads these from the file.
+    let hdr_end = elf.phoff as usize + elf.phnum as usize * elf.phentsize as usize;
+    out.push((0usize, hdr_end));
+
+    let phdrs = program_headers(bytes, elf)?;
+    let mut dyn_off = None;
+    let mut dyn_len = 0usize;
+    for ph in &phdrs {
+        if ph.p_type == PT_DYNAMIC {
+            dyn_off = Some(ph.p_offset as usize);
+            dyn_len = ph.p_filesz as usize;
+        }
+    }
+    let mut tags: Vec<(u64, u64)> = Vec::new();
+    if let Some(off) = dyn_off {
+        out.push((off, dyn_len));
+        let mut i = 0usize;
+        while i + 16 <= dyn_len {
+            let tag = read_u64(bytes, off + i)?;
+            if tag == DT_NULL {
+                break;
+            }
+            tags.push((tag, read_u64(bytes, off + i + 8)?));
+            i += 16;
+        }
+    }
+    let tag_val = |want: u64| -> Option<u64> {
+        tags.iter().find(|(t, _)| *t == want).map(|(_, v)| *v)
+    };
+    let to_file = |va: u64| -> Result<usize, FormatError> {
+        vaddr_to_off(
+            bytes,
+            elf.phoff as usize,
+            elf.phentsize as usize,
+            elf.phnum as usize,
+            va,
+        )
+    };
+    let mut push_va = |va: u64, len: u64| -> Result<(), FormatError> {
+        if va == 0 || len == 0 {
+            return Ok(());
+        }
+        let off = to_file(va)?;
+        if off.checked_add(len as usize).map(|e| e > bytes.len()).unwrap_or(true) {
+            return Err(FormatError::Invalid(
+                "dynamic metadata range runs past the file (corrupt dynamic table)",
+            ));
+        }
+        out.push((off, len as usize));
+        Ok(())
+    };
+
+    // 2. Exact-size tables.
+    if let (Some(st), Some(sz)) = (tag_val(DT_STRTAB), tag_val(DT_STRSZ)) {
+        push_va(st, sz)?;
+    }
+    if let (Some(r), Some(sz)) = (tag_val(DT_RELA), tag_val(DT_RELASZ)) {
+        push_va(r, sz)?;
+    }
+    if let (Some(r), Some(sz)) = (tag_val(DT_JMPREL), tag_val(DT_PLTRELSZ)) {
+        push_va(r, sz)?;
+    }
+    if let (Some(r), Some(sz)) = (tag_val(25), tag_val(27)) { // DT_INIT_ARRAY + SZ
+        push_va(r, sz)?;
+    }
+    if let (Some(r), Some(sz)) = (tag_val(26), tag_val(DT_FINI_ARRAYSZ)) {
+        push_va(r, sz)?;
+    }
+    if let (Some(r), Some(sz)) = (tag_val(DT_PREINIT_ARRAY), tag_val(DT_PREINIT_ARRAYSZ)) {
+        push_va(r, sz)?;
+    }
+
+    // 3. dynsym extent (hash-table-derived count — the same bound
+    // ifunc_symbol_values relies on).
+    if let Some(symtab) = tag_val(DT_SYMTAB) {
+        let dyn_off_v = dyn_off.unwrap_or(0);
+        let dyn_sz_v = dyn_len;
+        let extent = dynsym_extent(
+            bytes,
+            elf.phoff as usize,
+            elf.phentsize as usize,
+            elf.phnum as usize,
+            dyn_off_v,
+            dyn_sz_v,
+        )?;
+        if let Some((off, end)) = extent {
+            let len = end.saturating_sub(off);
+            let _ = off;
+            push_va(symtab, len as u64)?;
+            if let Some(versym) = tag_val(DT_VERSYM) {
+                push_va(versym, 2 * len as u64)?;
+            }
+        } else {
+            // No hash table states the count: carve conservatively to the
+            // strtab (dynsym always precedes dynstr in practice; if strtab
+            // is missing too, the input is not a loadable shared object).
+            let end = tag_val(DT_STRTAB).ok_or(FormatError::Invalid(
+                "dynsym extent unknown (no DT_HASH/DT_GNU_HASH/DT_STRTAB bound)",
+            ))?;
+            if end > symtab {
+                push_va(symtab, end - symtab)?;
+            }
+        }
+    }
+
+    // 4. DT_HASH: nbucket+nchain header states the exact table size.
+    if let Some(h) = tag_val(DT_HASH) {
+        let off = to_file(h)?;
+        let nb = read_u32(bytes, off)? as usize;
+        let nc = read_u32(bytes, off + 4)? as usize;
+        if nb == 0 || nb > MAX_WALK || nc == 0 || nc > MAX_WALK {
+            return Err(FormatError::Invalid("DT_HASH table size out of bounds"));
+        }
+        out.push((off, 8 + 4 * (nb + nc)));
+    }
+    // 5. DT_GNU_HASH: walk buckets/chains once (bounded by the file).
+    if let Some(g) = tag_val(DT_GNU_HASH) {
+        let off = to_file(g)?;
+        let nbuckets = read_u32(bytes, off)? as usize;
+        let symoffset = read_u32(bytes, off + 4)? as usize;
+        let bloom = read_u32(bytes, off + 8)? as usize;
+        if nbuckets == 0 || nbuckets > MAX_WALK || bloom > MAX_WALK {
+            return Err(FormatError::Invalid("DT_GNU_HASH header out of bounds"));
+        }
+        let chains_off = off + 16 + bloom * 8 + nbuckets * 4;
+        let mut maxsym = 0usize;
+        for b in 0..nbuckets {
+            let v = read_u32(bytes, off + 16 + bloom * 8 + b * 4)? as usize;
+            maxsym = maxsym.max(v);
+        }
+        if maxsym < symoffset {
+            maxsym = symoffset;
+        } else {
+            let limit = (bytes.len().saturating_sub(chains_off)) / 4;
+            let mut idx = maxsym;
+            while idx - symoffset < limit {
+                let word = read_u32(bytes, chains_off + (idx - symoffset) * 4)? as usize;
+                idx += 1;
+                if word & 1 == 1 {
+                    break;
+                }
+            }
+            maxsym = idx;
+        }
+        out.push((off, chains_off - off + (maxsym - symoffset) * 4));
+    }
+    // 6. Verneed/Verdef chains: vn_next/vd_next walks, bounded.
+    if let (Some(vn), Some(num)) = (tag_val(DT_VERNEED), tag_val(DT_VERNEEDNUM)) {
+        let start = to_file(vn)?;
+        let mut cur = start;
+        let mut end = start;
+        for _ in 0..num.min(MAX_WALK as u64) as usize {
+            let cnt = read_u32(bytes, cur + 4)? as usize;
+            let mut aux = read_u32(bytes, cur + 8)? as usize;
+            for _ in 0..cnt.min(MAX_WALK) {
+                if aux == 0 {
+                    break;
+                }
+                if cur.checked_add(aux + 16).map(|e| e > bytes.len()).unwrap_or(true) {
+                    return Err(FormatError::Invalid("verneed aux chain out of bounds"));
+                }
+                let vna_next = read_u32(bytes, cur + aux + 12)? as usize;
+                end = end.max(cur + aux + 16);
+                aux = if vna_next == 0 { 0 } else { aux + vna_next };
+            }
+            end = end.max(cur + 16); // Elf64_Verneed header
+            let vn_next = read_u32(bytes, cur + 12)? as usize;
+            if vn_next == 0 {
+                break;
+            }
+            let next = cur + vn_next;
+            if next <= cur || next > bytes.len() {
+                return Err(FormatError::Invalid("verneed chain out of bounds"));
+            }
+            cur = next;
+        }
+        out.push((start, end - start));
+    }
+    if let (Some(vd), Some(num)) = (tag_val(DT_VERDEF), tag_val(DT_VERDEFNUM)) {
+        // Elf64_Verdef: vd_version(2) vd_flags(2) vd_ndx(2) vd_cnt(2)
+        // vd_hash(4) vd_aux(4) vd_next(4) — vd_next is at +16.
+        let start = to_file(vd)?;
+        let mut cur = start;
+        let mut end = start;
+        for _ in 0..num.min(MAX_WALK as u64) as usize {
+            let vd_aux = read_u32(bytes, cur + 12)? as usize;
+            let vd_next = read_u32(bytes, cur + 16)? as usize;
+            end = end.max(cur + 20);
+            // Verdaux chain: vda_name(4) vda_next(4) — 8 bytes per entry.
+            let mut a = vd_aux;
+            for _ in 0..MAX_WALK {
+                if a == 0 {
+                    break;
+                }
+                if cur.checked_add(a + 8).map(|e| e > bytes.len()).unwrap_or(true) {
+                    return Err(FormatError::Invalid("verdef aux chain out of bounds"));
+                }
+                let vda_next = read_u32(bytes, cur + a + 4)? as usize;
+                end = end.max(cur + a + 8);
+                a = if vda_next == 0 { 0 } else { a + vda_next };
+            }
+            if vd_next == 0 {
+                break;
+            }
+            let next = cur + vd_next;
+            if next <= cur || next > bytes.len() {
+                return Err(FormatError::Invalid("verdef chain out of bounds"));
+            }
+            cur = next;
+        }
+        out.push((start, end - start));
+    }
+    Ok(out)
 }
 
 /// File offset of the DT_INIT value slot, plus the original init VA (0 if absent).
@@ -319,6 +636,7 @@ fn vaddr_to_off(
 
 fn scan_rela(
     bytes: &[u8],
+    machine: ElfMachine,
     phoff: usize,
     phentsize: usize,
     phnum: usize,
@@ -336,7 +654,7 @@ fn scan_rela(
     for i in 0..n {
         let info = read_u64(bytes, off + i * 24 + 8)?;
         let kind = (info & 0xffff_ffff) as u32;
-        match kind {
+        match (machine, kind) {
             // R_X86_64_IRELATIVE: allowed since TASK-022 — resolvers run
             // during ld.so relocation (before INIT_ARRAY), so the packer
             // keeps their pages native; see `ifunc_resolvers`.
@@ -346,13 +664,26 @@ fn scan_rela(
             // R_X86_64_TLSDESC: resolved by ld.so into the RW GOT before
             // INIT_ARRAY — likewise outside the seal set.
             // R_X86_64_TPOFF64 (18): targets an RW GOT slot (initial-exec).
-            R_X86_64_TPOFF32 => {
+            (_, R_X86_64_TPOFF32) => {
                 // Local-exec: the offset is embedded in the text itself, and
                 // the ld.so write happens before the stub restores plaintext —
                 // the page restore would wipe the applied value. Still
                 // rejected because its target IS a sealed RX page.
                 return Err(FormatError::Invalid(
                     "ELF R_X86_64_TPOFF32 (text TLS offset) is not packed",
+                ));
+            }
+            // AArch64 local-exec TLS offsets (TLSLE_ADD_TPREL_*): the arm64
+            // counterpart of TPOFF32 — the TP offset is baked into the
+            // instruction immediate on sealed RX text.
+            (
+                ElfMachine::Aarch64,
+                elf_aarch64::R_AARCH64_TLSLE_ADD_TPREL_LO12
+                | elf_aarch64::R_AARCH64_TLSLE_ADD_TPREL_HI12
+                | elf_aarch64::R_AARCH64_TLSLE_ADD_TPREL_LO12_NC,
+            ) => {
+                return Err(FormatError::Invalid(
+                    "ELF R_AARCH64_TLSLE_ADD_TPREL_* (text TLS offset) is not packed",
                 ));
             }
             _ => {}
@@ -558,7 +889,7 @@ pub fn ifunc_resolvers(bytes: &[u8], elf: &Elf64) -> Result<Vec<u64>, FormatErro
     for k in 0..(rela_sz as usize / 24) {
         let o = file + k * 24;
         let info = read_u64(bytes, o + 8)?;
-        if (info & 0xffff_ffff) as u32 == R_X86_64_IRELATIVE {
+        if (info & 0xffff_ffff) as u32 == elf.machine.ifunc_type() {
             out.push(read_u64(bytes, o + 16)?);
         }
     }
@@ -630,15 +961,31 @@ pub fn tls_reloc_census(bytes: &[u8], elf: &Elf64) -> Result<(u32, u32), FormatE
         return Ok((ie, ld));
     }
     let file = vaddr_file_offset(bytes, elf, rela_off)?;
+    // Per-arch census so the report's TLS note is truthful on arm64 inputs
+    // (x86 numbers would silently count nothing and report 0/0).
+    let (ie_types, ld_types): (&[u32], &[u32]) = match elf.machine {
+        ElfMachine::Amd64 => (
+            &[18, 22], // TPOFF64 GOT slots + GOTTPOFF offsets (initial-exec)
+            &[16, 17], // DTPMOD64/DTPREL64 (general/local dynamic)
+        ),
+        ElfMachine::Aarch64 => (
+            &[elf_aarch64::R_AARCH64_TLS_TPREL64],
+            &[
+                elf_aarch64::R_AARCH64_TLS_DTPMOD64,
+                elf_aarch64::R_AARCH64_TLS_DTPREL64,
+            ],
+        ),
+    };
     for k in 0..(rela_sz as usize / 24) {
         let o = file + k * 24;
         let info = read_u64(bytes, o + 8)?;
-        match (info & 0xffff_ffff) as u32 {
-            // initial-exec: GOTTPOFF (22) offsets + TPOFF64 (18) GOT slots.
-            18 | 22 => ie += 1,
-            // general/local-dynamic module+offset pairs.
-            16 | 17 => ld += 1,
-            _ => {}
+        let kind = (info & 0xffff_ffff) as u32;
+        // TLSDESC stays uncounted on both arches (RW GOT, resolved before
+        // INIT_ARRAY — mirrors the x86 handling).
+        if ie_types.contains(&kind) {
+            ie += 1;
+        } else if ld_types.contains(&kind) {
+            ld += 1;
         }
     }
     Ok((ie, ld))
@@ -848,6 +1195,177 @@ mod tests {
         parse(&img).expect("unbounded dynsym must not fail the parse");
     }
 
+    /// Minimal ET_DYN with one R+X PT_LOAD (vaddr == file offset) and a
+    /// PT_DYNAMIC carrying DT_RELA/DT_INIT_ARRAY plus caller-supplied extra
+    /// tags and relocation entries. Enough shape for the per-arch rejection
+    /// matrix and the census/bootstrap scans. Returns the image and the
+    /// INIT_ARRAY virtual address (a RELATIVE r_offset that must match).
+    fn elf_dyn_with_rela(
+        machine: ElfMachine,
+        relas: &[(u64, u32, u64)],
+        extra_dyn: &[(u64, u64)],
+    ) -> (Vec<u8>, u64) {
+        const PHOFF: usize = 64;
+        const PHNUM: usize = 2;
+        const DYN_OFF: usize = PHOFF + PHNUM * 56; // 176
+        let n_dyn = 4 + extra_dyn.len() + 1; // RELA/RELASZ/INIT_ARRAY/INIT_ARRAYSZ + extra + NULL
+        let rela_off = DYN_OFF + n_dyn * 16;
+        let ia_off = rela_off + relas.len() * 24;
+
+        let mut dyns: Vec<u8> = Vec::new();
+        for (tag, val) in [
+            (7u64, rela_off as u64),   // DT_RELA
+            (8u64, (relas.len() * 24) as u64), // DT_RELASZ
+            (25u64, ia_off as u64),    // DT_INIT_ARRAY
+            (26u64, 8u64),             // DT_INIT_ARRAYSZ
+        ] {
+            dyns.extend_from_slice(&tag.to_le_bytes());
+            dyns.extend_from_slice(&val.to_le_bytes());
+        }
+        for (tag, val) in extra_dyn {
+            dyns.extend_from_slice(&tag.to_le_bytes());
+            dyns.extend_from_slice(&val.to_le_bytes());
+        }
+        dyns.extend_from_slice(&[0u8; 16]); // DT_NULL
+
+        let total = ia_off + 8;
+        let mut img = vec![0u8; total];
+        img[0..4].copy_from_slice(b"\x7fELF");
+        img[4] = 2;
+        img[5] = 1;
+        img[16..18].copy_from_slice(&ET_DYN.to_le_bytes());
+        img[18..20].copy_from_slice(
+            &(match machine {
+                ElfMachine::Amd64 => EM_X86_64,
+                ElfMachine::Aarch64 => EM_AARCH64,
+            })
+            .to_le_bytes(),
+        );
+        img[32..40].copy_from_slice(&(PHOFF as u64).to_le_bytes());
+        img[54..56].copy_from_slice(&56u16.to_le_bytes());
+        img[56..58].copy_from_slice(&(PHNUM as u16).to_le_bytes());
+        // PT_LOAD: whole file, R+X, vaddr 0.
+        img[PHOFF..PHOFF + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        img[PHOFF + 4..PHOFF + 8].copy_from_slice(&5u32.to_le_bytes());
+        img[PHOFF + 8..PHOFF + 16].copy_from_slice(&0u64.to_le_bytes());
+        img[PHOFF + 32..PHOFF + 40].copy_from_slice(&(total as u64).to_le_bytes());
+        img[PHOFF + 40..PHOFF + 48].copy_from_slice(&(total as u64).to_le_bytes());
+        img[PHOFF + 48..PHOFF + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+        // PT_DYNAMIC.
+        let d = PHOFF + 56;
+        img[d..d + 4].copy_from_slice(&PT_DYNAMIC.to_le_bytes());
+        img[d + 8..d + 16].copy_from_slice(&(DYN_OFF as u64).to_le_bytes());
+        img[d + 16..d + 24].copy_from_slice(&(DYN_OFF as u64).to_le_bytes());
+        img[d + 32..d + 40].copy_from_slice(&(dyns.len() as u64).to_le_bytes());
+        img[DYN_OFF..DYN_OFF + dyns.len()].copy_from_slice(&dyns);
+        for (k, (r_offset, kind, addend)) in relas.iter().enumerate() {
+            let o = rela_off + k * 24;
+            let r_offset = if *r_offset == u64::MAX { ia_off as u64 } else { *r_offset };
+            img[o..o + 8].copy_from_slice(&r_offset.to_le_bytes());
+            img[o + 8..o + 16].copy_from_slice(&(*kind as u64).to_le_bytes());
+            img[o + 16..o + 24].copy_from_slice(&addend.to_le_bytes());
+        }
+        (img, ia_off as u64)
+    }
+
+    #[test]
+    fn aarch64_et_dyn_parses_and_rejects_by_name() {
+        let (img, _) = elf_dyn_with_rela(ElfMachine::Aarch64, &[], &[]);
+        let parsed = parse(&img).expect("aarch64 ET_DYN parses");
+        assert_eq!(parsed.machine, ElfMachine::Aarch64);
+        assert_eq!(parsed.kind, ImageKind::Elf64Dyn);
+
+        // ELF32 (EI_CLASS=1): named rejection, not a generic parse failure.
+        let (mut elf32, _) = elf_dyn_with_rela(ElfMachine::Amd64, &[], &[]);
+        elf32[4] = 1;
+        let err = format!("{}", parse(&elf32).unwrap_err());
+        assert!(err.contains("ELF32"), "named ELF32 rejection, got {err}");
+
+        // Unknown e_machine (EM_ARM with ELFCLASS64): named rejection.
+        let (mut arm, _) = elf_dyn_with_rela(ElfMachine::Amd64, &[], &[]);
+        arm[18..20].copy_from_slice(&40u16.to_le_bytes());
+        let err = format!("{}", parse(&arm).unwrap_err());
+        assert!(err.contains("not AMD64"), "named machine rejection, got {err}");
+    }
+
+    #[test]
+    fn relr_and_android_packed_relocs_fail_closed() {
+        for tag in [36u64, 35, 37, 0x6000_000F, 0x6000_0010, 0x6000_0011, 0x6000_0012] {
+            let (img, _) = elf_dyn_with_rela(ElfMachine::Aarch64, &[], &[(tag, 0x2000)]);
+            let err = format!("{}", parse(&img).unwrap_err());
+            assert!(
+                err.contains("packed relocations") && err.contains("--pack-dyn-relocs=none"),
+                "tag {tag:#x} must name the packed-reloc refusal with a relink workaround, got {err}"
+            );
+            let (img, _) = elf_dyn_with_rela(ElfMachine::Amd64, &[], &[(tag, 0x2000)]);
+            assert!(parse(&img).is_err(), "x86 inputs refuse tag {tag:#x} too");
+        }
+    }
+
+    #[test]
+    fn aarch64_tlsle_text_reloc_rejected() {
+        for kind in [549u32, 550, 551] {
+            let (img, _) = elf_dyn_with_rela(ElfMachine::Aarch64, &[(0x300, kind, 0x10)], &[]);
+            let err = format!("{}", parse(&img).unwrap_err());
+            assert!(
+                err.contains("TLSLE"),
+                "TLSLE kind {kind} must be named, got {err}"
+            );
+        }
+        // x86 keeps its own TPOFF32 rejection and ignores arm64 numbers.
+        let (img, _) = elf_dyn_with_rela(ElfMachine::Amd64, &[(0x300, 23, 0x10)], &[]);
+        assert!(parse(&img).is_err());
+        let (img, _) = elf_dyn_with_rela(ElfMachine::Amd64, &[(0x300, 550, 0x10)], &[]);
+        assert!(parse(&img).is_ok(), "x86 census ignores arm64 TLSLE kinds");
+    }
+
+    #[test]
+    fn aarch64_census_ifunc_and_bootstrap_marker() {
+        // One of each: RELATIVE(1027), IRELATIVE(1032), TLS_TPREL64(1030),
+        // TLS_DTPMOD64(1028), TLS_DTPREL64(1029), GLOB_DAT(1025) —
+        // ie=1, ld=2, one resolver at 0x280.
+        let relas: Vec<(u64, u32, u64)> = vec![
+            (u64::MAX, 1027, 0x180),
+            (0x180, 1032, 0x280),
+            (0x188, 1030, 0),
+            (0x190, 1028, 0),
+            (0x198, 1029, 8),
+            (0x1a0, 1025, 0),
+        ];
+        let (img, _ia) = elf_dyn_with_rela(ElfMachine::Aarch64, &relas, &[]);
+        let parsed = parse(&img).unwrap();
+        assert_eq!(tls_reloc_census(&img, &parsed).unwrap(), (1, 2));
+        assert_eq!(ifunc_resolvers(&img, &parsed).unwrap(), vec![0x280]);
+        // packed marker: INIT_ARRAY[0] rides a 1027 whose addend sits inside
+        // the last R+X PT_LOAD (the whole file here).
+        assert_eq!(packed_bootstrap_target(&img, &parsed).unwrap(), Some(0x180));
+    }
+
+    #[test]
+    fn loader_metadata_ranges_cover_headers_rela_and_init_array() {
+        let (img, _ia) = elf_dyn_with_rela(ElfMachine::Amd64, &[(u64::MAX, 8, 0x300)], &[]);
+        let parsed = parse(&img).unwrap();
+        let ranges = loader_metadata_file_ranges(&img, &parsed).unwrap();
+        // ELF header + phdr table always carved.
+        assert!(ranges.contains(&(0usize, 64 + 2 * 56)), "header range: {ranges:?}");
+        // PT_DYNAMIC's own file range and the RELA table (va==off here)
+        // are carved with their exact sizes.
+        assert!(ranges.contains(&(176usize, 80usize)), "dynamic range: {ranges:?}");
+        assert!(ranges.contains(&(256usize, 24usize)), "rela range: {ranges:?}");
+    }
+
+    #[test]
+    fn x86_machine_field_flows() {
+        let (img, _) = elf_dyn_with_rela(ElfMachine::Amd64, &[(u64::MAX, 8, 0x100)], &[]);
+        let parsed = parse(&img).unwrap();
+        assert_eq!(parsed.machine, ElfMachine::Amd64);
+        assert_eq!(
+            packed_bootstrap_target(&img, &parsed).unwrap(),
+            Some(0x100),
+            "x86 keeps its R_X86_64_RELATIVE(8) bootstrap marker"
+        );
+    }
+
     /// Same shape as `elf_with_dynsym` but with no DT_HASH: forces the
     /// dynsym-extent fallback path with strtab > symtab removed by pointing
     /// DT_STRTAB *below* DT_SYMTAB.
@@ -899,7 +1417,7 @@ mod tests {
     }
 }
 
-/// If INIT_ARRAY[0] rides an R_X86_64_RELATIVE whose addend lands inside the
+/// If INIT_ARRAY[0] rides an R_<ARCH>_RELATIVE whose addend lands inside the
 /// last R+X PT_LOAD, that addend is the injected bootstrap stub — the packed
 /// marker for Xenolith ELF images.
 pub fn packed_bootstrap_target(bytes: &[u8], elf: &Elf64) -> Result<Option<u64>, FormatError> {
@@ -938,7 +1456,9 @@ pub fn packed_bootstrap_target(bytes: &[u8], elf: &Elf64) -> Result<Option<u64>,
         let o = rela_file + k * 24;
         let r_offset = read_u64(bytes, o)?;
         let info = read_u64(bytes, o + 8)?;
-        if r_offset == init_array_va && (info & 0xffff_ffff) as u32 == R_X86_64_RELATIVE_TYPE {
+        if r_offset == init_array_va
+            && (info & 0xffff_ffff) as u32 == elf.machine.relative_type()
+        {
             let addend = read_u64(bytes, o + 16)?;
             if addend >= last_rx.p_vaddr && addend < last_rx.p_vaddr + last_rx.p_memsz {
                 return Ok(Some(addend));
@@ -948,5 +1468,3 @@ pub fn packed_bootstrap_target(bytes: &[u8], elf: &Elf64) -> Result<Option<u64>,
     }
     Ok(None)
 }
-
-const R_X86_64_RELATIVE_TYPE: u32 = 8;

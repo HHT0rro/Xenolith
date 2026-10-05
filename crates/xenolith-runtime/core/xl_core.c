@@ -33,6 +33,14 @@ XL_NOINLINE void *memset(void *dst, int value, uint64_t n) {
 #define XL_PAGE_RW 0x04u
 #define XL_PAGE_RX 0x20u
 #define XL_PAGE_RWX 0x40u
+#define XL_PLATFORM_PE64 0u
+#define XL_PLATFORM_ELF64 1u
+#define XL_PLATFORM_ELF64_AARCH64 2u
+/* Maximum sealed-region plaintext/ciphertext length. Mirrors
+ * xenolith_protocol::XL_MAX_REGION (16384) — covers 16-KiB chunks on
+ * 16-KiB-page Android devices. The two constants must stay identical;
+ * every core-side length gate uses this, never a bare 4096. */
+#define XL_MAX_REGION 16384u
 #endif
 
 
@@ -59,6 +67,11 @@ typedef struct XlHostCtx {
     void *(*veh_remove)(void *); /* G5: RemoveVectoredExceptionHandler */
     xl_gmfn_fn get_module_file; /* module-path channel, NULL when unresolved */
     xl_llx_fn load_library_ex;  /* altered-search loader, NULL when unresolved */
+    /* ELF: load-relative VA of the phdr table to consult (the packed image's
+     * e_phoff is a FILE offset into the appended PT_LOAD — using it as a
+     * bias offset reads the inter-segment gap). 0 = fall back to e_phoff
+     * (PE never sets it). */
+    uint64_t phdr_va;
 } XlHostCtx;
 
 static void xl_copy(uint8_t *d, const uint8_t *s, uint32_t n) {
@@ -415,11 +428,15 @@ static uint32_t xl_final_protect(XlHostCtx *ctx, uint32_t rva) {
         return XL_PAGE_RX;
     }
     if (b[0] == 0x7f && b[1] == 'E' && b[2] == 'L' && b[3] == 'F') {
-        uint64_t phoff = rd64(b + 0x20);
+        /* Packed ELFs: e_phoff is a file offset whose bias-relative address
+         * lands in the appended PT_LOAD only by accident — the stub hands us
+         * the real table VA in ctx->phdr_va. Unpacked inputs (e.g. PE-path
+         * leftovers, host emulators) keep the e_phoff fallback. */
+        uint64_t phoff = ctx->phdr_va ? ctx->phdr_va : rd64(b + 0x20);
         uint16_t phentsize = rd16(b + 0x36), phnum = rd16(b + 0x38);
         const uint8_t *ph;
         if (phentsize < 56 || phnum > 64) return XL_PAGE_RX;
-        if (phoff == 0 || phoff + (uint64_t)phnum * phentsize > 0x40000) return XL_PAGE_RX;
+        if (phoff == 0 || phoff + (uint64_t)phnum * phentsize > 0x40000000u) return XL_PAGE_RX;
         for (i = 0; i < phnum; i++) {
             ph = b + phoff + (uint64_t)i * phentsize;
             if (rd32(ph) != 1) continue; /* PT_LOAD */
@@ -538,7 +555,7 @@ static int xl_reloc_scan(const uint8_t *env, uint32_t env_len,
         if (cur + 4 + 4 + 4 + 12 + 4 > env_len) return 0;
         cur += 4 + 4 + 4 + 12;
         ct_len = rd32(env + cur); cur += 4;
-        if (ct_len > 4096 || cur + ct_len + 16 > env_len) return 0;
+        if (ct_len > XL_MAX_REGION || cur + ct_len + 16 > env_len) return 0;
         cur += ct_len + 16;
     }
     if (cur + 4 > env_len) return 0;
@@ -769,7 +786,7 @@ static int xl_build_region_table(XlHostCtx *ctx, XlRegionTable *rt) {
         len = rd32(env + cur + 8);
         cur += 4 + 4 + 4 + 12;
         ct_len = rd32(env + cur); cur += 4;
-        if (ct_len > 4096 || len > 4096 || cur + ct_len + 16 > env_len) return 0;
+        if (ct_len > XL_MAX_REGION || len > XL_MAX_REGION || cur + ct_len + 16 > env_len) return 0;
         rt->st[i].rva = rva;
         rt->st[i].len = len;
         rt->st[i].index = index;
@@ -868,7 +885,7 @@ static int xl_region_seal(XlHostCtx *ctx, XlRegionTable *rt, uint32_t i) {
     uint32_t policy = rd32(env + xl_policy_off(env));
     uint32_t index = rd32(env + rec);
     uint8_t *page = ctx->image_base + rva;
-    uint8_t ct[4096];
+    uint8_t ct[XL_MAX_REGION];
     uint8_t tag[16];
     uint32_t old = 0, k;
     region_aad(aad, platform, profile, flags, index, rva, len, policy, rt->reloc_bytes);
@@ -1034,6 +1051,8 @@ int xl_core_activate(XlHostCtx *ctx) {
     if (gate == 0) return 1;
 
     platform = env[6];
+    if (platform != XL_PLATFORM_PE64 && platform != XL_PLATFORM_ELF64 &&
+        platform != XL_PLATFORM_ELF64_AARCH64) return 0; /* unknown platform: fail closed */
     profile = env[7];
     flags = rd32(env + 8);
     region_count = rd32(env + 12);
@@ -1061,7 +1080,10 @@ int xl_core_activate(XlHostCtx *ctx) {
      * same bounded pre-scan also recovers the ASLR delta from the loader's
      * fixups over the 0xCC page filler, and it MUST run before the decrypt
      * loop below overwrites those slots with their unrelocated plaintext. */
-    if (!xl_reloc_scan(env, env_len, ctx->image_base, platform != 1,
+    /* PE (platform 0) only: the 0xCC filler + DIR64 delta recovery. Both
+     * ELF platforms (1 = AMD64, 2 = AArch64/Android) leave ld.so's own
+     * relocations untouched — no delta to recover. */
+    if (!xl_reloc_scan(env, env_len, ctx->image_base, platform == XL_PLATFORM_PE64,
                        &reloc_bytes, &delta)) {
         return 0;
     }
@@ -1079,7 +1101,7 @@ int xl_core_activate(XlHostCtx *ctx) {
             len = rd32(env + cur); cur += 4;
             nonce = env + cur; cur += 12;
             ct_len = rd32(env + cur); cur += 4;
-            if (ct_len > 4096 || len > 4096 || cur + ct_len + 16 > env_len) return 0;
+            if (ct_len > XL_MAX_REGION || len > XL_MAX_REGION || cur + ct_len + 16 > env_len) return 0;
             ct = env + cur; cur += ct_len;
             tag = env + cur; cur += 16;
             region_aad(aad, platform, profile, flags, index, rva, len, policy, reloc_bytes);
@@ -1266,8 +1288,9 @@ int xl_core_activate(XlHostCtx *ctx) {
         cur += kc * 4;
     }
     if (gate >= 2) {
-        /* ELF: ld.so already applied RELATIVE. PE ImageBase parse is wrong here. */
-        if (platform == 1) {
+        /* ELF (1 = AMD64, 2 = AArch64): ld.so already applied RELATIVE.
+         * PE ImageBase parse is wrong here. */
+        if (platform == XL_PLATFORM_ELF64 || platform == XL_PLATFORM_ELF64_AARCH64) {
             uint32_t n;
             if (cur + 4 > env_len) return 0;
             n = rd32(env + cur);
