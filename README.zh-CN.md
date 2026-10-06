@@ -6,7 +6,7 @@
   <img src="assets/icon.png" width="220" alt="Xenolith 图标:可执行文件被封入合拢中的琥珀色装甲壳" />
 </p>
 
-开源原生代码加壳器:输入 Windows x86_64 PE64 或 Linux AMD64 ELF64 二进制,输出带认证加密信封与自举 stub 的受保护映像。不需要源码,不需要重编译。
+开源原生代码加壳器:输入 Windows x86_64 PE64、Linux AMD64 ELF64 二进制,或安卓 arm64/x86_64 ELF64 `.so`(实验性),输出带认证加密信封与自举 stub 的受保护映像。不需要源码,不需要重编译。
 
 Xenolith 最重要的设计决定是一个否定:**不做共享指令集虚拟机**。VMProtect 与 Themida 的路线是 "handler 表 + guest 字节码 + 中央分发器",[NoVmp](https://github.com/can1357/NoVmp) 已经证明这类结构可以在没有壳源码的前提下被静态提升为 IR。Xenolith 把"虚拟化"实现为一个打包期编译器:选定函数被提升为内部 IR,每个基本块编译成一份仅存在于本次构建的位置无关原生代码(superoperator),块间用直接 `jmp`/`jcc` 连接。镜像里没有 guest 字节码,没有可复用的 opcode 表,没有 `l_gloop` 式分发循环。代价是保护成本随函数的块数增长;收益是攻击者无法靠"学会一次 VM"把成本摊销到所有样本上——每次打包都是一个新程序。
 
@@ -42,7 +42,7 @@ cargo run --release -p xenolith-cli -- inspect target/release/license_toy.xl.dll
 
 | Crate | 职责 |
 | --- | --- |
-| `xenolith-formats` | fail-closed 的 PE64 + ELF64 AMD64 解析器 |
+| `xenolith-formats` | fail-closed 的 PE64 + ELF64(AMD64/AARCH64)解析器 |
 | `xenolith-crypto` | MBA 密钥分片、ChaCha20-Poly1305 AEAD、页 MAC、API 哈希 |
 | `xenolith-protocol` | EnvelopeV2(`XLV2`)磁盘布局、AAD 绑定、fail-closed 解析(拒绝旧 `NSEN`/`NSV2`) |
 | `xenolith-pack` | lift、superoperator 流水线、EnvelopeV2 写入、PIC boot stub 与 `xl_core` 嵌入 |
@@ -154,6 +154,10 @@ ZF = r11 移位后的某一位(seed 决定)
 ### 6. ELF 路线
 
 Linux 打包不接管加载器:追加一个 R+X `PT_LOAD`(迁移后的 PHDR 表 + PIC stub + `xl_core` + EnvelopeV2),把 `INIT_ARRAY[0]` 重定向到 stub;`ld.so` 照常完成重定位与符号解析,PIE/RELRO/GOT-PLT 不动。可执行 `PT_LOAD` 的文件字节 `0x90` 填充后密封进信封。已在 WSL Ubuntu 24.04 验证:打包后的 `hello-elf` 正常输出,`libhello-elf.so` 可 `dlopen`/`dlclose`;IFUNC resolver 保持原生并支持,符号版本(`DT_VERNEED/VERDEF`)保留且 `dlvsym` 验证通过。IFUNC 导入、TLS 描述符、local-exec TPOFF32、copy 重定位、`PT_TLS`、静态链接 fail closed 直到 stage 5。ELF 符号选择本版本只报告,同样要求 `--allow-native-fallback`。
+
+**安卓路线(实验性)**:同一策略打包安卓 arm64(EM_AARCH64)与 x86_64 ELF64 `.so`——手写定宽编码的 AArch64 stub 加 NDK 编译的 aarch64 `xl_core`,页尺寸从输入推导(4-KiB 与 16-KiB 设备一等公民)。CLI 面不变:`pack`/`inspect`、profiles、`--json` 报告同构(仅新增 `machine` 字段);不支持的输入(ELF32/armeabi-v7a、`PT_INTERP`、`p_align`>16K、RELR/packed 重定位、aarch64 上 `DT_INIT`+`DT_INIT_ARRAY` 并存)一律具名报错。安卓强度:两种机器都有页级 AEAD 密封;**仅 arm64** 另有首批指令白名单的 `--vm-export`(整数/访存/分支类提升到 64 位 IR、逐块再生成 AArch64 superoperator;白名单之外——调用、SIMD/FP、原子、PAC、乘法、位段等——一律具名报错,绝不静默近似)与 bionic 反调试探针集(TracerPid 扫描、`PTRACE_TRACEME` 自附加、`/proc/self/maps` 标记扫描;按 profile 装配,`max`=三个全开,其余 profile=两个,x86_64-ELF=无并如实报告)。x86_64-ELF 的函数选择保持 fail closed(SysV x86-64 lift 属后续阶段)。
+
+装机状态(模拟器,Android 14 x86_64 + `ndk_translation`):真实 arm64 应用库(SimpleX `libsupport.so`,14.6 MB→19.2 MB)走完打包→回填 APK→对齐→签名→安装→启动(含 force-stop 重启)全流程,进程存活、库已映射、logcat 干净;合成 x86_64 `.so` 通过同一 `dlopen`/`dlsym` 检查。合成端到端门(`/data/local/tmp/xl-e2e/run_e2e.sh`,重建产物):x86_64 打包映像通过硬门——构造函数经 stub 转发,`xl_add`/`xl_mul` 与原生基线 9 组用例全对;arm64 4-KiB 映像经 `ndk_translation` 通过同一检查(观测 16/16);用 `--vm-export xl_add` 打包的 arm64 映像(导出已虚拟化进 stub superoperator)同样经转译 9 组全对,而 `--vm-export xl_mul` 被白名单具名拒绝(乘法保持原生)。arm64 16-KiB 映像仅在装载偏移恰好 16-KiB 同余时通过转译(约 1/4 概率;vprotect shim 按信封页尺寸对齐,而该 4-KiB 内核模拟器只保证 4K 同余)。上述 max-profile 映像中反调试探针已全副武装,在干净装载器下无误报;真实调试器附加下的检出与真机均未验证。仍有一类输入未修复:ELF 头表中不带 `PT_PHDR` 条目的库(如 PPSSPP 1.19.3 的 `libppsspp_jni.so`)能打包成功,但装载器拒绝装载(`loaded phdr … not in loadable segment`)——打包把 `e_phoff` 迁入了附加 `PT_LOAD`;打包器对该类输入尚未 fail closed。另有一个边角:输入可执行段小于一个推导页时密封页数为 0,输入构造函数会被静默跳过。修复前安卓装载支持按实验对待;真机矩阵未验证。
 
 ### 7. 工程面
 
@@ -272,6 +276,8 @@ cargo test --workspace --exclude xenolith-runtime
 ```
 
 `xenolith-runtime` 被排除是因为它是 `no_std` `#[panic_handler]` crate:workspace 级 feature unification 会把 `std` 链接进去(E0152)。排除不等于验证了它。打包测试需要 `target/release/hello_dll.dll` 与 `target/release/license_toy.dll`——先构建样例;缺样例算测试失败,不是跳过。
+
+安卓 arm64 打包还要求构建 CLI 时存在 NDK(`ANDROID_NDK_HOME`,或 `ANDROID_NDK_ROOT`/`ANDROID_HOME`;CI 在 `.github/workflows/android.yml` 里接线):缺失时构建出的 CLI 对 arm64 输入具名拒绝,不产出坏产物。
 
 分发用可执行文件:
 

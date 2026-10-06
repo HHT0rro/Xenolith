@@ -188,12 +188,30 @@ The first production version, if and only if G0–G8 in the architecture plan pa
 | Architecture | Default remains per-function / per-region unique superoperator native code. A shared bytecode table plus central dispatcher is forbidden as the default product. |
 
 ARM32/ELF32 and macOS are **not** completion criteria for this version. Android
-support covers ELF64 `.so` packing (arm64 + x86_64) at the structural layer:
-CLI pack/inspect, protocol platform byte 2, page-size-parameterized sealing and
-readelf-level artifact assertions. Android OS-load (emulator + real device),
-per-function virtualization (`--vm-export` stays fail-closed on ELF) and
-anti-debug probes (guard stays an empty set) are **not** claimed — Android
-strength is page-level AEAD sealing, no more.
+support covers ELF64 `.so` packing (arm64 + x86_64): CLI pack/inspect, protocol
+platform byte 2, page-size-parameterized sealing and readelf-level artifact
+assertions. Anti-debug probes exist on **aarch64 only**: TracerPid scan,
+`PTRACE_TRACEME` self-attach and `/proc/self/maps` marker scan, executed in the
+freestanding core before any AEAD open and armed per profile through a
+pack-time probe bitmap (`max` = all three; other profiles = TracerPid +
+self-attach; x86_64-ELF = none, reported as an empty `probes` list with an
+aarch64-only note). Probe status on a real loader: max-profile images with all
+three probes armed load cleanly through the emulator's bionic loader
+(ndk_translation, arm64 4-KiB gate, 16/16 + rerun) — no false-positive
+fail-close under a clean loader; detection of an actually attached debugger
+and any real-device run are **not yet verified**. Per-function virtualization
+exists on **aarch64 only**, as a first-batch instruction whitelist (integer
+add/sub/logic, shifts, movz/movk, loads/stores incl. pairs, adr/adrp,
+b/b.cond/cbz/tbz, ret) lifted to the 64-bit IR and re-emitted as per-block
+AArch64 superoperators; anything outside the whitelist — calls (`bl`),
+SIMD/FP, atomics, PAC, multiply, bitfields and more — is a named pack error,
+never a silent approximation. Verified on the emulator through ndk_translation
+with a virtualized leaf export (`xl_add`) matching the native baseline over
+the 9-case diff; broader function shapes and real devices are unverified.
+x86_64-ELF selection stays fail-closed (the SysV x86-64 lift is a later
+stage). Known limitation: a debugger that spawned the process itself is
+indistinguishable from the self-attach residue (TracerPid == getppid()) and
+passes by design.
 
 ## Fail-closed rules
 

@@ -72,6 +72,14 @@ typedef struct XlHostCtx {
      * bias offset reads the inter-segment gap). 0 = fall back to e_phoff
      * (PE never sets it). */
     uint64_t phdr_va;
+    /* Android/bionic anti-debug probe bitmap (plan WS-A §2.2.3). Pack-time
+     * constant from xenolith_guard::android_probe_mask, encoded into the
+     * aarch64 stub as a movz machine-code constant and stored here at
+     * offset 128. PE and x86-64-ELF stubs write an explicit 0. Consumed
+     * only on the aarch64 path as XL_PROBE_BIT_* (platform-local bits,
+     * NOT global probe ids 17+). The trailing pad keeps sizeof at 136. */
+    uint32_t probe_mask;
+    uint32_t _pad2;
 } XlHostCtx;
 
 static void xl_copy(uint8_t *d, const uint8_t *s, uint32_t n) {
@@ -759,6 +767,223 @@ static uint32_t xl_policy_off(const uint8_t *env) {
     return cur;                            /* policy u32 lives here */
 }
 
+#if defined(__aarch64__)
+/* ---- Android/bionic anti-debug probes (plan WS-A §2.2.2) ---------------
+ * Compiled only into the NDK-built aarch64 core. The host/CI x86-64 core
+ * is MSVC/gcc-built (no inline svc wrappers there; see the architecture
+ * scoping decision in plan §2.2.2) and this whole block is preprocessed
+ * out. Everything below is:
+ *   - freestanding: raw Linux aarch64 syscalls (svc #0), no libc, no new
+ *     host-API surface through XlHostCtx;
+ *   - stateless: no statics, no globals, no .xlg writes — every activation
+ *     runs from zero (review 3-1), so a dlopen/dlclose soak never depends
+ *     on storage that a remap would reset;
+ *   - stack-only: paths/markers are built byte-wise (the core contract
+ *     forbids string literals and static storage).
+ * Probe bits are PLATFORM-LOCAL (bit i = android_probes()[i] on the pack
+ * side), deliberately not the global probe ids 17+: ids ≥17 cannot fit a
+ * single stub movz imm16 (review 3-3).
+ */
+#define XL_PROBE_BIT_TRACERPID   0x1u
+#define XL_PROBE_BIT_PTRACE_SELF 0x2u
+#define XL_PROBE_BIT_MAPS        0x4u
+
+/* aarch64 generic syscall numbers (asm-generic/unistd.h). */
+#define XL_SYS_OPENAT   56
+#define XL_SYS_CLOSE    57
+#define XL_SYS_READ     63
+#define XL_SYS_PTRACE  117
+#define XL_SYS_GETPPID 172
+
+/* Raw 3-arg syscall. Linux aarch64 returns -errno (negative long) on
+ * failure; only x0 is clobbered. musl-style register bindings. */
+static long xl_sys3(long nr, long a, long b, long c) {
+    register long x8 __asm__("x8") = nr;
+    register long x0 __asm__("x0") = a;
+    register long x1 __asm__("x1") = b;
+    register long x2 __asm__("x2") = c;
+    __asm__ __volatile__ ("svc #0"
+                          : "=r"(x0)
+                          : "r"(x8), "0"(x0), "r"(x1), "r"(x2)
+                          : "memory", "cc");
+    return x0;
+}
+
+static long xl_open_readonly(const char *path) {
+    /* openat(AT_FDCWD, path, O_RDONLY) */
+    return xl_sys3(XL_SYS_OPENAT, -100L, (long)(uintptr_t)path, 0L);
+}
+
+/* Three-way TracerPid verdict — mirrors xenolith_guard::classify_tracerpid
+ * (the Rust reference semantics; this copy is the one that executes).
+ * Review 3-2: shared by both Tracer probes so the self-attach residue
+ * (TracerPid == getppid()) never cross-fires. */
+#define XL_TRACER_NONE       0
+#define XL_TRACER_BENIGN_SELF 1
+#define XL_TRACER_HIT        2
+
+static int xl_classify_tracerpid(uint32_t tracer_pid, uint32_t ppid) {
+    if (tracer_pid == 0) return XL_TRACER_NONE;
+    if (tracer_pid == ppid) return XL_TRACER_BENIGN_SELF;
+    return XL_TRACER_HIT;
+}
+
+/* Parse the TracerPid value out of /proc/self/status. Returns 1 and sets
+ * *out on success; 0 when the file cannot be read far enough to contain a
+ * parseable TracerPid line (fail closed — the caller treats 0 as a
+ * refusal). The status blob sits well inside 4 KiB on every Android
+ * release to date; reads accumulate into one buffer until EOF or full. */
+static int xl_read_status_tracer_pid(uint32_t *out) {
+    char path[18];
+    uint8_t buf[4096];
+    long fd, n;
+    uint32_t have = 0, i;
+    /* "/proc/self/status" is 17 chars + NUL: the buffer is 18 so openat
+     * gets a terminated C string (no over-read into stack garbage). */
+    path[0]='/'; path[1]='p'; path[2]='r'; path[3]='o'; path[4]='c';
+    path[5]='/'; path[6]='s'; path[7]='e'; path[8]='l'; path[9]='f';
+    path[10]='/'; path[11]='s'; path[12]='t'; path[13]='a'; path[14]='t';
+    path[15]='u'; path[16]='s'; path[17]=0;
+    fd = xl_open_readonly(path);
+    if (fd < 0) return 0;
+    while (have < sizeof(buf)) {
+        n = xl_sys3(XL_SYS_READ, fd, (long)(uintptr_t)&buf[have],
+                    (long)(sizeof(buf) - have));
+        if (n < 0) { xl_sys3(XL_SYS_CLOSE, fd, 0, 0); return 0; }
+        if (n == 0) break;
+        have += (uint32_t)n;
+    }
+    xl_sys3(XL_SYS_CLOSE, fd, 0, 0);
+    /* Find "TracerPid:" then the following decimal. Bounded by have-1 so
+     * the k+10 lookahead never reads uninitialized stack bytes. */
+    for (i = 0; i + 10 < have; i++) {
+        if (buf[i]   == 'T' && buf[i+1] == 'r' && buf[i+2] == 'a' &&
+            buf[i+3] == 'c' && buf[i+4] == 'e' && buf[i+5] == 'r' &&
+            buf[i+6] == 'P' && buf[i+7] == 'i' && buf[i+8] == 'd' &&
+            buf[i+9] == ':') {
+            uint32_t k = i + 10, v = 0, digits = 0;
+            while (k < have && (buf[k] == ' ' || buf[k] == '\t')) k++;
+            while (k < have && buf[k] >= '0' && buf[k] <= '9') {
+                v = v * 10u + (uint32_t)(buf[k] - '0');
+                digits++;
+                k++;
+                if (digits > 10) return 0; /* refuse absurd values */
+            }
+            if (digits == 0) return 0;
+            *out = v;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Case-insensitive ASCII lowercase. */
+static uint8_t xl_lc(uint8_t c) {
+    return (uint8_t)((c >= 'A' && c <= 'Z') ? c + 0x20 : c);
+}
+
+/* Scan /proc/self/maps for analysis-module markers. The needle table is
+ * built byte-wise on the stack (the core contract forbids static storage
+ * and string literals: .rodata would be dropped by the image extractor).
+ * Reads flow through a window that carries the previous chunk's tail so
+ * markers spanning a 4 KiB boundary still match. Total scan is capped at
+ * 4 MiB (a maps blob that large is already pathological; the cap bounds
+ * time under adversarial mapping storms). Returns 1 on a marker hit, 0 on
+ * clean, -1 on unreadable maps (caller fails closed on nonzero). */
+static int xl_maps_contains_marker(void) {
+    char path[16];
+    uint8_t mk[4][11];
+    uint8_t mlen[4];
+    uint8_t win[4096 + 16];
+    long fd, n;
+    uint32_t carry = 0, total = 0, w, m, k, i;
+    /* "/proc/self/maps" is 15 chars + NUL. */
+    path[0]='/'; path[1]='p'; path[2]='r'; path[3]='o'; path[4]='c';
+    path[5]='/'; path[6]='s'; path[7]='e'; path[8]='l'; path[9]='f';
+    path[10]='/'; path[11]='m'; path[12]='a'; path[13]='p'; path[14]='s';
+    path[15]=0;
+    /* "frida" */
+    mk[0][0]='f'; mk[0][1]='r'; mk[0][2]='i'; mk[0][3]='d'; mk[0][4]='a';
+    /* "xposed" */
+    mk[1][0]='x'; mk[1][1]='p'; mk[1][2]='o'; mk[1][3]='s'; mk[1][4]='e';
+    mk[1][5]='d';
+    /* "substrate" */
+    mk[2][0]='s'; mk[2][1]='u'; mk[2][2]='b'; mk[2][3]='s'; mk[2][4]='t';
+    mk[2][5]='r'; mk[2][6]='a'; mk[2][7]='t'; mk[2][8]='e';
+    /* "dlopen-hook" */
+    mk[3][0]='d'; mk[3][1]='l'; mk[3][2]='o'; mk[3][3]='p'; mk[3][4]='e';
+    mk[3][5]='n'; mk[3][6]='-'; mk[3][7]='h'; mk[3][8]='o'; mk[3][9]='o';
+    mk[3][10]='k';
+    mlen[0]=5; mlen[1]=6; mlen[2]=9; mlen[3]=11;
+    fd = xl_open_readonly(path);
+    if (fd < 0) return -1;
+    for (;;) {
+        n = xl_sys3(XL_SYS_READ, fd, (long)(uintptr_t)&win[carry],
+                    (long)(sizeof(win) - carry));
+        if (n < 0) { xl_sys3(XL_SYS_CLOSE, fd, 0, 0); return -1; }
+        if (n == 0) break;
+        total += (uint32_t)n;
+        if (total > 4u * 1024u * 1024u) {
+            xl_sys3(XL_SYS_CLOSE, fd, 0, 0);
+            return -1; /* unbounded maps: treat as tamper, fail closed */
+        }
+        w = carry + (uint32_t)n;
+        for (m = 0; m < 4; m++) {
+            uint32_t last;
+            if (w < mlen[m]) continue; /* short window: no full match fits */
+            last = w - mlen[m];
+            for (k = 0; k <= last; k++) {
+                int hit = 1;
+                for (i = 0; i < mlen[m]; i++) {
+                    if (xl_lc(win[k + i]) != mk[m][i]) { hit = 0; break; }
+                }
+                if (hit) { xl_sys3(XL_SYS_CLOSE, fd, 0, 0); return 1; }
+            }
+        }
+        /* Carry the max-marker-minus-1 tail into the next round. */
+        carry = 10;
+        if (w < carry) carry = w;
+        for (k = 0; k < carry; k++) win[k] = win[w - carry + k];
+    }
+    xl_sys3(XL_SYS_CLOSE, fd, 0, 0);
+    return 0;
+}
+
+/* Run the enabled probes. Returns 1 = proceed, 0 = fail closed (the
+ * activation returns 0 and the image refuses to unpack — same contract as
+ * the Windows stub's STAGE_DEBUGGER path). A zero mask means the packer
+ * explicitly shipped no probes (only reachable by a deliberate custom
+ * build; the packer's profile defaults always arm at least the two core
+ * debugger checks) and passes. */
+static int xl_android_guard(uint32_t probe_mask) {
+    uint32_t ppid, tp;
+    if (probe_mask == 0) return 1;
+    ppid = (uint32_t)xl_sys3(XL_SYS_GETPPID, 0, 0, 0);
+    if (probe_mask & XL_PROBE_BIT_TRACERPID) {
+        if (!xl_read_status_tracer_pid(&tp)) return 0;
+        if (xl_classify_tracerpid(tp, ppid) == XL_TRACER_HIT) return 0;
+    }
+    if (probe_mask & XL_PROBE_BIT_PTRACE_SELF) {
+        long rc = xl_sys3(XL_SYS_PTRACE, 0 /* PTRACE_TRACEME */, 0, 0);
+        if (rc != 0) {
+            /* TRACEME refused: either policy denied it (Yama/SELinux on
+             * some contexts — TracerPid stays 0, NOT a hit) or someone
+             * else already holds the tracer slot (TracerPid != 0 and !=
+             * ppid → hit). classify() resolves the trichotomy. */
+            if (!xl_read_status_tracer_pid(&tp)) return 0;
+            if (xl_classify_tracerpid(tp, ppid) == XL_TRACER_HIT) return 0;
+        }
+        /* Success: the parent now occupies the tracer slot; later external
+         * PTRACE_ATTACH is refused by the kernel. Residue on re-activation
+         * is BenignSelf by construction (classify above). */
+    }
+    if (probe_mask & XL_PROBE_BIT_MAPS) {
+        if (xl_maps_contains_marker() != 0) return 0;
+    }
+    return 1;
+}
+#endif /* __aarch64__ */
+
 #if defined(_MSC_VER)
 #pragma optimize("", off)
 #else
@@ -1053,6 +1278,16 @@ int xl_core_activate(XlHostCtx *ctx) {
     platform = env[6];
     if (platform != XL_PLATFORM_PE64 && platform != XL_PLATFORM_ELF64 &&
         platform != XL_PLATFORM_ELF64_AARCH64) return 0; /* unknown platform: fail closed */
+#if defined(__aarch64__)
+    /* Android guard: probes run after the platform gate and BEFORE any
+     * AEAD open (plan WS-A §2.2.2) — mirroring the Windows stub, which
+     * runs its debugger checks before xl_core_activate is ever reached.
+     * A fired probe (or an unreadable /proc) fails the whole activation;
+     * there is no logging channel and no partial-unpack fallback. */
+    if (platform == XL_PLATFORM_ELF64_AARCH64) {
+        if (!xl_android_guard(ctx->probe_mask)) return 0;
+    }
+#endif
     profile = env[7];
     flags = rd32(env + 8);
     region_count = rd32(env + 12);

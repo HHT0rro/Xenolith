@@ -4,12 +4,16 @@
 //! dumped handler table from another pack does not lift.
 
 pub mod abi;
+pub mod aarch64_asm;
+pub mod aarch64_decode;
+pub mod ir64;
 mod guest;
 pub mod ir;
 pub mod mba;
 pub mod regalloc;
 pub mod semantics;
 pub mod superop;
+pub mod superop_aarch64;
 
 pub use abi::Abi;
 pub use guest::{run_guest, GuestMap, GuestOp, GuestProgram, GPR_COUNT, MAX_GUEST_CODE};

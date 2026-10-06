@@ -26,6 +26,8 @@
 //! rewrite drops DT_INIT — silently discarding a real DT_INIT function is a
 //! semantic change, so the input shape is refused instead).
 
+use crate::lift::forbidden_vm_rule;
+use crate::lift_aarch64::{lift_function_aarch64, LiftedExport64};
 use crate::runtime_image::{self, CoreArch};
 use crate::stub::{emit_elf_stub, META_ENVELOPE_LEN, META_MEASUREMENT, META_ORIGINAL_ENTRY,
     META_PAGE_SIZE, META_PAYLOAD_RVA, META_SELF_RVA, META_TABLE_RVA, META_UNPACKED,
@@ -38,11 +40,13 @@ use xenolith_crypto::{
 use xenolith_formats::{
     align_up, elf, elf::ElfMachine, write_u64, classify, ImageKind,
 };
-use xenolith_loader::{section_name_from_seed, PackedImage, PageRecord};
+use xenolith_loader::{section_name_from_seed, PackedImage, PageRecord, Profile};
 use xenolith_protocol::{
     encode as encode_v2, seal_region, EnvelopeV2, PLATFORM_ELF64, PLATFORM_ELF64_AARCH64,
     POLICY_STRICT,
 };
+use xenolith_guard::{android_probe_mask, android_probes_for_profile, probe_name, Probe};
+use xenolith_vm::superop_aarch64::{emit_superop_aarch64, SuperopAarch64Options};
 use xenolith_vm::{OpcodeMap, Program};
 
 pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
@@ -140,20 +144,139 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
         }
         v
     };
-    if !request.vm_exports.is_empty() || !request.select_rva.is_empty() {
+    let selection_requested = !request.select_functions.is_empty() || request.select_all
+        || !request.vm_exports.is_empty()
+        || !request.select_rva.is_empty();
+
+    // ---- function selection gate (vm-aarch64 design §8.2) ----
+    // aarch64 runs the new whitelist lift pipeline; x86-64 ELF keeps the
+    // named SysV-lift rejection. PE behavior is untouched (different path).
+    let mut vm64: Vec<LiftedExport64> = Vec::new();
+    // Derived ONCE per request (see the sizing-pass comment below for why).
+    let opcode_seed_once = opcode_seed_for(request);
+    let mut vm_coverage: Vec<crate::FunctionCoverageRecord> = Vec::new();
+    let mut vm_selected: Vec<String> = Vec::new();
+    let mut vm_thunk_words: Vec<Vec<u32>> = Vec::new();
+    // The hooked working buffer: every later stage (page sealing, 0x90 fill,
+    // output assembly) reads this so hook bytes travel inside the sealed
+    // pages (design §5.4 — seal reads the patched buffer).
+    let mut working = request.input.to_vec();
+    if machine == ElfMachine::Aarch64 {
+        if !request.vm_exports.is_empty() && request.profile == Profile::Fast {
+            return Err(PackError::Invalid("vm-export requires standard or max"));
+        }
+        if selection_requested {
+            let selected =
+                resolve_elf_selection(request, request.input, &parsed, &resolvers)?;
+            for func in selected {
+                vm_selected.push(func.name.clone());
+                match lift_function_aarch64(
+                    &parsed,
+                    request.input,
+                    &func.name,
+                    func.rva,
+                    func.len,
+                    &resolvers,
+                ) {
+                    Ok(f) => {
+                        vm_coverage.push(crate::FunctionCoverageRecord {
+                            name: func.name.clone(),
+                            rva: func.rva,
+                            len: func.len,
+                            source: func.source,
+                            bucket: "transformed".into(),
+                            reason: String::new(),
+                        });
+                        vm64.push(f);
+                    }
+                    Err(e) if request.allow_native_fallback && !request.strict_coverage => {
+                        vm_coverage.push(crate::FunctionCoverageRecord {
+                            name: func.name.clone(),
+                            rva: func.rva,
+                            len: func.len,
+                            source: func.source,
+                            bucket: if e.0.contains("boundary")
+                                || e.0.contains("out of lift window")
+                                || e.0.contains("lift cap")
+                            {
+                                "boundary_uncertain".into()
+                            } else {
+                                "mixed_native".into()
+                            },
+                            reason: e.0.clone(),
+                        });
+                    }
+                    Err(e) => return Err(PackError::Lift(e.0)),
+                }
+            }
+            if request.strict_coverage {
+                let failed: Vec<&crate::FunctionCoverageRecord> = vm_coverage
+                    .iter()
+                    .filter(|r| r.bucket != "transformed")
+                    .collect();
+                if !failed.is_empty() {
+                    let detail = failed
+                        .iter()
+                        .map(|r| {
+                            format!(
+                                "  {} (rva {:#x}, {}): {}",
+                                r.name,
+                                r.rva,
+                                r.bucket,
+                                r.reason.lines().next().unwrap_or("unknown reason")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Err(PackError::Lift(format!(
+                        "strict coverage: {} selected function(s) did not fully transform \
+                         (drop --strict-coverage, use --allow-native-fallback, or pick \
+                         functions the lifter supports):\n{detail}",
+                        failed.len()
+                    )));
+                }
+            }
+            // Inner-label reference scans (design §5.2) run before hooking.
+            let windows: Vec<(u32, usize)> =
+                vm64.iter().map(|f| (f.rva, f.native_len)).collect();
+            scan_inner_label_refs(request.input, &parsed, &rx, &windows)?;
+            // Sizing pass: thunk word counts are rva-independent (the bias
+            // constant materialization is fixed-width), so rva=0 output
+            // sizes the layout deterministically. The seed is derived ONCE
+            // per request: opcode_seed_for() draws from the crypto RNG when
+            // --seed-hex is absent, so per-call derivation gave the sizing
+            // and real passes different register allocations (and word
+            // counts) -- the "changed size" packer error.
+            for (i, f) in vm64.iter().enumerate() {
+                let mut seed = opcode_seed_once;
+                seed[0] ^= (i as u8).wrapping_add(1);
+                let words = emit_superop_aarch64(
+                    &f.ir,
+                    &seed,
+                    &SuperopAarch64Options { thunk_rva: 0 },
+                )
+                .map_err(|e| {
+                    PackError::Stub(format!(
+                        "vm {} (rva {:#x}): {e}",
+                        f.name, f.rva
+                    ))
+                })?;
+                vm_thunk_words.push(words);
+            }
+        }
+    } else if !request.vm_exports.is_empty() || !request.select_rva.is_empty() {
         return Err(PackError::Invalid(
-            "ELF function selection requires the SysV lift (stage 5); fail-closed here",
+            "ELF x86-64 function selection requires the SysV x86-64 lift (stage 5); \
+             fail-closed here",
         ));
-    }
-    if request.strict_coverage {
+    } else if request.strict_coverage {
         return Err(PackError::Invalid(
-            "strict coverage has no selected functions on ELF in this release",
+            "strict coverage has no selected functions on x86-64 ELF in this release",
         ));
-    }
-    let selection_requested = !request.select_functions.is_empty() || request.select_all;
-    if selection_requested && !request.allow_native_fallback {
+    } else if selection_requested && !request.allow_native_fallback {
         return Err(PackError::Invalid(
-            "ELF symbol selection requires --allow-native-fallback until the SysV lift lands",
+            "ELF x86-64 symbol selection requires --allow-native-fallback until the SysV \
+             x86-64 lift lands",
         ));
     }
     fail_closed_on_relative_into_rx(request.input, &parsed, &rx)?;
@@ -164,6 +287,18 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
     let mba = MbaKeyShare::split(&secret, &opcode_seed);
     let map = OpcodeMap::from_seed(&opcode_seed);
     let program = Program::encode_key_mix(map, &mba);
+
+    // ---- Android anti-debug probe policy (plan WS-A 2.2.3) ----
+    // aarch64: profile-defaulted Android set (Max = all three; otherwise the
+    // two core debugger checks), mirroring the PE probe policy
+    // (lib.rs probe selection). x86-64-ELF: none -- probes are aarch64-only
+    // in this release and the report says so explicitly (no fake
+    // pass-through of the Windows claim).
+    let android_probes: Vec<Probe> = match machine {
+        ElfMachine::Aarch64 => android_probes_for_profile(request.profile == Profile::Max),
+        ElfMachine::Amd64 => Vec::new(),
+    };
+    let probe_mask = android_probe_mask(&android_probes);
 
     // ---- core object + stub emitter dispatch (A-1/A-4) ----
     let stub = match machine {
@@ -176,7 +311,90 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
         ElfMachine::Aarch64 => {
             let core_img = runtime_image::load_builtin(CoreArch::Aarch64)
                 .map_err(|e| PackError::Runtime(e.to_string()))?;
-            emit_elf_stub_aarch64(&core_img.text, core_img.entry_off).map_err(PackError::Stub)?
+            if vm_thunk_words.is_empty() {
+                emit_elf_stub_aarch64(&core_img.text, core_img.entry_off, probe_mask, &[])
+                    .map_err(PackError::Stub)?
+            } else {
+                // Layout arithmetic mirrored from below (input-only inputs):
+                // the appended LOAD starts at load_vaddr; the stub's code
+                // starts after the relocated PHDR table.
+                let max_va_end = elf::max_load_vaddr_end(request.input, &parsed)
+                    .map_err(PackError::Format)?;
+                let load_vaddr = align_up(max_va_end as u32, page_size) as u64;
+                let table_len =
+                    (parsed.phnum as usize + 2) * parsed.phentsize as usize;
+                let stub_vaddr = load_vaddr + table_len as u64;
+                // Sizing emission gives the in-stub guest offsets.
+                let sized = emit_elf_stub_aarch64(
+                    &core_img.text,
+                    core_img.entry_off,
+                    probe_mask,
+                    &vm_thunk_words,
+                )
+                .map_err(PackError::Stub)?;
+                // Real pass: re-emit every thunk at its true RVA (word counts
+                // are rva-independent by construction).
+                for (i, f) in vm64.iter().enumerate() {
+                    let thunk_rva =
+                        stub_vaddr + sized.guest_thunk_offs[i] as u64;
+                    let mut seed = opcode_seed_once;
+                    seed[0] ^= (i as u8).wrapping_add(1);
+                    let words = emit_superop_aarch64(
+                        &f.ir,
+                        &seed,
+                        &SuperopAarch64Options {
+                            thunk_rva: thunk_rva as u32,
+                        },
+                    )
+                    .map_err(|e| {
+                        PackError::Stub(format!(
+                            "vm {} (rva {:#x}): {e}",
+                            f.name, f.rva
+                        ))
+                    })?;
+                    if words.len() != vm_thunk_words[i].len() {
+                        return Err(PackError::Stub(format!(
+                            "guest thunk {} changed size between the sizing and real \
+                             emission passes ({} vs {} words) — packer bug; report with \
+                             the input image",
+                            f.name,
+                            vm_thunk_words[i].len(),
+                            words.len()
+                        )));
+                    }
+                    vm_thunk_words[i] = words;
+                }
+                let stub = emit_elf_stub_aarch64(
+                    &core_img.text,
+                    core_img.entry_off,
+                    probe_mask,
+                    &vm_thunk_words,
+                )
+                .map_err(PackError::Stub)?;
+                // Hook the selected entries into the working buffer (§5.3):
+                // 4-byte `b rel26` + brk fill, before page extraction below.
+                for (i, f) in vm64.iter().enumerate() {
+                    let target = stub_vaddr + stub.guest_thunk_offs[i] as u64;
+                    apply_vm_hook_elf(
+                        &mut working,
+                        &parsed,
+                        request.input,
+                        &f.name,
+                        f.rva,
+                        f.native_len,
+                        target,
+                    )?;
+                }
+                if vm64.len() != stub.guest_thunk_offs.len() {
+                    return Err(PackError::Stub(format!(
+                        "guest thunk count mismatch: {} lifted functions but the stub \
+                         emitted {} thunks (packer bug; report with the input image)",
+                        vm64.len(),
+                        stub.guest_thunk_offs.len()
+                    )));
+                }
+                stub
+            }
         }
     };
 
@@ -201,7 +419,7 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
             pages.push((
                 page_index,
                 (va + o as u64) as u32,
-                request.input[off + o..off + o + chunk].to_vec(),
+                working[off + o..off + o + chunk].to_vec(),
                 random_nonce12(),
             ));
             page_files.push((off + o, chunk));
@@ -324,7 +542,7 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
         elf::max_load_vaddr_end(request.input, &parsed).map_err(PackError::Format)?;
     let load_vaddr = align_up(max_va_end as u32, page_size) as u64;
 
-    let mut image = request.input.to_vec();
+    let mut image = working;
     image.resize(new_phoff, 0);
     image.resize(new_phoff + table_len, 0);
     let phdrs =
@@ -520,11 +738,13 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
         imports: Vec::new(),
         exports: Vec::new(),
         pages: records,
-        probes: Vec::new(),
+        probes: android_probes.clone(),
         program,
     };
 
-    let coverage = if selection_requested {
+    let coverage = if machine == ElfMachine::Aarch64 && selection_requested {
+        vm_coverage
+    } else if selection_requested {
         let wanted: std::collections::BTreeSet<&str> =
             request.select_functions.iter().map(String::as_str).collect();
         elf::symtab_functions(request.input, &parsed)
@@ -544,7 +764,11 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
     } else {
         Vec::new()
     };
-    let selected_functions = coverage.iter().map(|c| c.name.clone()).collect();
+    let selected_functions = if machine == ElfMachine::Aarch64 && selection_requested {
+        vm_selected
+    } else {
+        coverage.iter().map(|c| c.name.clone()).collect()
+    };
     let report = crate::PackReport {
         report_version: PACK_REPORT_VERSION,
         profile: request.profile.as_str().to_string(),
@@ -562,6 +786,10 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
         output_bytes: image.len(),
         backend: BACKEND_PIC_STUB.into(),
         export_surface: Vec::new(),
+        // Anti-debug probe manifest actually injected into the stub
+        // (aarch64 only; the list is what the artifact runs -- never a
+        // pass-through of the Windows claim).
+        probes: android_probes.iter().map(|p| probe_name(*p).to_string()).collect(),
         // GOT/PLT are filled by ld.so before init; the runtime never
         // resolves imports on ELF.
         iat_mode: "loader-resolved-got-plt".into(),
@@ -575,7 +803,7 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
         seed_len: 16,
         pages: packed.pages.len(),
         stolen_bytes: 0,
-        vm_functions: 0,
+        vm_functions: vm64.len(),
         selected_functions,
         coverage,
         strict_coverage: request.strict_coverage,
@@ -598,6 +826,17 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
                 }
             ),
             "ld.so stays the loader: PIE/RELRO/GOT-PLT untouched; imports loader-resolved".into(),
+            format!(
+                "anti-debug probes: {}",
+                if machine == ElfMachine::Aarch64 {
+                    format!(
+                        "{} (aarch64 core: TracerPid scan, PTRACE_TRACEME self-attach,                          /proc/self/maps marker scan; fail-closed, run before any AEAD open)",
+                        android_probes.iter().map(|p| probe_name(*p)).collect::<Vec<_>>().join("+")
+                    )
+                } else {
+                    "anti-debug probes are aarch64-only in this release".to_string()
+                }
+            ),
             "executable PT_LOAD file bytes sealed as EnvelopeV2 AEAD; disk holds 0x90              (carve-outs: entry window, IFUNC resolver pages, loader metadata pages)".into(),
             format!(
                 "loader metadata: {} page(s) kept native (ld.so parses them before init)",
@@ -640,6 +879,302 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
         report,
         packed,
     })
+}
+
+/// The per-build superop seed (mirrors the PE path's block_seed derivation;
+/// None falls back to the same derivation the envelope uses later).
+fn opcode_seed_for(request: &PackRequest<'_>) -> [u8; 16] {
+    request.opcode_seed.unwrap_or_else(|| {
+        // Deterministic per-request is impossible without OsRng here; the
+        // PE path derives it from the same random source the envelope
+        // uses. The lift only needs *a* seed, so reuse the request's when
+        // present and otherwise derive from the crypto RNG.
+        xenolith_crypto::random_seed16()
+    })
+}
+
+/// A resolved selection entry (vm-aarch64 design §8.4): dynsym/symtab give
+/// name/rva/st_size; explicit windows come verbatim; ifunc resolvers are
+/// rejected by name with the pre-init-window reason.
+struct ElfFnSel {
+    name: String,
+    rva: u32,
+    len: Option<u32>,
+    source: crate::analysis::function_map::BoundarySource,
+}
+
+fn resolve_elf_selection(
+    request: &PackRequest<'_>,
+    input: &[u8],
+    parsed: &elf::Elf64,
+    ifunc_resolvers: &[u64],
+) -> Result<Vec<ElfFnSel>, PackError> {
+    let mut out: Vec<ElfFnSel> = Vec::new();
+    // Explicit windows first (highest priority, always retained).
+    for (rva, len) in &request.select_rva {
+        if *len == 0 {
+            return Err(PackError::Lift(format!(
+                "select-rva {rva:#x}: length must be > 0"
+            )));
+        }
+        if elf::vaddr_file_offset(input, parsed, *rva as u64).is_err() {
+            return Err(PackError::Lift(format!(
+                "select-rva {rva:#x}: not in image"
+            )));
+        }
+        out.push(ElfFnSel {
+            name: format!("rva_{rva:#x}"),
+            rva: *rva,
+            len: Some(*len),
+            source: crate::analysis::function_map::BoundarySource::ExplicitRange,
+        });
+    }
+    let dynsym = elf::dynsym_functions(input, parsed).map_err(PackError::Format)?;
+    let symtab = elf::symtab_functions(input, parsed).map_err(PackError::Format)?;
+    let mut explicit: Vec<String> = request.vm_exports.clone();
+    explicit.extend(request.select_functions.iter().cloned());
+    explicit.sort();
+    explicit.dedup();
+    for name in &explicit {
+        if let Some(rule) = forbidden_vm_rule(name) {
+            return Err(PackError::Lift(format!(
+                "vm-export {name}: stays native ({rule}); CRT/JNI ABI exports must stay \
+                 native — pick another function"
+            )));
+        }
+        let hit = dynsym
+            .iter()
+            .find(|f| f.name == *name)
+            .map(|f| (f.value, f.size))
+            .or_else(|| {
+                symtab
+                    .iter()
+                    .find(|f| f.name == *name)
+                    .map(|f| (f.value, f.size))
+            });
+        let Some((value, size)) = hit else {
+            const MAX_LISTED: usize = 8;
+            let mut named: Vec<&str> =
+                dynsym.iter().chain(symtab.iter()).map(|f| f.name.as_str()).collect();
+            named.sort();
+            named.dedup();
+            let listed: Vec<&str> = named.iter().take(MAX_LISTED).copied().collect();
+            let more = if named.len() > MAX_LISTED {
+                format!(" … (+{} more)", named.len() - MAX_LISTED)
+            } else {
+                String::new()
+            };
+            let available = if named.is_empty() {
+                "This image exports no named functions (stripped, no dynsym/symtab \
+                 entries with sizes)."
+                    .to_string()
+            } else {
+                format!(
+                    "Available functions ({} of {}): {}{}. Full list: run `xenolith \
+                     inspect <input>`.",
+                    listed.len(),
+                    named.len(),
+                    listed.join(", "),
+                    more
+                )
+            };
+            return Err(PackError::Lift(format!(
+                "vm-export {name} is missing: it is neither a dynsym nor a symtab \
+                 function symbol. {available}"
+            )));
+        };
+        if size == 0 {
+            return Err(PackError::Lift(format!(
+                "vm-export {name}: symbol has st_size 0 — no lift window; select an \
+                 explicit --select-rva <rva>:<len> window instead"
+            )));
+        }
+        out.push(ElfFnSel {
+            name: name.clone(),
+            rva: value as u32,
+            len: Some(size as u32),
+            source: crate::analysis::function_map::BoundarySource::Symbol,
+        });
+    }
+    if request.select_all {
+        let mut discovered: Vec<(String, u64, u64)> = Vec::new();
+        for f in dynsym.iter().chain(symtab.iter()) {
+            if forbidden_vm_rule(&f.name).is_some() || f.size == 0 {
+                continue;
+            }
+            discovered.push((f.name.clone(), f.value, f.size));
+        }
+        discovered.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        discovered.dedup_by(|a, b| a.1 == b.1 && a.0 == b.0);
+        for (name, value, size) in discovered {
+            if out.iter().any(|f| f.rva as u64 == value) {
+                continue;
+            }
+            out.push(ElfFnSel {
+                name,
+                rva: value as u32,
+                len: Some(size as u32),
+                source: crate::analysis::function_map::BoundarySource::Symbol,
+            });
+        }
+    }
+    // §8.4 ifunc exclusion: resolvers execute during ld.so relocation,
+    // before the INIT_ARRAY unpack stub — hooking them in that window is
+    // unproven, so they stay native.
+    for f in &out {
+        if ifunc_resolvers.contains(&(f.rva as u64)) {
+            return Err(PackError::Lift(format!(
+                "vm-export {} (rva {:#x}): IFUNC resolvers run during ld.so relocation, \
+                 before the INIT_ARRAY unpack stub; hooking the entry in that pre-init \
+                 window is unproven, so resolver functions stay native — pick a \
+                 non-ifunc export",
+                f.name, f.rva
+            )));
+        }
+    }
+    Ok(out)
+}
+
+/// `b rel26` + `brk #0` fill at the selected entry (design §5.3): a direct
+/// branch into the guest thunk, with the rest of the lifted window trapped.
+fn apply_vm_hook_elf(
+    working: &mut [u8],
+    parsed: &elf::Elf64,
+    input: &[u8],
+    name: &str,
+    rva: u32,
+    native_len: usize,
+    target_va: u64,
+) -> Result<(), PackError> {
+    if rva % 4 != 0 {
+        return Err(PackError::Stub(format!(
+            "vm hook: {name} rva {rva:#x} is not 4-byte aligned"
+        )));
+    }
+    let off = elf::vaddr_file_offset(input, parsed, rva as u64)
+        .map_err(|_| PackError::Stub(format!("vm hook: {name} bad rva {rva:#x}")))?;
+    let end = off + native_len;
+    if end > working.len() || native_len < 4 {
+        return Err(PackError::Stub(format!(
+            "vm hook: {name} rewrite of {native_len} bytes at rva {rva:#x} overruns the \
+             {}-byte image",
+            working.len()
+        )));
+    }
+    let rel = target_va as i64 - rva as i64;
+    if rel % 4 != 0 || rel / 4 < -(1 << 25) || rel / 4 >= (1 << 25) {
+        return Err(PackError::Stub(format!(
+            "vm hook: {name} branch distance {rel:#x} is out of the ±128MiB rel26 range"
+        )));
+    }
+    let word: u32 = 0x1400_0000 | (((rel / 4) as u32) & 0x03FF_FFFF);
+    working[off..off + 4].copy_from_slice(&word.to_le_bytes());
+    for w in working[off + 4..end].chunks_exact_mut(4) {
+        w.copy_from_slice(&0xD420_0000u32.to_le_bytes());
+    }
+    Ok(())
+}
+
+/// Design §5.2 gate 2: references into the middle of a virtualized window
+/// (switch-table inner labels and in-window b/bl targets) would execute
+/// brk filler after the hook — conservative named rejection.
+fn scan_inner_label_refs(
+    input: &[u8],
+    parsed: &elf::Elf64,
+    rx: &[(u64, u64, usize, usize)],
+    windows: &[(u32, usize)],
+) -> Result<(), PackError> {
+    if windows.is_empty() {
+        return Ok(());
+    }
+    let inside = |rva: u64| -> Option<usize> {
+        windows
+            .iter()
+            .position(|(w_rva, w_len)| rva > *w_rva as u64 && rva < (*w_rva as u64 + *w_len as u64))
+    };
+    // (a) RELATIVE addends and dynsym st_values pointing inside a window.
+    let phdrs = elf::program_headers(input, parsed).map_err(PackError::Format)?;
+    let (mut rela_off, mut rela_sz, mut dyn_off, mut dyn_len) = (0u64, 0u64, 0usize, 0usize);
+    for ph in &phdrs {
+        if ph.p_type == elf::PT_DYNAMIC {
+            dyn_off = ph.p_offset as usize;
+            dyn_len = ph.p_filesz as usize;
+        }
+    }
+    if dyn_len > 0 {
+        let mut i = 0usize;
+        while i + 16 <= dyn_len {
+            let tag = u64::from_le_bytes(input[dyn_off + i..dyn_off + i + 8].try_into().unwrap());
+            let val =
+                u64::from_le_bytes(input[dyn_off + i + 8..dyn_off + i + 16].try_into().unwrap());
+            if tag == 0 {
+                break;
+            }
+            if tag == DT_RELA {
+                rela_off = val;
+            } else if tag == DT_RELASZ {
+                rela_sz = val;
+            }
+            i += 16;
+        }
+    }
+    if rela_off != 0 && rela_sz > 0 {
+        let off = elf::vaddr_file_offset(input, parsed, rela_off).map_err(PackError::Format)?;
+        for k in 0..(rela_sz as usize / 24) {
+            let o = off + k * 24;
+            let addend =
+                u64::from_le_bytes(input[o + 16..o + 24].try_into().unwrap());
+            if let Some(wi) = inside(addend) {
+                return Err(PackError::Lift(format!(
+                    "vm-export rva_{:#x}: a relocation addend ({addend:#x}) points inside \
+                     the virtualized window (rva {:#x}, {} bytes) - an inner label (switch \
+                     table) would execute trap filler; keep the function native with \
+                     --allow-native-fallback",
+                    windows[wi].0, windows[wi].0, windows[wi].1
+                )));
+            }
+        }
+    }
+    // (b) 4-aligned b/bl scan over the input RX ranges.
+    for (va, _va_end, off, len) in rx {
+        let mut o = *off;
+        let end = off + len;
+        while o + 4 <= end {
+            let word = u32::from_le_bytes(input[o..o + 4].try_into().unwrap());
+            if word & 0xFC00_0000 == 0x1400_0000 || word & 0xFC00_0000 == 0x9400_0000 {
+                let imm26 = (word & 0x03FF_FFFF) as i64;
+                let imm26 = if imm26 & (1 << 25) != 0 {
+                    imm26 - (1 << 26)
+                } else {
+                    imm26
+                };
+                let src_va = va + (o - off) as u64;
+                // A branch that ORIGINATES inside a virtualized window never
+                // executes natively (the lift turns it into an in-VM Jmp/Jcc
+                // and validates the target itself); only native branches
+                // entering a window from outside would hit trap filler.
+                if inside(src_va).is_some() {
+                    o += 4;
+                    continue;
+                }
+                let target = src_va.wrapping_add((imm26 * 4) as u64);
+                if let Some(wi) = inside(target) {
+                    return Err(PackError::Lift(format!(
+                        "vm-export rva_{:#x}: a b/bl at {:#x} targets {target:#x} inside the \
+                         virtualized window (rva {:#x}, {} bytes) — the inner label would \
+                         execute trap filler; keep the function native with \
+                         --allow-native-fallback",
+                        windows[wi].0,
+                        va + (o - off) as u64,
+                        windows[wi].0,
+                        windows[wi].1
+                    )));
+                }
+            }
+            o += 4;
+        }
+    }
+    Ok(())
 }
 
 /// R_<ARCH>_RELATIVE applied by ld.so *before* init would be overwritten
@@ -720,7 +1255,7 @@ struct InitArrayBoot {
 
 const DT_INIT: u64 = 12;
 const DT_INIT_ARRAY: u64 = 25;
-const DT_INIT_ARRAYSZ: u64 = 26;
+const DT_INIT_ARRAYSZ: u64 = 27;
 const DT_RELA: u64 = 7;
 const DT_RELASZ: u64 = 8;
 
@@ -761,9 +1296,9 @@ fn init_array_bootstrap(input: &[u8], parsed: &elf::Elf64) -> Result<InitArrayBo
             }
             DT_INIT if val != 0 => saw_init = true,
             // Known broken-linker shape: DT_INIT_ARRAYSZ mis-emitted as
-            // DT_FINI_ARRAY with a tiny non-vaddr value. Recognized only for
-            // the diagnostic; the pack still refuses (below).
-            0x1b if val < 0x1000 => saw_misfini_slot = true,
+            // DT_FINI_ARRAY (tag 26) with a tiny non-vaddr value. Recognized
+            // only for the diagnostic; the pack still refuses (below).
+            26 if val < 0x1000 => saw_misfini_slot = true,
             _ => {}
         }
         i += 16;
@@ -879,7 +1414,6 @@ fn file_off_to_vaddr(rx: &[(u64, u64, usize, usize)], file_off: usize) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xenolith_loader::Profile;
 
     /// Minimal packable ET_DYN (one R+X PT_LOAD covering the whole file,
     /// vaddr == file offset; PT_DYNAMIC with DT_RELA/DT_RELASZ/
@@ -910,7 +1444,7 @@ mod tests {
             (7u64, rela_off as u64), // DT_RELA
             (8u64, 24u64),           // DT_RELASZ (one entry)
             (25u64, ia_off as u64),  // DT_INIT_ARRAY
-            (26u64, 8u64),           // DT_INIT_ARRAYSZ
+            (27u64, 8u64),           // DT_INIT_ARRAYSZ
         ] {
             dyns.extend_from_slice(&tag.to_le_bytes());
             dyns.extend_from_slice(&val.to_le_bytes());
@@ -1122,5 +1656,446 @@ mod tests {
             }
             Err(e) => panic!("unexpected error: {e}"),
         }
+    }
+
+    // ---- plan WS-A 2.2.3: probe assembly + report + inspect round-trip ----
+
+    /// Pack an aarch64 fixture with the NDK core present and assert the
+    /// probe manifest travels the whole path: guard mask -> stub machine
+    /// code (movz+str at ctx+128) -> PackReport.probes -> PackedImage.probes
+    /// -> inspect_bytes decode. Skips (without asserting) when no NDK core
+    /// exists on this host -- CI installs the pinned NDK so the assert
+    /// always runs there.
+    fn pack_aarch64_or_skip(img: &[u8], profile: Profile) -> Option<PackOutput> {
+        let r = PackRequest {
+            input: img,
+            profile,
+            vm_exports: vec![],
+            debug_gate: 3,
+            opcode_seed: Some([9; 16]),
+            trace_diverge: false,
+            select_rva: vec![],
+            select_functions: Vec::new(),
+            select_all: false,
+            strict_coverage: false,
+            allow_native_fallback: false,
+            lazy_regions: false,
+            protect_imports: false,
+            strict_constants: false,
+        };
+        match pack_elf(&r) {
+            Ok(out) => Some(out),
+            Err(PackError::Runtime(msg)) => {
+                if msg.contains("aarch64 runtime core not built") {
+                    eprintln!("skipped: no NDK aarch64 core on this host");
+                    return None;
+                }
+                panic!("unexpected runtime error: {msg}");
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    #[test]
+    fn aarch64_probe_assembly_report_and_inspect_roundtrip() {
+        use xenolith_guard::Probe;
+        let img = elf_dyn_fixture(ElfMachine::Aarch64, &[], false);
+        let Some(out) = pack_aarch64_or_skip(&img, Profile::Max) else {
+            return;
+        };
+        // Max profile: the full Android set, in canonical bitmap order.
+        assert_eq!(
+            out.report.probes,
+            vec!["TracerPidScan", "PtraceSelfAttach", "MapsScan"],
+            "report must list exactly the injected probes"
+        );
+        assert_eq!(
+            out.packed.probes,
+            vec![Probe::TracerPidScan, Probe::PtraceSelfAttach, Probe::MapsScan]
+        );
+        // The report note names them and states the fail-closed contract.
+        assert!(
+            out.report
+                .notes
+                .iter()
+                .any(|n| n.contains("anti-debug probes") && n.contains("TracerPidScan")),
+            "notes must describe the probe set: {:?}",
+            out.report.notes
+        );
+        // inspect decodes the same manifest back out of the machine code.
+        let info = crate::inspect_bytes(&out.image).expect("packed artifact inspects");
+        assert_eq!(info["packed"], serde_json::json!(true));
+        assert_eq!(
+            info["probes"],
+            serde_json::json!(["TracerPidScan", "PtraceSelfAttach", "MapsScan"]),
+            "inspect must round-trip the probe manifest from the stub bytes"
+        );
+        let note = info["note"].as_str().unwrap_or_default();
+        assert!(!note.contains("not decodable"), "decode note: {note}");
+    }
+
+    #[test]
+    fn aarch64_probe_default_profile_is_the_two_core_checks() {
+        let img = elf_dyn_fixture(ElfMachine::Aarch64, &[], false);
+        let Some(out) = pack_aarch64_or_skip(&img, Profile::Standard) else {
+            return;
+        };
+        assert_eq!(
+            out.report.probes,
+            vec!["TracerPidScan", "PtraceSelfAttach"],
+            "non-Max profiles arm only the two core debugger checks"
+        );
+        let info = crate::inspect_bytes(&out.image).expect("packed artifact inspects");
+        assert_eq!(
+            info["probes"],
+            serde_json::json!(["TracerPidScan", "PtraceSelfAttach"])
+        );
+    }
+
+    /// x86-64 ELF: zero probes AND the explicit aarch64-only note -- the
+    /// report may never pass the Windows claim through.
+    #[test]
+    fn x86_64_elf_reports_empty_probes_with_aarch64_only_note() {
+        let img = elf_dyn_fixture(ElfMachine::Amd64, &[], false);
+        let Some(out) = pack_aarch64_or_skip(&img, Profile::Max) else {
+            return; // host x86-64 core also missing on this machine
+        };
+        assert_eq!(out.report.machine, "x86_64");
+        assert!(
+            out.report.probes.is_empty(),
+            "x86-64 ELF must not claim any probe"
+        );
+        assert!(
+            out.report
+                .notes
+                .iter()
+                .any(|n| n.contains("anti-debug probes are aarch64-only")),
+            "notes must carry the aarch64-only statement: {:?}",
+            out.report.notes
+        );
+        let info = crate::inspect_bytes(&out.image).expect("packed artifact inspects");
+        assert_eq!(info["probes"], serde_json::json!([]));
+        assert!(
+            info["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("anti-debug probes are aarch64-only"),
+            "inspect note must state the aarch64-only scope"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // vm-export pipeline (vm-aarch64 design §2/§8): end-to-end gate tests.
+    // ------------------------------------------------------------------
+
+    /// `elf_dyn_fixture` plus a section-header table carrying SHT_SYMTAB /
+    /// SHT_STRTAB with one named STT_FUNC whose body (liftable whitelist
+    /// words) sits at FN_RVA inside the RX LOAD (file offset == vaddr).
+    fn elf_dyn_fixture_with_fn(machine: ElfMachine, fn_rva: u32, body: &[u32]) -> Vec<u8> {
+        let mut img = elf_dyn_fixture(machine, &[], false);
+        let fn_off = fn_rva as usize;
+        assert!(fn_off + body.len() * 4 <= 0x2F0, "body must fit the RX LOAD");
+        for (i, w) in body.iter().enumerate() {
+            img[fn_off + i * 4..fn_off + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        // Sections past every LOAD: [0] NULL, [1] SYMTAB, [2] STRTAB.
+        let sym_off = img.len();
+        let str_off = sym_off + 24 * 2;
+        let sh_off = align_up((str_off + 16) as u32, 8) as usize;
+        img.resize(sh_off + 3 * 64, 0);
+        // Elf64_Sym: name, info, other, shndx, value, size, size_hi
+        let mut sym: Vec<u8> = Vec::new();
+        sym.extend_from_slice(&1u32.to_le_bytes()); // st_name: "leaf_add"
+        sym.push(0x12); // STB_GLOBAL << 4 | STT_FUNC
+        sym.push(0);
+        sym.extend_from_slice(&1u16.to_le_bytes()); // shndx
+        sym.extend_from_slice(&(fn_rva as u64).to_le_bytes());
+        sym.extend_from_slice(&((body.len() * 4) as u64).to_le_bytes());
+        img[sym_off..sym_off + sym.len()].copy_from_slice(&sym);
+        img[str_off..str_off + 16].copy_from_slice(b"\0leaf_add\0\0\0\0\0\0\0");
+        // e_shoff / e_shentsize / e_shnum / e_shstrndx
+        img[40..48].copy_from_slice(&(sh_off as u64).to_le_bytes());
+        img[58..60].copy_from_slice(&64u16.to_le_bytes());
+        img[60..62].copy_from_slice(&3u16.to_le_bytes());
+        img[62..64].copy_from_slice(&0u16.to_le_bytes());
+        let mut sh = |i: usize, ty: u32, off: u64, size: u64, link: u32| {
+            let b = sh_off + i * 64;
+            img[b + 4..b + 8].copy_from_slice(&ty.to_le_bytes()); // sh_type
+            img[b + 24..b + 32].copy_from_slice(&off.to_le_bytes());
+            img[b + 32..b + 40].copy_from_slice(&size.to_le_bytes());
+            img[b + 40..b + 44].copy_from_slice(&link.to_le_bytes());
+            img[b + 56..b + 64].copy_from_slice(&24u64.to_le_bytes());
+        };
+        sh(1, 2, sym_off as u64, 48, 2);
+        sh(2, 3, str_off as u64, 16, 0);
+        img
+    }
+
+    const LEAF_ADD: [u32; 2] = [0x8B01_0000, 0xD65F_03C0]; // add x0,x0,x1; ret
+
+    #[test]
+    fn aarch64_vm_export_packs_and_reports() {
+        let img = elf_dyn_fixture_with_fn(ElfMachine::Aarch64, 0x200, &LEAF_ADD);
+        let r = PackRequest {
+            input: &img,
+            profile: Profile::Max,
+            vm_exports: vec!["leaf_add".into()],
+            debug_gate: 3,
+            opcode_seed: Some([9; 16]),
+            trace_diverge: false,
+            select_rva: vec![],
+            select_functions: Vec::new(),
+            select_all: false,
+            strict_coverage: false,
+            allow_native_fallback: false,
+            lazy_regions: false,
+            protect_imports: false,
+            strict_constants: false,
+        };
+        let out = match pack_elf(&r) {
+            Ok(out) => out,
+            Err(PackError::Runtime(msg)) if msg.contains("aarch64 runtime core not built") => {
+                eprintln!("skipped: no NDK aarch64 core on this host");
+                return;
+            }
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(out.report.vm_functions, 1, "one function virtualized");
+        assert_eq!(out.report.selected_functions, vec!["leaf_add".to_string()]);
+        let rec = &out.report.coverage[0];
+        assert_eq!(rec.bucket, "transformed", "bucket: {rec:?}");
+        assert_eq!(rec.rva, 0x200);
+        // The appended PT_LOAD is plaintext: the guest thunk's prologue
+        // (paired sub sp + stp x19,x20 saves) must be visible in it.
+        let phoff = u64::from_le_bytes(out.image[32..40].try_into().unwrap()) as usize;
+        let phnum = u16::from_le_bytes(out.image[56..58].try_into().unwrap()) as usize;
+        let mut stub_off = None;
+        for i in 0..phnum {
+            let b = phoff + i * 56;
+            let ty = u32::from_le_bytes(out.image[b..b + 4].try_into().unwrap());
+            if ty == 1 {
+                let flags =
+                    u32::from_le_bytes(out.image[b + 4..b + 8].try_into().unwrap());
+                let o = u64::from_le_bytes(out.image[b + 8..b + 16].try_into().unwrap());
+                if flags & 1 != 0 && o > img.len() as u64 {
+                    stub_off = Some(o as usize);
+                }
+            }
+        }
+        let stub_off = stub_off.expect("appended RX LOAD present");
+        let words: Vec<u32> = out.image[stub_off..]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        // The thunk opens with  — the stub's
+        // own ctx frame uses , so the PAIR identifies a thunk.
+        let sub_sp = words
+            .windows(2)
+            .position(|w| {
+                w[0] & 0xFF00_0000 == 0xD100_0000
+                    && (w[0] >> 5) & 0x1F == 31
+                    && w[0] & 0x1F == 31
+                    && (w[0] >> 10) & 0xFFF >= 96
+                    && (w[0] >> 10) & 0xFFF % 16 == 0
+                    && w[1] == 0xA900_53F3
+            })
+            .expect("thunk frame prologue in the appended LOAD");
+        assert_eq!(
+            words[sub_sp + 1],
+            0xA900_53F3,
+            "stp x19,x20,[sp] right after the frame sub"
+        );
+        // inspect still decodes the packed artifact.
+        let info = crate::inspect_bytes(&out.image).expect("packed artifact inspects");
+        assert_eq!(info["packed"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn aarch64_vm_export_unsupported_instruction_fails_closed_named() {
+        // bl inside the body: whole-function fail-closed with the word,
+        // function name and remediation.
+        let body = [0x8B01_0000u32, 0x9400_0000 | 4, 0xD65F_03C0];
+        let img = elf_dyn_fixture_with_fn(ElfMachine::Aarch64, 0x200, &body);
+        let r = PackRequest {
+            input: &img,
+            profile: Profile::Max,
+            vm_exports: vec!["leaf_add".into()],
+            debug_gate: 3,
+            opcode_seed: Some([9; 16]),
+            trace_diverge: false,
+            select_rva: vec![],
+            select_functions: Vec::new(),
+            select_all: false,
+            strict_coverage: false,
+            allow_native_fallback: false,
+            lazy_regions: false,
+            protect_imports: false,
+            strict_constants: false,
+        };
+        let msg = match pack_elf(&r) {
+            Err(PackError::Lift(m)) => m,
+            Err(PackError::Runtime(m)) if m.contains("aarch64 runtime core not built") => {
+                eprintln!("skipped: no NDK aarch64 core on this host");
+                return;
+            }
+            other => panic!("expected a named lift error, got Ok(..)"),
+        };
+        assert!(msg.contains("leaf_add"), "{msg}");
+        assert!(msg.contains("0x94000004"), "{msg}");
+        assert!(msg.contains("--allow-native-fallback"), "{msg}");
+    }
+
+    #[test]
+    fn aarch64_vm_export_fallback_reports_mixed_native() {
+        let body = [0x8B01_0000u32, 0x9400_0000 | 4, 0xD65F_03C0];
+        let img = elf_dyn_fixture_with_fn(ElfMachine::Aarch64, 0x200, &body);
+        let r = PackRequest {
+            input: &img,
+            profile: Profile::Max,
+            vm_exports: vec!["leaf_add".into()],
+            debug_gate: 3,
+            opcode_seed: Some([9; 16]),
+            trace_diverge: false,
+            select_rva: vec![],
+            select_functions: Vec::new(),
+            select_all: false,
+            strict_coverage: false,
+            allow_native_fallback: true,
+            lazy_regions: false,
+            protect_imports: false,
+            strict_constants: false,
+        };
+        let out = match pack_elf(&r) {
+            Ok(out) => out,
+            Err(PackError::Runtime(m)) if m.contains("aarch64 runtime core not built") => {
+                eprintln!("skipped: no NDK aarch64 core on this host");
+                return;
+            }
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(out.report.vm_functions, 0);
+        assert_eq!(out.report.coverage[0].bucket, "mixed_native");
+        assert!(out.report.coverage[0].reason.contains("0x94000004"));
+    }
+
+    #[test]
+    fn aarch64_select_rva_window_packs() {
+        let img = elf_dyn_fixture_with_fn(ElfMachine::Aarch64, 0x200, &LEAF_ADD);
+        let r = PackRequest {
+            input: &img,
+            profile: Profile::Standard,
+            vm_exports: vec![],
+            debug_gate: 3,
+            opcode_seed: Some([9; 16]),
+            trace_diverge: false,
+            select_rva: vec![(0x200, 8)],
+            select_functions: Vec::new(),
+            select_all: false,
+            strict_coverage: true,
+            allow_native_fallback: false,
+            lazy_regions: false,
+            protect_imports: false,
+            strict_constants: false,
+        };
+        let out = match pack_elf(&r) {
+            Ok(out) => out,
+            Err(PackError::Runtime(m)) if m.contains("aarch64 runtime core not built") => {
+                eprintln!("skipped: no NDK aarch64 core on this host");
+                return;
+            }
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(out.report.vm_functions, 1);
+        assert_eq!(out.report.selected_functions, vec!["rva_0x200".to_string()]);
+    }
+
+    #[test]
+    fn x86_64_elf_selection_stays_named_rejected() {
+        let img = elf_dyn_fixture(ElfMachine::Amd64, &[], false);
+        let r = PackRequest {
+            input: &img,
+            profile: Profile::Max,
+            vm_exports: vec!["whatever".into()],
+            debug_gate: 3,
+            opcode_seed: Some([9; 16]),
+            trace_diverge: false,
+            select_rva: vec![],
+            select_functions: Vec::new(),
+            select_all: false,
+            strict_coverage: false,
+            allow_native_fallback: false,
+            lazy_regions: false,
+            protect_imports: false,
+            strict_constants: false,
+        };
+        let msg = match pack_elf(&r) {
+            Err(PackError::Invalid(m)) => m,
+            other => panic!("expected named rejection, got Ok(..)"),
+        };
+        assert!(msg.contains("SysV x86-64 lift"), "{msg}");
+        // select-rva also stays rejected on x86-64
+        let r = PackRequest {
+            select_rva: vec![(0x40, 8)],
+            vm_exports: vec![],
+            ..r_self(&img)
+        };
+        let msg = match pack_elf(&r) {
+            Err(PackError::Invalid(m)) => m,
+            other => panic!("expected named rejection, got Ok(..)"),
+        };
+        assert!(msg.contains("SysV x86-64 lift"), "{msg}");
+    }
+
+    fn r_self<'a>(input: &'a [u8]) -> PackRequest<'a> {
+        PackRequest {
+            input,
+            profile: Profile::Max,
+            vm_exports: vec![],
+            debug_gate: 3,
+            opcode_seed: Some([9; 16]),
+            trace_diverge: false,
+            select_rva: vec![],
+            select_functions: Vec::new(),
+            select_all: false,
+            strict_coverage: false,
+            allow_native_fallback: false,
+            lazy_regions: false,
+            protect_imports: false,
+            strict_constants: false,
+        }
+    }
+
+    #[test]
+    fn aarch64_vm_export_missing_symbol_names_alternatives() {
+        let img = elf_dyn_fixture_with_fn(ElfMachine::Aarch64, 0x200, &LEAF_ADD);
+        let r = PackRequest {
+            vm_exports: vec!["no_such".into()],
+            ..r_self(&img)
+        };
+        let msg = match pack_elf(&r) {
+            Err(PackError::Lift(m)) => m,
+            Err(PackError::Runtime(m)) if m.contains("aarch64 runtime core not built") => {
+                eprintln!("skipped: no NDK aarch64 core on this host");
+                return;
+            }
+            other => panic!("expected named error, got Ok(..)"),
+        };
+        assert!(msg.contains("no_such"), "{msg}");
+        assert!(msg.contains("leaf_add"), "{msg}");
+    }
+
+    #[test]
+    fn aarch64_vm_export_fast_profile_rejected() {
+        let img = elf_dyn_fixture_with_fn(ElfMachine::Aarch64, 0x200, &LEAF_ADD);
+        let r = PackRequest {
+            profile: Profile::Fast,
+            vm_exports: vec!["leaf_add".into()],
+            ..r_self(&img)
+        };
+        let msg = match pack_elf(&r) {
+            Err(PackError::Invalid(m)) => m,
+            other => panic!("expected named rejection, got Ok(..)"),
+        };
+        assert!(msg.contains("standard or max"), "{msg}");
     }
 }

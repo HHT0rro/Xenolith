@@ -53,5 +53,17 @@ pub const CTX_LOAD_LIBRARY: usize = 64;
 pub const CTX_GET_PROC: usize = 72;
 pub const CTX_VPROTECT: usize = 80;
 /// ELF only: load-relative phdr-table VA for `xl_final_protect` (see
-/// META_TABLE_RVA). PE stubs leave it zero; the ctx grows to 128 bytes.
+/// META_TABLE_RVA). PE stubs leave it zero.
 pub const CTX_PHDR_VA: usize = 120;
+/// Android/bionic anti-debug probe bitmap (plan WS-A §2.2.3). Pack-time
+/// constant produced by `xenolith_guard::android_probe_mask`; the aarch64
+/// stub encodes it as a `movz w9, #mask` machine-code constant and the
+/// freestanding core consumes it as `XL_PROBE_BIT_*` (platform-local bits,
+/// decoupled from the global probe ids). The x86-64 ELF and PE stubs write
+/// an explicit ZERO (no probes on those paths — the core must never read
+/// stack garbage here). The ctx grows to 136 bytes.
+pub const CTX_PROBE_MASK: usize = 128;
+/// Byte size of `XlHostCtx` as the stubs build it (grew from 128 to 136
+/// with CTX_PROBE_MASK). Stubs reserve at least this much frame below the
+/// saved-register slots — golden frame-size assertions lock this.
+pub const CTX_LEN: usize = 136;

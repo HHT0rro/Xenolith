@@ -812,6 +812,70 @@ fn gnu_hash_sym_count(
 /// executed before the stub restored it, so neither flavor needs to be
 /// rejected (the packer keeps defined-resolver pages native via this
 /// function and `ifunc_resolvers`).
+/// Defined STT_FUNC symbols from the dynamic symbol table (the selection
+/// surface for stripped .so files, where SHT_SYMTAB is gone). Names come
+/// from DT_STRTAB; the extent comes from the hash tables (`dynsym_extent`).
+pub fn dynsym_functions(bytes: &[u8], elf: &Elf64) -> Result<Vec<SymtabFunc>, FormatError> {
+    let phdrs = program_headers(bytes, elf)?;
+    let (mut dyn_off, mut dyn_sz) = (None, 0usize);
+    for ph in &phdrs {
+        if ph.p_type == PT_DYNAMIC {
+            dyn_off = Some(ph.p_offset as usize);
+            dyn_sz = ph.p_filesz as usize;
+        }
+    }
+    let Some(doff) = dyn_off else {
+        return Ok(Vec::new());
+    };
+    let (mut symtab_va, mut strtab_va) = (0u64, 0u64);
+    let mut i = 0usize;
+    while i + 16 <= dyn_sz {
+        let tag = read_u64(bytes, doff + i)?;
+        let val = read_u64(bytes, doff + i + 8)?;
+        if tag == 0 {
+            break;
+        }
+        match tag {
+            DT_SYMTAB => symtab_va = val,
+            DT_STRTAB => strtab_va = val,
+            _ => {}
+        }
+        i += 16;
+    }
+    if symtab_va == 0 || strtab_va == 0 {
+        return Ok(Vec::new());
+    }
+    let Some((off, end)) = dynsym_extent(
+        bytes,
+        elf.phoff as usize,
+        elf.phentsize as usize,
+        elf.phnum as usize,
+        doff,
+        dyn_sz,
+    )? else {
+        return Ok(Vec::new());
+    };
+    let str_off = vaddr_file_offset(bytes, elf, strtab_va)?;
+    let mut out = Vec::new();
+    let mut o = off;
+    while o + 24 <= end && o + 24 <= bytes.len() {
+        let info = bytes[o + 4];
+        let value = read_u64(bytes, o + 8)?;
+        let size = read_u64(bytes, o + 16)?;
+        if info & 0xf == 2 && info >> 4 == 1 && size > 0 {
+            // STB_GLOBAL/STB_WEAK defined functions only: STB_LOCAL dynsym
+            // entries exist but are not the exported selection surface.
+            let name_off = read_u32(bytes, o)? as usize;
+            let name = cstr_at_off(bytes, str_off, usize::MAX, name_off);
+            if !name.is_empty() {
+                out.push(SymtabFunc { name, value, size });
+            }
+        }
+        o += 24;
+    }
+    Ok(out)
+}
+
 pub fn ifunc_symbol_values(bytes: &[u8], elf: &Elf64) -> Result<Vec<u64>, FormatError> {
     let phdrs = program_headers(bytes, elf)?;
     let (mut dyn_off, mut dyn_sz) = (None, 0usize);
@@ -1217,7 +1281,7 @@ mod tests {
             (7u64, rela_off as u64),   // DT_RELA
             (8u64, (relas.len() * 24) as u64), // DT_RELASZ
             (25u64, ia_off as u64),    // DT_INIT_ARRAY
-            (26u64, 8u64),             // DT_INIT_ARRAYSZ
+            (27u64, 8u64),             // DT_INIT_ARRAYSZ
         ] {
             dyns.extend_from_slice(&tag.to_le_bytes());
             dyns.extend_from_slice(&val.to_le_bytes());
@@ -1443,7 +1507,7 @@ pub fn packed_bootstrap_target(bytes: &[u8], elf: &Elf64) -> Result<Option<u64>,
             7 => rela_off = val,
             8 => rela_sz = val,
             25 => init_array_va = val,
-            26 => init_array_sz = val,
+            27 => init_array_sz = val, // DT_INIT_ARRAYSZ (26 is DT_FINI_ARRAY)
             _ => {}
         }
         i += 16;

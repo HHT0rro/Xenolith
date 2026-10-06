@@ -5,6 +5,7 @@ pub mod protect;
 pub mod stats;
 pub mod unwind;
 pub mod lift;
+pub mod lift_aarch64;
 pub mod platform;
 pub mod runtime_image;
 pub mod selection;
@@ -100,6 +101,12 @@ pub struct PackReport {
     /// Input machine ("x86_64" | "aarch64"). PE is always x86_64; ELF
     /// follows e_machine. Additive field — existing parsers ignore it.
     pub machine: String,
+    /// Anti-debug probes the artifact actually runs (plan WS-A): Windows
+    /// names on the PE path, Android names on the aarch64 ELF path, and an
+    /// EMPTY list with an explicit note on x86-64 ELF (probes are
+    /// aarch64-only in this release). Never a pass-through of a claim the
+    /// artifact does not honor.
+    pub probes: Vec<String>,
     /// TASK-038: on-disk sizes feeding the G8 size budget (output/input).
     pub input_bytes: usize,
     pub output_bytes: usize,
@@ -1008,6 +1015,10 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
     } else {
         vec![Probe::TlsEarlyProbe, Probe::PebBeingDebugged]
     };
+    let probe_names: Vec<String> = probes
+        .iter()
+        .map(|p| xenolith_guard::probe_name(*p).to_string())
+        .collect();
 
     // TASK-021: unwind metadata for the injected stub lives in the payload
     // section — a UNWIND_INFO blob (XDATA) plus a relocated .pdata array
@@ -1277,6 +1288,7 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
             ImageKind::Elf64Dyn => "elf64-dyn".into(),
         },
         machine: "x86_64".into(), // PE path is AMD64-only
+        probes: probe_names,
         input_bytes: request.input.len(),
         output_bytes: image.len(),
         backend: BACKEND_PIC_STUB.into(),
@@ -1770,6 +1782,69 @@ fn apply_vm_hook(
     Ok(())
 }
 
+/// Decode the Android probe bitmap the aarch64 stub emitter encoded
+/// (`movz w9, #imm` / optional `movk w9, #imm16, lsl #16`, then
+/// `str w9, [sp, #CTX_PROBE_MASK]`). Scans only the first 256 words (the
+/// store sits in the fixed ctx-build prologue, well before the embedded
+/// core bytes). `None` = pattern not found: the caller reports an honest
+/// empty list plus a note instead of guessing.
+fn decode_aarch64_probe_mask(stub: &[u8]) -> Option<u32> {
+    const STR_W9_SP_128: u32 = 0xB900_0000 | ((128 / 4) << 10) | (31 << 5) | 9;
+    let words: Vec<u32> = stub
+        .chunks_exact(4)
+        .take(256)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let at = words.iter().position(|w| *w == STR_W9_SP_128)?;
+    let movz = *words.get(at.checked_sub(1)?)?;
+    // movz w9, #imm16, lsl #0: opcode field [31:23] == 0b010100101, hw
+    // [22:21] == 0, rd == 9. (0xFF80_0000 masks exactly the 9 opcode bits,
+    // leaving hw free to check separately.)
+    if movz & 0xFF80_0000 != 0x5280_0000 || movz & 0x1F != 9 || ((movz >> 21) & 3) != 0 {
+        return None;
+    }
+    let mut mask = (movz >> 5) & 0xFFFF;
+    if at >= 2 {
+        let movk = words[at - 2];
+        // movk w9, #imm16, lsl #16 (hw field == 1).
+        if movk & 0xFF80_0000 == 0x7280_0000
+            && movk & 0x1F == 9
+            && ((movk >> 21) & 3) == 1
+        {
+            mask |= ((movk >> 5) & 0xFFFF) << 16;
+        }
+    }
+    Some(mask)
+}
+
+/// Map a load-relative VA to its file offset through the covering PT_LOAD.
+fn elf_va_to_offset(image: &[u8], va: u64) -> Option<usize> {
+    if image.len() < 64 {
+        return None;
+    }
+    let rd_u16 = |o: usize| u16::from_le_bytes(image[o..o + 2].try_into().unwrap());
+    let rd_u64 = |o: usize| u64::from_le_bytes(image[o..o + 8].try_into().unwrap());
+    let phoff = rd_u64(0x20) as usize;
+    let phentsize = rd_u16(0x36) as usize;
+    let phnum = rd_u16(0x38) as usize;
+    if phentsize < 56 || phnum == 0 || phoff.saturating_add(phnum * phentsize) > image.len() {
+        return None;
+    }
+    for i in 0..phnum {
+        let e = phoff + i * phentsize;
+        if rd_u64(e) as u32 == 1 {
+            // PT_LOAD
+            let p_offset = rd_u64(e + 8);
+            let p_vaddr = rd_u64(e + 16);
+            let p_filesz = rd_u64(e + 32);
+            if va >= p_vaddr && va - p_vaddr < p_filesz {
+                return Some((va - p_vaddr + p_offset) as usize);
+            }
+        }
+    }
+    None
+}
+
 pub fn inspect_bytes(image: &[u8]) -> Result<serde_json::Value, PackError> {
     match classify(image) {
         Ok(ImageKind::Elf64Exec | ImageKind::Elf64Dyn) => {
@@ -1788,6 +1863,52 @@ pub fn inspect_bytes(image: &[u8]) -> Result<serde_json::Value, PackError> {
                 .map_err(PackError::Format)?;
             let (tls_ie, tls_ld) = xenolith_formats::elf::tls_reloc_census(image, &elf)
                 .map_err(PackError::Format)?;
+            // Android probe manifest, decoded from the stub machine code the
+            // packer emitted (movz(+movk)/str at CTX_PROBE_MASK). aarch64
+            // artifacts carry the real list; x86-64 reports an honest empty
+            // set with the aarch64-only note -- never a fake pass-through.
+            let probes_json: serde_json::Value = match (&elf.machine, packed, &boot) {
+                (
+                    xenolith_formats::elf::ElfMachine::Aarch64,
+                    true,
+                    Some(stub_va),
+                ) => {
+                    let names = elf_va_to_offset(image, *stub_va)
+                        .and_then(|off| decode_aarch64_probe_mask(&image[off..]))
+                        .map(|mask| {
+                            xenolith_guard::android_probes_for_mask(mask)
+                                .iter()
+                                .map(|p| xenolith_guard::probe_name(*p))
+                                .collect::<Vec<&str>>()
+                        });
+                    match names {
+                        Some(list) => serde_json::json!(list),
+                        None => serde_json::json!([]),
+                    }
+                }
+                _ => serde_json::json!([]),
+            };
+            let probes_note: Option<&str> = match (&elf.machine, packed, &boot) {
+                (
+                    xenolith_formats::elf::ElfMachine::Aarch64,
+                    true,
+                    Some(stub_va),
+                ) => {
+                    match elf_va_to_offset(image, *stub_va)
+                        .and_then(|off| decode_aarch64_probe_mask(&image[off..]))
+                    {
+                        Some(_) => None,
+                        None => Some(
+                            "android probe mask not decodable in this artifact (stub \
+                             shape unrecognized); probes list is NOT authoritative",
+                        ),
+                    }
+                }
+                (xenolith_formats::elf::ElfMachine::Amd64, true, _) => {
+                    Some("anti-debug probes are aarch64-only in this release")
+                }
+                _ => None,
+            };
             let mut info = serde_json::json!({
                 "report_version": PACK_REPORT_VERSION,
                 "backend": if packed { BACKEND_PIC_STUB } else { "none" },
@@ -1821,6 +1942,7 @@ pub fn inspect_bytes(image: &[u8]) -> Result<serde_json::Value, PackError> {
                 "ifunc_resolvers": resolvers,
                 "symbol_versions": { "verneed": verneed, "verdef": verdef },
                 "tls_models": { "initial_exec": tls_ie, "dynamic": tls_ld },
+                "probes": probes_json,
             });
             if !packed {
                 info["note"] = serde_json::json!(
@@ -1832,6 +1954,13 @@ pub fn inspect_bytes(image: &[u8]) -> Result<serde_json::Value, PackError> {
                     "packed ELF: INIT_ARRAY[0] bootstraps pic-stub+xl-core; ld.so keeps \
                      PIE/RELRO/GOT-PLT; executable PT_LOAD bytes sealed on disk"
                 );
+                if let Some(extra) = probes_note {
+                    info["note"] = serde_json::json!(format!(
+                        "{}; {}",
+                        info["note"].as_str().unwrap_or_default(),
+                        extra
+                    ));
+                }
             }
             return Ok(info);
         }
@@ -1985,6 +2114,62 @@ pub struct StrengthScan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// decode_aarch64_probe_mask round-trips every encodable mask shape
+    /// (single movz; movz+movk beyond imm16) and refuses look-alikes.
+    #[test]
+    fn aarch64_probe_mask_decode_roundtrip() {
+        let str_store = 0xB900_0000u32 | ((128 / 4) << 10) | (31 << 5) | 9;
+        let movz_w9 = |imm: u32| 0x5280_0000u32 | (imm << 5) | 9;
+        let movk_w9 = |imm: u32| 0x7280_0000u32 | (1u32 << 21) | (imm << 5) | 9;
+        let words_to_bytes = |ws: &[u32]| {
+            ws.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>()
+        };
+        // Single movz shapes (all v1 masks).
+        for mask in [0u32, 1, 2, 4, 0b111, 0x7FFF] {
+            let blob = words_to_bytes(&[movz_w9(mask), str_store]);
+            assert_eq!(
+                decode_aarch64_probe_mask(&blob),
+                Some(mask),
+                "movz mask {mask:#x}"
+            );
+        }
+        // movz+movk beyond imm16.
+        let blob = words_to_bytes(&[movk_w9(1), movz_w9(7), str_store]);
+        assert_eq!(decode_aarch64_probe_mask(&blob), Some(0x1_0007));
+        // Look-alikes must be refused: wrong rd, missing store, garbage.
+        let blob = words_to_bytes(&[movz_w9(7)]);
+        assert_eq!(decode_aarch64_probe_mask(&blob), None);
+        let str_other_reg = 0xB900_0000u32 | ((128 / 4) << 10) | (31 << 5) | 10;
+        let blob = words_to_bytes(&[movz_w9(7), str_other_reg]);
+        assert_eq!(decode_aarch64_probe_mask(&blob), None);
+        let shifted = 0x5280_0000u32 | (1u32 << 21) | (7 << 5) | 9; // movz lsl#16
+        let blob = words_to_bytes(&[shifted, str_store]);
+        assert_eq!(decode_aarch64_probe_mask(&blob), None);
+        // Padding in front (the real stub has ~30 words of prologue).
+        let mut blob = words_to_bytes(&[0xD503_201F; 29]); // 29x nop
+        blob.extend_from_slice(&words_to_bytes(&[movz_w9(0b111), str_store]));
+        assert_eq!(decode_aarch64_probe_mask(&blob), Some(0b111));
+    }
+
+    /// elf_va_to_offset maps through the covering PT_LOAD only.
+    #[test]
+    fn elf_va_to_offset_walks_pt_loads() {
+        let mut img = vec![0u8; 512];
+        img[0..4].copy_from_slice(b"ELF");
+        img[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        img[0x36..0x38].copy_from_slice(&56u16.to_le_bytes()); // phentsize
+        img[0x38..0x3a].copy_from_slice(&1u16.to_le_bytes()); // phnum
+        // PT_LOAD: vaddr 0x1000, offset 0x2000, filesz 0x100.
+        img[64..68].copy_from_slice(&1u32.to_le_bytes());
+        img[64 + 8..64 + 16].copy_from_slice(&0x2000u64.to_le_bytes());
+        img[64 + 16..64 + 24].copy_from_slice(&0x1000u64.to_le_bytes());
+        img[64 + 32..64 + 40].copy_from_slice(&0x100u64.to_le_bytes());
+        assert_eq!(elf_va_to_offset(&img, 0x1080), Some(0x2080));
+        assert_eq!(elf_va_to_offset(&img, 0x1000), Some(0x2000));
+        assert_eq!(elf_va_to_offset(&img, 0x1100), None); // end of filesz
+        assert_eq!(elf_va_to_offset(&img, 0x0), None); // before the LOAD
+    }
 
     fn required_sample(name: &str) -> Vec<u8> {
         std::fs::read(format!("target/release/{name}"))

@@ -12,10 +12,10 @@ use xenolith_crypto::{PAGE_MAC_DOMAIN, WRAP_DOMAIN};
 // Meta-block and host-ctx field offsets live in stub_meta.rs, shared with
 // the aarch64 emitter; re-exported here for existing consumers.
 pub use crate::stub_meta::{
-    CTX_ENVELOPE, CTX_ENVELOPE_LEN, CTX_GATE, CTX_IMAGE_BASE, CTX_LOAD_LIBRARY, CTX_MEASUREMENT,
-    CTX_GET_PROC, CTX_ORIG_ENTRY, CTX_PHDR_VA, CTX_VPROTECT, META_ENVELOPE_LEN, META_MEASUREMENT,
-    META_ORIGINAL_ENTRY, META_PAGE_SIZE, META_PAYLOAD_RVA, META_SELF_RVA, META_TABLE_RVA,
-    META_TLS_CALLBACK, META_UNPACKED, STUB_META_LEN,
+    CTX_ENVELOPE, CTX_ENVELOPE_LEN, CTX_GATE, CTX_IMAGE_BASE, CTX_LEN, CTX_LOAD_LIBRARY,
+    CTX_MEASUREMENT, CTX_PROBE_MASK, CTX_GET_PROC, CTX_ORIG_ENTRY, CTX_PHDR_VA, CTX_VPROTECT,
+    META_ENVELOPE_LEN, META_MEASUREMENT, META_ORIGINAL_ENTRY, META_PAGE_SIZE, META_PAYLOAD_RVA,
+    META_SELF_RVA, META_TABLE_RVA, META_TLS_CALLBACK, META_UNPACKED, STUB_META_LEN,
 };
 
 /// Failure phases for the fail-closed exit (PE `l_fail`). Every jump site
@@ -1245,7 +1245,9 @@ fn emit_inner_g5(
 
     a.set_label(&mut l_core_call)?;
     if !core.is_empty() {
-        // XlHostCtx at rsp+0x200 (112 bytes). Win64: rcx = &ctx.
+        // XlHostCtx at rsp+0x200 (136 bytes: grew from 120/112 with the
+        // phdr_va qword and the probe_mask/pad tail; 0x2FF8 of stack below
+        // absorbs it). Win64: rcx = &ctx.
         a.lea(rax, ptr(rsp + 0x200i32))?;
         a.mov(qword_ptr(rax), r15)?; // image_base
         a.mov(qword_ptr(rax + 8i32), r14)?; // envelope
@@ -1284,6 +1286,10 @@ fn emit_inner_g5(
         a.mov(qword_ptr(rax + 104i32), rdx)?;
         a.mov(rdx, qword_ptr(rsp + 0x130))?; // LoadLibraryExA
         a.mov(qword_ptr(rax + 112i32), rdx)?;
+        // PE carries no Android probes; the field is zeroed explicitly so
+        // the core never reads stack garbage at ctx+128 (behavior unchanged:
+        // probe_mask=0 short-circuits the aarch64-only guard anyway).
+        a.mov(dword_ptr(rax + CTX_PROBE_MASK as i32), 0u32)?;
         a.lea(rcx, ptr(rsp + 0x200i32))?;
         a.sub(rsp, 0x20i32)?;
         a.lea(rax, ptr(l_core_bytes))?;
@@ -1648,6 +1654,9 @@ pub struct ElfStub {
     pub meta_off: usize,
     /// DT_INIT replacement (also the first byte of the stub section).
     pub entry_off: u32,
+    /// Byte offsets of embedded guest thunks inside `bytes` (aarch64
+    /// vm-export; empty on the x86-64 ELF stub and when nothing lifted).
+    pub guest_thunk_offs: Vec<u32>,
 }
 
 /// ELF64 AMD64 DT_INIT bootstrap.
@@ -1660,6 +1669,11 @@ pub struct ElfStub {
 /// then tail-calls the original DT_INIT. GOT/PLT are already resolved by
 /// ld.so before DT_INIT, so `load_library`/`get_proc` stay null and xl_core
 /// skips IAT writeback.
+/// x86-64 ELF stub ctx reservation (bytes below the saved-register pushes;
+/// the ctx itself starts at rsp+0x20 inside it). 0x20 + 136 = 0xA8, so 0xC0
+/// keeps slack. Golden frame-size test below locks the >= 136 bound.
+const ELF_CTX_FRAME: i32 = 0xC0;
+
 pub fn emit_elf_stub(core: &[u8], core_entry: u32, sysv: bool) -> Result<ElfStub, String> {
     if core.is_empty() {
         return Err("empty xl_core object".into());
@@ -1706,10 +1720,11 @@ fn emit_elf_inner(
     a.je(l_forward)?;
 
     // Build XlHostCtx at rsp+0x20 (below it: 0x20 shadow for Win64 callees).
-    // 0xB0 covers the full 128-byte ctx (0x20 + 0x80) with slack: the old
-    // 0x80 reservation left the struct tail overlapping the saved-register
-    // slots, and zeroing ctx fields past +0x60 would clobber them on return.
-    a.sub(rsp, 0xB0i32)?;
+    // ELF_CTX_FRAME covers the full 136-byte ctx (0x20 + 0x88) with slack:
+    // the old 0x80 reservation left the struct tail overlapping the
+    // saved-register slots, and zeroing ctx fields past +0x60 would clobber
+    // them on return. Grew 0xB0 -> 0xC0 with CTX_PROBE_MASK (offset 128).
+    a.sub(rsp, ELF_CTX_FRAME)?;
     a.mov(qword_ptr(rsp + 0x20 + CTX_IMAGE_BASE), r15)?;
     a.mov(eax, dword_ptr(rbx + META_PAYLOAD_RVA as i32))?;
     a.lea(rax, ptr(r15 + rax))?;
@@ -1745,6 +1760,10 @@ fn emit_elf_inner(
     // appended PT_LOAD — the core must walk the table at its mapped VA.
     a.mov(eax, dword_ptr(rbx + META_TABLE_RVA as i32))?;
     a.mov(qword_ptr(rsp + 0x20 + CTX_PHDR_VA as i32), rax)?;
+    // x86-64 ELF carries NO Android probes (they are aarch64-only in this
+    // release), but the field must be written explicitly: the core must
+    // never read stack garbage at ctx+128 (plan WS-A review 3-3).
+    a.mov(dword_ptr(rsp + 0x20 + CTX_PROBE_MASK as i32), 0u32)?;
 
     // xl_core_activate(ctx) — the argument register follows the HOST
     // compiler of the core object: Win64 RCX (MSVC COFF) or SysV RDI
@@ -1757,7 +1776,7 @@ fn emit_elf_inner(
     a.lea(rax, ptr(l_core_bytes))?;
     a.add(rax, core_entry as i32)?;
     a.call(rax)?;
-    a.add(rsp, 0xB0i32)?;
+    a.add(rsp, ELF_CTX_FRAME)?;
     a.test(eax, eax)?;
     a.jz(l_fail)?;
 
@@ -1793,8 +1812,9 @@ fn emit_elf_inner(
     a.pop(rbx)?;
     a.ret()?;
 
-    // Fail closed: return as if init succeeded; every protected page is 0xCC,
-    // so the next protected call traps loudly.
+    // Fail closed: return as if init succeeded; every protected page is
+    // 0x90 filler on the ELF path (0xCC on PE), so the next protected call
+    // traps loudly.
     a.set_label(&mut l_fail)?;
     a.add(rsp, 8i32)?;
     a.pop(r15)?;
@@ -1882,7 +1902,60 @@ fn emit_elf_inner(
         bytes,
         meta_off,
         entry_off,
+        guest_thunk_offs: Vec::new(),
     })
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Golden frame-size lock for the x86-64 ELF stub (plan WS-A review
+    /// 2-6/3-3): the ctx reservation must cover shadow space (0x20) plus the
+    /// full 136-byte XlHostCtx, and the probe-mask word must land inside the
+    /// frame. Saved registers (rbx/r15) are pushed BEFORE the sub, so a
+    /// frame >= 0x20 + CTX_LEN keeps the struct tail strictly below them.
+    #[test]
+    fn elf_ctx_frame_covers_136_byte_ctx() {
+        assert!(
+            ELF_CTX_FRAME as usize >= 0x20 + CTX_LEN,
+            "ELF_CTX_FRAME {ELF_CTX_FRAME:#x} < 0x20 + {CTX_LEN}"
+        );
+        assert!(0x20 + CTX_PROBE_MASK + 4 <= ELF_CTX_FRAME as usize);
+        let core = [0xCCu8; 16];
+        let stub = emit_elf_stub(&core, 0, true).unwrap();
+        let b = &stub.bytes;
+        // sub rsp, 0xC0 / add rsp, 0xC0 -- imm32 forms (0xC0 exceeds imm8's
+        // signed range). Both must be present with the CURRENT constant.
+        let frame = u32::to_le_bytes(ELF_CTX_FRAME as u32);
+        let sub_rsp = [0x48u8, 0x81, 0xEC]
+            .iter()
+            .chain(frame.iter())
+            .copied()
+            .collect::<Vec<u8>>();
+        let add_rsp = [0x48u8, 0x81, 0xC4]
+            .iter()
+            .chain(frame.iter())
+            .copied()
+            .collect::<Vec<u8>>();
+        assert!(
+            b.windows(sub_rsp.len()).any(|w| w == sub_rsp),
+            "sub rsp, {ELF_CTX_FRAME:#x} missing"
+        );
+        assert!(
+            b.windows(add_rsp.len()).any(|w| w == add_rsp),
+            "add rsp, {ELF_CTX_FRAME:#x} missing"
+        );
+        // Explicit zero store of ctx->probe_mask at rsp+0x20+128 = rsp+0xA0:
+        // `mov dword [rsp+0xA0], 0`. 0xA0 > 127 forces the disp32 SIB form.
+        let mov_zero = [
+            0xC7u8, 0x84, 0x24, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert!(
+            b.windows(mov_zero.len()).any(|w| w == mov_zero),
+            "explicit probe_mask=0 store (ctx+128) missing from the x86-64 ELF stub"
+        );
+    }
+}

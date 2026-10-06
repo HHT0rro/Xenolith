@@ -13,7 +13,7 @@
   <a href="docs/WHITEBOX.md">White-box model</a>
 </p>
 
-**Xenolith is a post-link binary protector for Windows x86-64 PE64 (experimental Linux AMD64 ELF64; Android arm64/x86_64 ELF `.so` packing at the structural layer).** Give it a compiled binary — no source code, no recompilation — and it compiles the functions you select into position-independent native code that exists only in that one build. The protected image contains **no guest bytecode, no reusable opcode table, no central dispatcher**. Payload is sealed with per-page ChaCha20-Poly1305 and unsealed at load time by an injected PIC boot stub plus a freestanding C core.
+**Xenolith is a post-link binary protector for Windows x86-64 PE64 (experimental Linux AMD64 ELF64; experimental Android arm64/x86_64 ELF `.so` packing — real-app load verified on emulator, one input class still broken).** Give it a compiled binary — no source code, no recompilation — and it compiles the functions you select into position-independent native code that exists only in that one build. The protected image contains **no guest bytecode, no reusable opcode table, no central dispatcher**. Payload is sealed with per-page ChaCha20-Poly1305 and unsealed at load time by an injected PIC boot stub plus a freestanding C core.
 
 <p align="center">
   <img src="assets/demo-before-after.png" width="860" alt="check_license before packing vs. after Xenolith pack (--vm-export check_license): same input, same return value, nothing left to pattern-match" />
@@ -61,7 +61,7 @@ The packed DLL still exports `check_license`, but its body now lives inside the 
 
 | Crate | Responsibility |
 | --- | --- |
-| `xenolith-formats` | fail-closed PE64 + ELF64 AMD64 parser |
+| `xenolith-formats` | fail-closed PE64 + ELF64 AMD64/AARCH64 parser |
 | `xenolith-crypto` | MBA key shares, ChaCha20-Poly1305 AEAD, page MACs, hashed imports |
 | `xenolith-protocol` | EnvelopeV2 (`XLV2`) on-disk layout, AAD binding, fail-closed parsing |
 | `xenolith-pack` | lift, superoperator pipeline, EnvelopeV2 writer, PIC stub embedding |
@@ -73,7 +73,9 @@ Load-time flow (Windows): system loader → PIC stub boot (PEB walk, resolves `L
 
 On Linux the loader stays `ld.so`: Xenolith appends one R+X `PT_LOAD` and redirects `INIT_ARRAY[0]`; PIE/RELRO/GOT-PLT untouched. Verified on Ubuntu 24.04 (WSL): packed executables run, `.so` files survive `dlopen`/`dlclose`, symbol versioning and IFUNC resolvers work.
 
-On Android the same strategy packs arm64 (EM_AARCH64) and x86_64 ELF64 `.so` files with a hand-encoded AArch64 stub and an NDK-built arm64 core; page size is derived from the input (4-KiB and 16-KiB devices). Android strength is **page-level AEAD sealing only** — no per-function virtualization (ELF selection stays fail-closed) and no anti-debug probes; OS-load on device/emulator is a follow-up gate, not a claim.
+On Android the same strategy packs arm64 (EM_AARCH64) and x86_64 ELF64 `.so` files with a hand-encoded AArch64 stub and an NDK-built aarch64 core; page size is derived from the input (4-KiB and 16-KiB devices). The CLI surface is unchanged — same `pack`/`inspect` commands, profiles and `--json` shape (the report gains a `machine` field), and unsupported inputs (ELF32/armeabi-v7a, `PT_INTERP`, `p_align` > 16 KiB, RELR/packed relocations, `DT_INIT`+`DT_INIT_ARRAY` coexistence on aarch64) fail with named diagnostics. Android strength: page-level AEAD sealing on both machines, plus — **arm64 only** — a first-batch `--vm-export` (integer/memory/branch whitelist lifted to the 64-bit IR and re-emitted as per-block AArch64 superoperators; anything outside the whitelist — calls, SIMD/FP, atomics, PAC, multiply, bitfields and more — is a named pack error, never a silent approximation) and a bionic anti-debug probe set (TracerPid scan, `PTRACE_TRACEME` self-attach, `/proc/self/maps` marker scan; armed per profile, `max` = all three, other profiles = two, x86_64-ELF = none and reported as such). x86_64-ELF function selection stays fail-closed (the SysV x86-64 lift is a later stage).
+
+On-device status (emulator, Android 14 x86_64 + `ndk_translation`): a real arm64 app library (SimpleX `libsupport.so`, 14.6 MB → 19.2 MB) went through pack → APK repack → zipalign → sign → install → launch (plus force-stop relaunches) with the process alive, the library mapped and a clean logcat, and a synthetic x86_64 `.so` passes the same `dlopen`/`dlsym` check. The synthetic end-to-end gate (`/data/local/tmp/xl-e2e/run_e2e.sh`, rebuilt artifacts): the x86_64 packed image passes the hard gate — constructor forwarded through the stub, `xl_add`/`xl_mul` diffed against the native baseline over 9 cases; the arm64 4-KiB image passes the same check via `ndk_translation` (16/16 observed), and an arm64 image packed with `--vm-export xl_add` — the export virtualized into stub superoperators — also passes all 9 cases through translation, while `--vm-export xl_mul` is refused with a named whitelist error (multiply stays native). The arm64 16-KiB image passes translation only when the load bias happens to be 16-KiB congruent (~1/4 of runs; the vprotect shim aligns at the envelope page size this 4-KiB-kernel emulator does not guarantee). Anti-debug probes were armed in those max-profile images and did not false-positive under the clean loader; detection of an actually attached debugger was not tested on device. One input class is still broken: libraries whose ELF carries no `PT_PHDR` entry (e.g. PPSSPP 1.19.3's `libppsspp_jni.so`) pack successfully but the loader rejects them at load (`loaded phdr … not in loadable segment`) because the packed image moves `e_phoff` into the appended `PT_LOAD`; the packer does not yet fail closed there. A corner case is also open: when the input's executable segment is smaller than one derived page, zero pages are sealed and the input's constructor is silently skipped. Android load support stays experimental until these are fixed; real-device matrices are unverified.
 
 ## How it compares
 
@@ -141,6 +143,8 @@ cargo test --workspace --exclude xenolith-runtime
 ```
 
 `xenolith-runtime` is excluded because it is a `no_std` `#[panic_handler]` crate that workspace feature unification would pollute with `std` (E0152). Packing tests require the sample DLLs — missing samples fail the test, they are not skipped. Distribution build: `powershell -ExecutionPolicy Bypass -File scripts/build-exe.ps1` produces `dist/xenolith.exe` + sha256 (`-ReleaseBundle` adds SBOM, provenance and the performance-budget gate).
+
+Android arm64 packing additionally requires the NDK at CLI build time (`ANDROID_NDK_HOME`, or `ANDROID_NDK_ROOT`/`ANDROID_HOME`; CI wires this in `.github/workflows/android.yml`): a CLI built without it refuses arm64 inputs with a named error instead of emitting a broken artifact.
 
 ## License
 

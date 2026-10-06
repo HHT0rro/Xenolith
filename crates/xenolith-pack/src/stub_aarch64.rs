@@ -22,9 +22,10 @@
 
 use crate::stub::ElfStub;
 use crate::stub_meta::{
-    CTX_ENVELOPE, CTX_ENVELOPE_LEN, CTX_GATE, CTX_IMAGE_BASE, CTX_LOAD_LIBRARY, CTX_MEASUREMENT,
-    CTX_GET_PROC, CTX_PHDR_VA, CTX_VPROTECT, META_ENVELOPE_LEN, META_MEASUREMENT, META_ORIGINAL_ENTRY,
-    META_PAGE_SIZE, META_PAYLOAD_RVA, META_SELF_RVA, META_TABLE_RVA, META_UNPACKED, STUB_META_LEN,
+    CTX_ENVELOPE, CTX_ENVELOPE_LEN, CTX_GATE, CTX_IMAGE_BASE, CTX_LEN, CTX_LOAD_LIBRARY,
+    CTX_MEASUREMENT, CTX_PROBE_MASK, CTX_GET_PROC, CTX_PHDR_VA, CTX_VPROTECT, META_ENVELOPE_LEN,
+    META_MEASUREMENT, META_ORIGINAL_ENTRY, META_PAGE_SIZE, META_PAYLOAD_RVA, META_SELF_RVA,
+    META_TABLE_RVA, META_UNPACKED, STUB_META_LEN,
 };
 
 // ---- fixed instruction words (ARM ARM encodings, verified by unit test) ----
@@ -40,8 +41,6 @@ const STP_X19_X20_PRE: u32 = 0xA9BF_53F3;
 const LDP_X19_X20_POST: u32 = 0xA8C1_53F3;
 /// `ldp x29, x30, [sp], #16`
 const LDP_X29_X30_POST: u32 = 0xA8C1_7BFD;
-/// `ret` (return to LR).
-const RET: u32 = 0xD65F_03C0;
 /// `blr x17` — tail-call the original INIT_ARRAY[0] target.
 const BLR_X17: u32 = 0xD63F_0220;
 /// `svc #0` — Linux syscall (aarch64 generic table).
@@ -55,193 +54,11 @@ const NEG_X17: u32 = 0xCB11_03F1;
 /// `mvn x6, x17` (orn x6, xzr, x17) → x6 = page - 1.
 const MVN_X6_X17: u32 = 0xAA31_03E6;
 
-// ---- parameterized encoders (field masks per ARM ARM) ----
-const fn movz_x(rd: u32, imm16: u32) -> u32 {
-    0xD280_0000 | (imm16 << 5) | rd
-}
-const fn movz_w(rd: u32, imm16: u32) -> u32 {
-    0x5280_0000 | (imm16 << 5) | rd
-}
-const fn mov_x(rd: u32, rm: u32) -> u32 {
-    0xAA00_0000 | (rm << 16) | (31 << 5) | rd // orr rd, xzr, rm
-}
-const fn mov_w(rd: u32, rm: u32) -> u32 {
-    0x2A00_0000 | (rm << 16) | (31 << 5) | rd // orr rd, wzr, rm
-}
-const fn add_x_imm(rd: u32, rn: u32, imm12: u32) -> u32 {
-    0x9100_0000 | (imm12 << 10) | (rn << 5) | rd
-}
-const fn sub_x_imm(rd: u32, rn: u32, imm12: u32) -> u32 {
-    0xD100_0000 | (imm12 << 10) | (rn << 5) | rd
-}
-const fn add_x_reg(rd: u32, rn: u32, rm: u32) -> u32 {
-    0x8B00_0000 | (rm << 16) | (rn << 5) | rd
-}
-const fn sub_x_reg(rd: u32, rn: u32, rm: u32) -> u32 {
-    0xCB00_0000 | (rm << 16) | (rn << 5) | rd
-}
-const fn and_x_reg(rd: u32, rn: u32, rm: u32) -> u32 {
-    0x8A00_0000 | (rm << 16) | (rn << 5) | rd
-}
-const fn cmp_w_imm(rn: u32, imm12: u32) -> u32 {
-    0x7100_0000 | (imm12 << 10) | (rn << 5) | 31 // subs wzr, rn, #imm
-}
-const fn ldr_w(rt: u32, rn: u32, byte_off: u32) -> u32 {
-    0xB940_0000 | ((byte_off / 4) << 10) | (rn << 5) | rt
-}
-const fn ldrb_w(rt: u32, rn: u32, byte_off: u32) -> u32 {
-    0x3940_0000 | (byte_off << 10) | (rn << 5) | rt
-}
-const fn str_w(rt: u32, rn: u32, byte_off: u32) -> u32 {
-    0xB900_0000 | ((byte_off / 4) << 10) | (rn << 5) | rt
-}
-const fn str_x(rt: u32, rn: u32, byte_off: u32) -> u32 {
-    0xF900_0000 | ((byte_off / 8) << 10) | (rn << 5) | rt
-}
-const fn strb_w(rt: u32, rn: u32, byte_off: u32) -> u32 {
-    0x3900_0000 | (byte_off << 10) | (rn << 5) | rt
-}
-/// `stp x9, x10, [sp, #byte_off]` (signed-offset form; imm7 = bytes/8).
-const fn stp_x9_x10_off(byte_off: u32) -> u32 {
-    0xA900_0000 | (((byte_off / 8) & 0x7F) << 15) | (10 << 10) | (31 << 5) | 9
-}
-/// `ldp x9, x10, [x16, #byte_off]`.
-const fn ldp_x9_x10_off(byte_off: u32) -> u32 {
-    0xA940_0000 | (((byte_off / 8) & 0x7F) << 15) | (10 << 10) | (16 << 5) | 9
-}
-
-// ---- label fixups ----
-#[derive(Clone, Copy)]
-enum Target {
-    Label(usize),
-    /// First word after the code (core bytes start), offset by core_entry.
-    CoreEntry,
-    /// Meta word (first word of the 80-byte meta tail).
-    Meta,
-}
-
-#[derive(Clone, Copy)]
-enum FixupKind {
-    /// B / BL: imm26 at [25:0], value (target-pc)>>2.
-    Branch { base: u32 },
-    /// B.cond: imm19 at [23:5].
-    BranchCond { cond: u32 },
-    /// CBZ/CBNZ (sf picks 32/64-bit Rt): imm19 at [23:5].
-    CompBranch { base: u32, rt: u32 },
-    /// ADR: imm21 split immlo[30:29] / immhi[23:5], byte granularity.
-    Adr { rd: u32 },
-    /// TBNZ/TBZ: imm14 at [18:5], (target-pc)>>2.
-    TestBranch { base: u32, bit: u32, rt: u32 },
-}
-
-struct Fixup {
-    kind: FixupKind,
-    at_word: usize,
-    target: Target,
-}
-
-/// Two-pass word emitter with post-hoc label patching.
-struct Asm {
-    words: Vec<u32>,
-    fixups: Vec<Fixup>,
-    labels: Vec<usize>,
-}
-
-impl Asm {
-    fn new() -> Self {
-        Asm {
-            words: Vec::new(),
-            fixups: Vec::new(),
-            labels: Vec::new(),
-        }
-    }
-
-    fn label(&mut self) -> usize {
-        self.labels.push(usize::MAX);
-        self.labels.len() - 1
-    }
-
-    fn bind(&mut self, l: usize) {
-        self.labels[l] = self.words.len();
-    }
-
-    fn emit(&mut self, word: u32) {
-        self.words.push(word);
-    }
-
-    fn fixup(&mut self, kind: FixupKind, target: Target) {
-        self.fixups.push(Fixup {
-            kind,
-            at_word: self.words.len(),
-            target,
-        });
-    }
-
-    /// Resolve every fixup once `core_entry` (byte offset into the core
-    /// blob) is known; the core follows the code words directly and the
-    /// meta block follows the (padded) core.
-    fn finish(mut self, core_len_padded: usize, core_entry: u32) -> Result<Vec<u32>, String> {
-        let code_words = self.words.len();
-        let core_words = core_len_padded / 4;
-        let meta_word = code_words + core_words;
-        for f in &self.fixups {
-            let pc = f.at_word as i64 * 4;
-            let target_word = match f.target {
-                Target::Label(l) => {
-                    let w = self.labels[l];
-                    if w == usize::MAX {
-                        return Err("unbound stub label".into());
-                    }
-                    w as i64
-                }
-                Target::CoreEntry => code_words as i64 + (core_entry / 4) as i64,
-                Target::Meta => meta_word as i64,
-            };
-            let patched = match f.kind {
-                FixupKind::Branch { base } => {
-                    let rel = target_word * 4 - pc;
-                    if rel & 3 != 0 || rel / 4 < -(1 << 25) || rel / 4 >= (1 << 25) {
-                        return Err(format!("branch out of ±128MiB range ({rel})"));
-                    }
-                    base | (((rel / 4) as u32) & 0x03FF_FFFF)
-                }
-                FixupKind::BranchCond { cond } => {
-                    let rel = target_word * 4 - pc;
-                    if rel & 3 != 0 || rel / 4 < -(1 << 18) || rel / 4 >= (1 << 18) {
-                        return Err(format!("b.cond out of ±1MiB range ({rel})"));
-                    }
-                    0x5400_0000 | ((((rel / 4) as u32) & 0x7FFFF) << 5) | cond
-                }
-                FixupKind::CompBranch { base, rt } => {
-                    let rel = target_word * 4 - pc;
-                    if rel & 3 != 0 || rel / 4 < -(1 << 18) || rel / 4 >= (1 << 18) {
-                        return Err(format!("cbz/cbnz out of ±1MiB range ({rel})"));
-                    }
-                    base | ((((rel / 4) as u32) & 0x7FFFF) << 5) | rt
-                }
-                FixupKind::Adr { rd } => {
-                    let rel = target_word * 4 - pc;
-                    if rel < -(1 << 20) || rel >= (1 << 20) {
-                        return Err(format!("adr out of ±1MiB range ({rel})"));
-                    }
-                    let imm = rel as u32 & 0x1F_FFFF;
-                    0x1000_0000 | ((imm & 3) << 29) | (((imm >> 2) & 0x7_FFFF) << 5) | rd
-                }
-                FixupKind::TestBranch { base, bit, rt } => {
-                    let rel = target_word * 4 - pc;
-                    if rel & 3 != 0 || rel / 4 < -(1 << 13) || rel / 4 >= (1 << 13) {
-                        return Err(format!("tbz/tbnz out of ±32KiB range ({rel})"));
-                    }
-                    let b5 = (bit >> 5) & 1;
-                    let b40 = bit & 0x1F;
-                    base | (b5 << 31) | (b40 << 19) | ((((rel / 4) as u32) & 0x3FFF) << 5) | rt
-                }
-            };
-            self.words[f.at_word] = patched;
-        }
-        Ok(self.words)
-    }
-}
+use xenolith_vm::aarch64_asm::{
+    add_x_imm, add_x_reg, and_x_reg, cmp_w_imm, ldp_x_off, ldr_w, ldrb_w, mov_w, mov_x, movk_w,
+    movz_w, movz_x, str_w, str_x, strb_w, stp_x_off, sub_x_imm, sub_x_reg, Asm, FixupKind,
+    Target, RET,
+};
 
 // Registers used by the stub (AAPCS64):
 //   x16/x17: IP0/IP1 scratch (meta pointer / values)
@@ -260,8 +77,14 @@ const X17: u32 = 17;
 const X19: u32 = 19;
 const SP: u32 = 31;
 const GATE_META_BYTE: u32 = 63; // debug_gate byte inside meta
-/// CTX reservation: 0xC0 covers the 128-byte ctx with alignment slack.
-const CTX_FRAME: u32 = 0xC0;
+/// CTX reservation: 0xD0 covers the 136-byte ctx (grew from 128 with
+/// CTX_PROBE_MASK) with alignment slack. Golden frame assertions lock the
+/// ≥136 bound below.
+const CTX_FRAME: u32 = 0xD0;
+
+/// Compile-time frame contract: the stack reservation must cover the full
+/// `XlHostCtx` the core reads (probe_mask tail included).
+const _: () = assert!(CTX_FRAME as usize >= CTX_LEN);
 
 // XL_PAGE_* protection constants (stub_meta contract with xl_core).
 const XL_PAGE_RW: u32 = 0x04;
@@ -271,7 +94,20 @@ const XL_PAGE_RWX: u32 = 0x40;
 const __NR_MPROTECT: u32 = 226;
 
 /// Emit the aarch64 ELF stub: `[code][core][meta 80B]`, entry at offset 0.
-pub fn emit_elf_stub_aarch64(core: &[u8], core_entry: u32) -> Result<ElfStub, String> {
+///
+/// `probe_mask` is the pack-time Android probe bitmap
+/// (`xenolith_guard::android_probe_mask`). It is encoded as a machine-code
+/// constant (single `movz` while ≤ imm16 — always true with ≤16 Android
+/// probes, asserted in the guard tests; `movz+movk` pair beyond) and stored
+/// into `ctx->probe_mask` (offset 128) for the core's `XL_PROBE_BIT_*`
+/// consumption. Zero is an explicit opt-out that only a deliberate custom
+/// packer invocation can produce.
+pub fn emit_elf_stub_aarch64(
+    core: &[u8],
+    core_entry: u32,
+    probe_mask: u32,
+    guest_thunks: &[Vec<u32>],
+) -> Result<ElfStub, String> {
     if core.is_empty() {
         return Err("empty xl_core object".into());
     }
@@ -323,10 +159,10 @@ pub fn emit_elf_stub_aarch64(core: &[u8], core_entry: u32) -> Result<ElfStub, St
     a.emit(ldrb_w(X9, X16, GATE_META_BYTE));
     a.emit(strb_w(X9, SP, CTX_GATE as u32));
     // measurement: 32 bytes in two ldp/stp pairs.
-    a.emit(ldp_x9_x10_off(META_MEASUREMENT as u32));
-    a.emit(stp_x9_x10_off(CTX_MEASUREMENT as u32));
-    a.emit(ldp_x9_x10_off(META_MEASUREMENT as u32 + 16));
-    a.emit(stp_x9_x10_off(CTX_MEASUREMENT as u32 + 16));
+    a.emit(ldp_x_off(9, 10, 16, META_MEASUREMENT as u32 / 8));
+    a.emit(stp_x_off(9, 10, 31, CTX_MEASUREMENT as u32 / 8));
+    a.emit(ldp_x_off(9, 10, 16, (META_MEASUREMENT as u32 + 16) / 8));
+    a.emit(stp_x_off(9, 10, 31, (CTX_MEASUREMENT as u32 + 16) / 8));
     // load_library/get_proc stay NULL (ld.so resolved GOT/PLT already) and
     // the module-dir channel slots are zeroed so the core never chases a
     // stale stack value as a function pointer.
@@ -343,6 +179,16 @@ pub fn emit_elf_stub_aarch64(core: &[u8], core_entry: u32) -> Result<ElfStub, St
     // appended PT_LOAD — the core must walk the table at its mapped VA.
     a.emit(ldr_w(X9, X16, META_TABLE_RVA as u32));
     a.emit(str_x(X9, SP, CTX_PHDR_VA as u32));
+    // probe_mask: pack-time Android probe bitmap (see fn doc). Explicitly
+    // stored so the core never reads stack garbage at ctx+128.
+    a.emit(movz_w(X9, probe_mask & 0xFFFF));
+    if probe_mask > 0xFFFF {
+        // Future-proofing beyond imm16 (review 3-3): unreachable while the
+        // Android probe set fits 16 bits, kept so a growing set cannot
+        // silently truncate the mask.
+        a.emit(movk_w(X9, probe_mask >> 16, 1));
+    }
+    a.emit(str_w(X9, SP, CTX_PROBE_MASK as u32));
     a.emit(MOV_X0_SP);
     a.fixup(FixupKind::Branch { base: 0x9400_0000 }, Target::CoreEntry);
     a.emit(0); // bl xl_core_activate
@@ -509,6 +355,15 @@ pub fn emit_elf_stub_aarch64(core: &[u8], core_entry: u32) -> Result<ElfStub, St
     a.emit(movz_w(X0, 0));
     a.emit(RET);
 
+    // Guest thunks append after the vprotect shim, before the core bytes:
+    // plain word streams whose branches are already resolved relative to
+    // their own start (design §8.3 — entered by a direct `b`, no BTI).
+    let mut guest_thunk_offs = Vec::with_capacity(guest_thunks.len());
+    for words in guest_thunks {
+        guest_thunk_offs.push((a.here() * 4) as u32);
+        a.emit_words(words);
+    }
+
     let code = a.finish(core_padded, core_entry)?;
     let mut bytes = Vec::with_capacity(code.len() * 4 + core_padded + STUB_META_LEN);
     for w in &code {
@@ -523,6 +378,7 @@ pub fn emit_elf_stub_aarch64(core: &[u8], core_entry: u32) -> Result<ElfStub, St
         bytes,
         meta_off,
         entry_off: 0,
+        guest_thunk_offs,
     })
 }
 
@@ -545,7 +401,7 @@ mod tests {
     fn structure_and_golden_prologue() {
         // 24-byte fake core, entry at +4 (word-aligned).
         let core = [0xAAu8; 24];
-        let stub = emit_elf_stub_aarch64(&core, 4).unwrap();
+        let stub = emit_elf_stub_aarch64(&core, 4, 0, &[]).unwrap();
         assert_eq!(stub.entry_off, 0, "INIT_ARRAY[0] redirects to byte 0");
         assert_eq!(stub.bytes.len() % 4, 0);
         assert_eq!(
@@ -589,7 +445,7 @@ mod tests {
     fn bl_targets_core_entry() {
         let core = [0x11u8; 40];
         let entry = 8u32;
-        let stub = emit_elf_stub_aarch64(&core, entry).unwrap();
+        let stub = emit_elf_stub_aarch64(&core, entry, 0, &[]).unwrap();
         // Find the `bl` to the core: scan for a word whose imm26 resolves
         // into [meta_off - core_len, meta_off).
         let mut found = 0;
@@ -616,7 +472,7 @@ mod tests {
     #[test]
     fn vprotect_shim_encodings() {
         let core = [0u8; 8];
-        let stub = emit_elf_stub_aarch64(&core, 0).unwrap();
+        let stub = emit_elf_stub_aarch64(&core, 0, 0, &[]).unwrap();
         let b = &stub.bytes;
         // The shim opens with `bti c` after the fail-path `b ret`.
         let vp = b
@@ -650,8 +506,69 @@ mod tests {
 
     #[test]
     fn rejects_bad_core_entry() {
-        assert!(emit_elf_stub_aarch64(&[1u8; 16], 2).is_err(), "unaligned entry");
-        assert!(emit_elf_stub_aarch64(&[], 0).is_err(), "empty core");
-        assert!(emit_elf_stub_aarch64(&[1u8; 16], 16).is_err(), "entry at core end");
+        assert!(emit_elf_stub_aarch64(&[1u8; 16], 2, 0, &[]).is_err(), "unaligned entry");
+        assert!(emit_elf_stub_aarch64(&[], 0, 0, &[]).is_err(), "empty core");
+        assert!(emit_elf_stub_aarch64(&[1u8; 16], 16, 0, &[]).is_err(), "entry at core end");
+    }
+
+    // ---- probe-mask protocol (plan WS-A §2.2.3, review 3-3) ----
+
+    /// `str w9, [sp, #CTX_PROBE_MASK]` — the unique store to sp+128.
+    const STR_W9_SP_PROBE: u32 = 0xB900_0000 | ((128 / 4) << 10) | (31 << 5) | 9;
+
+    fn find_word(stub: &[u8], want: u32) -> Option<usize> {
+        stub.chunks_exact(4)
+            .position(|c| u32::from_le_bytes(c.try_into().unwrap()) == want)
+    }
+
+    #[test]
+    fn probe_mask_single_movz_within_imm16() {
+        // The full v1 Android probe set (0b111): one movz + one str.
+        let core = [0u8; 8];
+        let stub = emit_elf_stub_aarch64(&core, 0, 0b111, &[]).unwrap();
+        let at = find_word(&stub.bytes, STR_W9_SP_PROBE).expect("probe-mask store present");
+        assert_eq!(
+            word_at(&stub.bytes, at - 1),
+            movz_w(X9, 0b111),
+            "mask ≤ imm16 must be a single movz immediately before the store"
+        );
+        // Zero-mask opt-out is still written explicitly (no stack garbage).
+        let stub0 = emit_elf_stub_aarch64(&core, 0, 0, &[]).unwrap();
+        assert!(find_word(&stub0.bytes, STR_W9_SP_PROBE).is_some());
+        let at0 = find_word(&stub0.bytes, STR_W9_SP_PROBE).unwrap();
+        assert_eq!(word_at(&stub0.bytes, at0 - 1), movz_w(X9, 0));
+    }
+
+    #[test]
+    fn probe_mask_movz_movk_fallback_beyond_imm16() {
+        let core = [0u8; 8];
+        let mask = 0x1_0007u32; // > imm16: unreachable today, encoder must cope
+        let stub = emit_elf_stub_aarch64(&core, 0, mask, &[]).unwrap();
+        let at = find_word(&stub.bytes, STR_W9_SP_PROBE).expect("probe-mask store present");
+        assert_eq!(word_at(&stub.bytes, at - 1), movk_w(X9, 1, 1));
+        assert_eq!(word_at(&stub.bytes, at - 2), movz_w(X9, 7));
+    }
+
+    /// Golden frame-size lock (plan §2.2.3): the ctx reservation must cover
+    /// the full 136-byte struct and the saved-register slots sit ABOVE the
+    /// frame (pushed before the sub), so the struct tail cannot clobber
+    /// them on return.
+    #[test]
+    fn ctx_frame_covers_136_byte_struct() {
+        assert!(CTX_FRAME as usize >= CTX_LEN, "CTX_FRAME {CTX_FRAME:#x} < CTX_LEN {CTX_LEN}");
+        let core = [0u8; 8];
+        let stub = emit_elf_stub_aarch64(&core, 0, 0, &[]).unwrap();
+        // sub sp, sp, #CTX_FRAME — decode the imm12 back out of the emitted
+        // word rather than trusting the constant alone.
+        let sub_sp = sub_x_imm(SP, SP, CTX_FRAME);
+        let at = find_word(&stub.bytes, sub_sp).expect("sub sp, sp, #CTX_FRAME emitted");
+        let imm12 = (word_at(&stub.bytes, at) >> 10) & 0xFFF;
+        assert!(imm12 as usize >= CTX_LEN, "emitted frame {imm12:#x} < {CTX_LEN}");
+        // The probe-mask store offset must sit inside the frame.
+        assert!(CTX_PROBE_MASK + 4 <= imm12 as usize);
+        // Saved registers (x29/x30, x19/x20) were pushed BEFORE the sub, so
+        // the largest ctx offset (probe_mask+pad at 132..136) stays strictly
+        // below them.
+        assert!(CTX_LEN <= imm12 as usize);
     }
 }
