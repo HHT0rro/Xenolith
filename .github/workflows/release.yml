@@ -34,8 +34,10 @@ jobs:
         # refuses arm64 inputs with a named error and the Android release
         # claim would be false.
         shell: bash
+        # No pipefail on purpose: `yes | sdkmanager` ends with SIGPIPE on
+        # `yes` once sdkmanager exits; the sdkmanager status must decide.
         run: |
-          set -euo pipefail
+          set -eu
           if [ "$RUNNER_OS" = "Windows" ]; then
             export ANDROID_HOME="$LOCALAPPDATA/Android/Sdk"
             mkdir -p "$ANDROID_HOME/cmdline-tools"
