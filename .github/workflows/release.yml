@@ -28,6 +28,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned NDK (r27c) for the aarch64 core
+        # Release CLIs must embed the NDK-built aarch64 core so arm64 packing
+        # works out of the box (same pin as android.yml). Without it the CLI
+        # refuses arm64 inputs with a named error and the Android release
+        # claim would be false.
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            export ANDROID_HOME="$LOCALAPPDATA/Android/Sdk"
+            mkdir -p "$ANDROID_HOME/cmdline-tools"
+            curl -sSL -o cmdtools.zip https://dl.google.com/android/repository/commandlinetools-win-11076708_latest.zip
+            unzip -q cmdtools.zip -d "$ANDROID_HOME/cmdline-tools"
+            mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+            SDKMGR="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager.bat"
+          else
+            SDKMGR="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          fi
+          yes | "$SDKMGR" "ndk;27.2.12479018" > /dev/null
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
       - name: Build workspace and samples
         run: |
           cargo build -p xenolith-cli --release
@@ -35,6 +56,8 @@ jobs:
       - name: Regression
         env:
           XL_SKIP_WSL_TESTS: ${{ matrix.os == 'windows-latest' && '1' || '0' }}
+        # With ANDROID_NDK_HOME set the aarch64 pack/vm tests run for real
+        # here instead of skipping — the release regression covers Android.
         run: cargo test --workspace --exclude xenolith-runtime
       - name: Assemble release bundle
         run: >
