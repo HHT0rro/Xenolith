@@ -63,11 +63,20 @@ fn main() {
 
     // AArch64 core for Android packing: cross-compiled with the NDK clang.
     // A missing NDK must NOT fail the build (PE/x86-64 packing is unaffected);
-    // the marker makes arm64 packing fail closed with a named error instead.
+    // the placeholder plus the XL_AARCH64_CORE flag make arm64 packing fail
+    // closed with a named error instead, while include_bytes! always has a
+    // file to embed (the object is baked into the binary — never read off
+    // the build machine's disk at runtime, which is how v1.1.0 shipped a
+    // CLI that could not pack anything off the CI runner).
+    let aarch64_obj = out.join("xl_core_aarch64.o");
     match compile_aarch64_core(&src, &out) {
-        Ok(path) => println!("cargo:rustc-env=XL_CORE_OBJ_AARCH64_PATH={}", path.display()),
+        Ok(path) => {
+            assert_eq!(path, aarch64_obj, "aarch64 core must land at the staged path");
+            println!("cargo:rustc-env=XL_AARCH64_CORE=1");
+        }
         Err(reason) => {
-            println!("cargo:rustc-env=XL_CORE_OBJ_AARCH64_PATH=NONE");
+            std::fs::write(&aarch64_obj, [0u8; 8]).expect("write aarch64 placeholder");
+            println!("cargo:rustc-env=XL_AARCH64_CORE=0");
             eprintln!("xenolith-pack: aarch64 core not built: {reason}");
         }
     }

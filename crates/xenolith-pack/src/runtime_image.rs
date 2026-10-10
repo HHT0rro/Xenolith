@@ -644,25 +644,28 @@ pub fn load_builtin(arch: CoreArch) -> Result<RuntimeImage, RuntimeImageError> {
 }
 
 fn builtin_object_bytes(arch: CoreArch) -> Result<Vec<u8>, RuntimeImageError> {
+    // The core objects are EMBEDDED via include_bytes!, never read off the
+    // build machine's disk at runtime. v1.1.0 shipped a CLI whose "builtin"
+    // loader fs::read() the build-time OUT_DIR path — the downloaded exe
+    // could not pack anything (PE included) off the CI runner. The env-var
+    // overrides remain for local dev/test cycles against a fresh object.
     match arch {
         CoreArch::X8664 => {
             let path = option_env!("XL_CORE_OBJ").unwrap_or("");
             if !path.is_empty() {
                 return std::fs::read(path).map_err(|e| RuntimeImageError::Missing(e.to_string()));
             }
-            let out = env!("XL_CORE_OBJ_PATH");
-            std::fs::read(out).map_err(|e| RuntimeImageError::Missing(format!("{out}: {e}")))
+            Ok(include_bytes!(concat!(env!("OUT_DIR"), "/xl_core.obj")).to_vec())
         }
         CoreArch::Aarch64 => {
-            let path = env!("XL_CORE_OBJ_AARCH64_PATH");
-            if path == "NONE" || path.is_empty() {
+            if env!("XL_AARCH64_CORE") != "1" {
                 return Err(RuntimeImageError::Missing(
                     "aarch64 runtime core not built (NDK not found): set \
                      ANDROID_NDK_HOME/ANDROID_NDK_ROOT/ANDROID_HOME and rebuild; \
                      x86-64/PE packing is unaffected".to_string(),
                 ));
             }
-            std::fs::read(path).map_err(|e| RuntimeImageError::Missing(e.to_string()))
+            Ok(include_bytes!(concat!(env!("OUT_DIR"), "/xl_core_aarch64.o")).to_vec())
         }
     }
 }
