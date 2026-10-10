@@ -30,25 +30,29 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install pinned NDK (r27c) for the aarch64 core
         # Release CLIs must embed the NDK-built aarch64 core so arm64 packing
-        # works out of the box (same pin as android.yml). Without it the CLI
-        # refuses arm64 inputs with a named error and the Android release
-        # claim would be false.
+        # works out of the box (same pin as android.yml). Both legs install
+        # cmdline-tools themselves: ubuntu-latest no longer ships an Android
+        # SDK, and windows-latest never did. `shell: bash` on Actions implies
+        # pipefail — `yes | sdkmanager` always ends in SIGPIPE on `yes`, so it
+        # is disabled here; the sdkmanager status and the dir assert decide.
         shell: bash
-        # No pipefail on purpose: `yes | sdkmanager` ends with SIGPIPE on
-        # `yes` once sdkmanager exits; the sdkmanager status must decide.
         run: |
           set -eu
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            export ANDROID_HOME="$LOCALAPPDATA/Android/Sdk"
-            mkdir -p "$ANDROID_HOME/cmdline-tools"
-            curl -sSL -o cmdtools.zip https://dl.google.com/android/repository/commandlinetools-win-11076708_latest.zip
-            unzip -q cmdtools.zip -d "$ANDROID_HOME/cmdline-tools"
-            mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
-            SDKMGR="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager.bat"
-          else
-            SDKMGR="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          fi
+          set +o pipefail
+          case "$RUNNER_OS" in
+            Windows) CT=win; BAT=.bat ;;
+            *)       CT=linux; BAT= ;;
+          esac
+          export ANDROID_HOME="${ANDROID_HOME:-$HOME/android-sdk}"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          curl -sSL -o cmdtools.zip "https://dl.google.com/android/repository/commandlinetools-${CT}-11076708_latest.zip"
+          unzip -q cmdtools.zip -d "$ANDROID_HOME/cmdline-tools"
+          rm -rf "$ANDROID_HOME/cmdline-tools/latest"
+          mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+          SDKMGR="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager${BAT}"
+          yes | "$SDKMGR" --licenses > /dev/null
           yes | "$SDKMGR" "ndk;27.2.12479018" > /dev/null
+          test -d "$ANDROID_HOME/ndk/27.2.12479018"
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
       - name: Build workspace and samples

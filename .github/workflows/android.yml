@@ -87,19 +87,34 @@ jobs:
           # C-2: appended R+X LOAD exists; no W+X LOAD
           "$RE" -lW "$OUT" | grep -qE "LOAD.*R E"
           ! "$RE" -lW "$OUT" | grep -qE "LOAD.*RWE"
-          # C-4: INIT_ARRAY[0] RELATIVE(1027) addend lands in the appended LOAD
-          ADDEND=$("$RE" -rW "$OUT" | awk '/R_AARCH64_RELATIVE/ {print $4}' | head -1)
-          python3 - "$ADDEND" <<'EOF'
-          import struct, sys
-          addend = int(sys.argv[1], 16)
-          data = open("target/android-ci/out-aarch64-4096.xl.so", "rb").read()
+          # C-4: the INIT_ARRAY[0] redirect — the RELATIVE whose r_offset
+          # equals DT_INIT_ARRAY — has its addend in the appended LOAD.
+          # Select by offset, not head -1: since the vm-hook relocation
+          # preservation work the table also carries preserved input
+          # RELATIVEs, so the first row is no longer the redirect.
+          "$RE" -dW "$OUT" > target/android-ci/dyn.txt
+          "$RE" -rW "$OUT" > target/android-ci/rel.txt
+          python3 - <<'EOF'
+          import re, struct
+          OUT = "target/android-ci/out-aarch64-4096.xl.so"
+          dyn = open("target/android-ci/dyn.txt").read()
+          rel = open("target/android-ci/rel.txt").read()
+          ia = int(re.search(r"\(INIT_ARRAY\)\s+(\S+)", dyn).group(1), 16)
+          addend = None
+          for line in rel.splitlines():
+            m = re.match(r"([0-9a-fA-F]+)\s+\S+\s+R_AARCH64_RELATIVE\s+(\S+)", line)
+            if m and int(m.group(1), 16) == ia:
+              addend = int(m.group(2), 16)
+              break
+          assert addend is not None, f"no R_AARCH64_RELATIVE at DT_INIT_ARRAY {ia:#x}"
+          data = open(OUT, "rb").read()
           phoff = struct.unpack_from("<Q", data, 32)[0]
           phnum = struct.unpack_from("<H", data, 56)[0]
           o = phoff + (phnum - 2) * 56
           va = struct.unpack_from("<Q", data, o + 16)[0]
           msz = struct.unpack_from("<Q", data, o + 40)[0]
-          assert va <= addend < va + msz, f"addend {addend:#x} outside appended LOAD [{va:#x},{va+msz:#x})"
-          print("INIT_ARRAY[0] addend lands in the appended LOAD: OK")
+          assert va <= addend < va + msz, f"redirect addend {addend:#x} outside appended LOAD [{va:#x},{va+msz:#x})"
+          print("INIT_ARRAY[0] redirect addend lands in the appended LOAD: OK")
           EOF
       - name: Tamper control (flip one envelope byte → inspect stays packed, envelope refuses)
         run: |
