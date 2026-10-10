@@ -289,11 +289,14 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
     let program = Program::encode_key_mix(map, &mba);
 
     // ---- Android anti-debug probe policy (plan WS-A 2.2.3) ----
-    // aarch64: profile-defaulted Android set (Max = all three; otherwise the
-    // two core debugger checks), mirroring the PE probe policy
-    // (lib.rs probe selection). x86-64-ELF: none -- probes are aarch64-only
-    // in this release and the report says so explicitly (no fake
-    // pass-through of the Windows claim).
+    // aarch64: profile-defaulted Android set (Max = TracerPid + Maps;
+    // otherwise TracerPid only). PtraceSelfAttach is implemented but never
+    // profile-armed: TRACEME on this dlopen/INIT_ARRAY thread makes the
+    // parent (zygote on real apps) the thread's tracer with no tracee-side
+    // detach, and the next signal on the thread freezes the app (see
+    // `android_probes_for_profile`). x86-64-ELF: none -- probes are
+    // aarch64-only in this release and the report says so explicitly (no
+    // fake pass-through of the Windows claim).
     let android_probes: Vec<Probe> = match machine {
         ElfMachine::Aarch64 => android_probes_for_profile(request.profile == Profile::Max),
         ElfMachine::Amd64 => Vec::new(),
@@ -782,6 +785,7 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
             ElfMachine::Amd64 => "x86_64".into(),
             ElfMachine::Aarch64 => "aarch64".into(),
         },
+        debug_gate: request.debug_gate,
         input_bytes: request.input.len(),
         output_bytes: image.len(),
         backend: BACKEND_PIC_STUB.into(),
@@ -1092,7 +1096,7 @@ fn scan_inner_label_refs(
             .iter()
             .position(|(w_rva, w_len)| rva > *w_rva as u64 && rva < (*w_rva as u64 + *w_len as u64))
     };
-    // (a) RELATIVE addends and dynsym st_values pointing inside a window.
+    // (a) RELATIVE addends pointing inside a window.
     let phdrs = elf::program_headers(input, parsed).map_err(PackError::Format)?;
     let (mut rela_off, mut rela_sz, mut dyn_off, mut dyn_len) = (0u64, 0u64, 0usize, 0usize);
     for ph in &phdrs {
@@ -1131,6 +1135,29 @@ fn scan_inner_label_refs(
                      table) would execute trap filler; keep the function native with \
                      --allow-native-fallback",
                     windows[wi].0, windows[wi].0, windows[wi].1
+                )));
+            }
+        }
+    }
+    // (a2) Defined FUNC symbol st_values (dynsym + symtab) pointing inside
+    // a window. An alias symbol whose st_value lands mid-window keeps
+    // resolving there in the packed image while the hook wrote trap filler
+    // over it — a GOT/PLT or dlsym indirect call would SIGTRAP (independent
+    // review 2026-10-06: the addend-only check below let exactly this
+    // through). Size-0 aliases (no st_size) stay outside these parsers'
+    // surface and are an accepted residual, same as before.
+    for (face, syms) in [
+        ("dynsym", elf::dynsym_functions(input, parsed).map_err(PackError::Format)?),
+        ("symtab", elf::symtab_functions(input, parsed).map_err(PackError::Format)?),
+    ] {
+        for sym in syms {
+            if let Some(wi) = inside(sym.value) {
+                return Err(PackError::Lift(format!(
+                    "vm-export rva_{:#x}: {face} symbol `{}` (st_value {:#x}) points inside \
+                     the virtualized window (rva {:#x}, {} bytes) - an indirect call through \
+                     its GOT/PLT slot or dlsym would execute trap filler; keep the function \
+                     native with --allow-native-fallback",
+                    windows[wi].0, sym.name, sym.value, windows[wi].0, windows[wi].1
                 )));
             }
         }
@@ -1561,7 +1588,7 @@ mod tests {
         // PT_INTERP and place the path string past the RW LOAD (extended).
         let img_len = img.len();
         img.resize(img_len + 16, 0);
-        img[img_len..img_len + 8].copy_from_slice(b"/system ");
+        img[img_len..img_len + 8].copy_from_slice(b"/system\x00");
         let p = 64 + 3 * 56;
         img[p..p + 4].copy_from_slice(&3u32.to_le_bytes()); // PT_INTERP
         img[p + 8..p + 16].copy_from_slice(&(img_len as u64).to_le_bytes());
@@ -1625,11 +1652,11 @@ mod tests {
             &[(5u64, STRTAB_OFF as u64), (10u64, 8u64)], // DT_STRTAB, DT_STRSZ
             false,
         );
-        img[STRTAB_OFF..STRTAB_OFF + 8].copy_from_slice(b"libc.so ");
+        img[STRTAB_OFF..STRTAB_OFF + 8].copy_from_slice(b"libc.so\x00");
         match pack_elf(&req(&img, false)) {
             Ok(out) => {
                 assert!(
-                    &out.image[STRTAB_OFF..STRTAB_OFF + 8] == b"libc.so ",
+                    &out.image[STRTAB_OFF..STRTAB_OFF + 8] == b"libc.so\x00",
                     "strtab inside the RX LOAD must survive as plaintext"
                 );
             }
@@ -1703,15 +1730,17 @@ mod tests {
         let Some(out) = pack_aarch64_or_skip(&img, Profile::Max) else {
             return;
         };
-        // Max profile: the full Android set, in canonical bitmap order.
+        // Max profile: the default armed set, in canonical bitmap order
+        // (PtraceSelfAttach implemented but not profile-armed — freeze
+        // hazard, see android_probes_for_profile).
         assert_eq!(
             out.report.probes,
-            vec!["TracerPidScan", "PtraceSelfAttach", "MapsScan"],
+            vec!["TracerPidScan", "MapsScan"],
             "report must list exactly the injected probes"
         );
         assert_eq!(
             out.packed.probes,
-            vec![Probe::TracerPidScan, Probe::PtraceSelfAttach, Probe::MapsScan]
+            vec![Probe::TracerPidScan, Probe::MapsScan]
         );
         // The report note names them and states the fail-closed contract.
         assert!(
@@ -1727,7 +1756,7 @@ mod tests {
         assert_eq!(info["packed"], serde_json::json!(true));
         assert_eq!(
             info["probes"],
-            serde_json::json!(["TracerPidScan", "PtraceSelfAttach", "MapsScan"]),
+            serde_json::json!(["TracerPidScan", "MapsScan"]),
             "inspect must round-trip the probe manifest from the stub bytes"
         );
         let note = info["note"].as_str().unwrap_or_default();
@@ -1740,16 +1769,15 @@ mod tests {
         let Some(out) = pack_aarch64_or_skip(&img, Profile::Standard) else {
             return;
         };
+        // PtraceSelfAttach is not profile-armed (freeze hazard, see
+        // android_probes_for_profile) — non-Max keeps TracerPid only.
         assert_eq!(
             out.report.probes,
-            vec!["TracerPidScan", "PtraceSelfAttach"],
-            "non-Max profiles arm only the two core debugger checks"
+            vec!["TracerPidScan"],
+            "non-Max profiles arm the TracerPid core check only"
         );
         let info = crate::inspect_bytes(&out.image).expect("packed artifact inspects");
-        assert_eq!(
-            info["probes"],
-            serde_json::json!(["TracerPidScan", "PtraceSelfAttach"])
-        );
+        assert_eq!(info["probes"], serde_json::json!(["TracerPidScan"]));
     }
 
     /// x86-64 ELF: zero probes AND the explicit aarch64-only note -- the
@@ -1832,6 +1860,75 @@ mod tests {
     }
 
     const LEAF_ADD: [u32; 2] = [0x8B01_0000, 0xD65F_03C0]; // add x0,x0,x1; ret
+
+    /// `elf_dyn_fixture_with_fn` plus a second GLOBAL FUNC symbol
+    /// `inner_alias` at `alias_va` — the alias-inside-window probe shape
+    /// from independent review 2026-10-06.
+    fn elf_dyn_fixture_with_alias(alias_va: u64) -> Vec<u8> {
+        let mut img = elf_dyn_fixture(ElfMachine::Aarch64, &[], false);
+        let fn_rva = 0x200usize;
+        for (i, w) in LEAF_ADD.iter().enumerate() {
+            img[fn_rva + i * 4..fn_rva + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        let sym_off = img.len();
+        let str_off = sym_off + 24 * 3;
+        let sh_off = align_up((str_off + 24) as u32, 8) as usize;
+        img.resize(sh_off + 3 * 64, 0);
+        let mut sym: Vec<u8> = Vec::new();
+        sym.extend_from_slice(&1u32.to_le_bytes()); // st_name "leaf_add"
+        sym.push(0x12);
+        sym.push(0);
+        sym.extend_from_slice(&1u16.to_le_bytes());
+        sym.extend_from_slice(&(fn_rva as u64).to_le_bytes());
+        sym.extend_from_slice(&8u64.to_le_bytes());
+        sym.extend_from_slice(&10u32.to_le_bytes()); // st_name "inner_alias"
+        sym.push(0x12);
+        sym.push(0);
+        sym.extend_from_slice(&1u16.to_le_bytes());
+        sym.extend_from_slice(&alias_va.to_le_bytes());
+        sym.extend_from_slice(&4u64.to_le_bytes());
+        img[sym_off..sym_off + sym.len()].copy_from_slice(&sym);
+        img[str_off..str_off + 24].copy_from_slice(b"\0leaf_add\0inner_alias\0\0\0");
+        img[40..48].copy_from_slice(&(sh_off as u64).to_le_bytes());
+        img[58..60].copy_from_slice(&64u16.to_le_bytes());
+        img[60..62].copy_from_slice(&3u16.to_le_bytes());
+        let mut sh = |i: usize, ty: u32, off: u64, size: u64, link: u32| {
+            let b = sh_off + i * 64;
+            img[b + 4..b + 8].copy_from_slice(&ty.to_le_bytes());
+            img[b + 24..b + 32].copy_from_slice(&off.to_le_bytes());
+            img[b + 32..b + 40].copy_from_slice(&size.to_le_bytes());
+            img[b + 40..b + 44].copy_from_slice(&link.to_le_bytes());
+            img[b + 56..b + 64].copy_from_slice(&24u64.to_le_bytes());
+        };
+        sh(1, 2, sym_off as u64, 72, 2);
+        sh(2, 3, str_off as u64, 24, 0);
+        img
+    }
+
+    #[test]
+    fn vm_export_rejects_symbol_alias_inside_window() {
+        // Independent review 2026-10-06: an alias symbol whose st_value
+        // lands strictly inside a virtualized window survived the
+        // addend-only gate, packed, and its GOT/PLT slot resolved to trap
+        // filler -> SIGTRAP. A/B at the scan layer: 0x204 inside
+        // [0x200,0x208) is a named rejection; 0x100 outside passes.
+        let rx = [(0u64, 0x300u64, 0usize, 0x300usize)];
+        let windows = [(0x200u32, 8usize)];
+
+        let inside_img = elf_dyn_fixture_with_alias(0x204);
+        let parsed = elf::parse(&inside_img).unwrap();
+        let err = scan_inner_label_refs(&inside_img, &parsed, &rx, &windows)
+            .err()
+            .expect("alias inside window must be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("symtab symbol `inner_alias`"), "{msg}");
+        assert!(msg.contains("0x204"), "{msg}");
+
+        let outside_img = elf_dyn_fixture_with_alias(0x100);
+        let parsed = elf::parse(&outside_img).unwrap();
+        scan_inner_label_refs(&outside_img, &parsed, &rx, &windows)
+            .expect("alias outside every window must pass");
+    }
 
     #[test]
     fn aarch64_vm_export_packs_and_reports() {

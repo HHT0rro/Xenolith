@@ -83,8 +83,33 @@ fn main() -> Result<()> {
                 resolved.profile_label,
                 resolved.output.display()
             );
+            // XL_DEBUG_GATE (independent review 2026-10-06): validated
+            // 0..=3, named error on anything else — an unvalidated env var
+            // used to bake a non-decrypting debug artifact with a fully
+            // normal pack report. Gates below 3 are loud on purpose.
+            let debug_gate = match std::env::var("XL_DEBUG_GATE") {
+                Ok(v) => {
+                    let g: u8 = v.parse().unwrap_or_else(|_| {
+                        eprintln!("error: XL_DEBUG_GATE={v:?} is not a number in 0..=3");
+                        std::process::exit(2);
+                    });
+                    if g > 3 {
+                        eprintln!("error: XL_DEBUG_GATE={g} out of range (0..=3)");
+                        std::process::exit(2);
+                    }
+                    if g < 3 {
+                        eprintln!(
+                            "warning: XL_DEBUG_GATE={g}: this is a DEBUG artifact — gate {g} \
+                             skips load-time decrypt and/or import binding and the image \
+                             will NOT run as a protected build"
+                        );
+                    }
+                    g
+                }
+                Err(_) => 3,
+            };
             let packed = pack(PackRequest {
-                debug_gate: std::env::var("XL_DEBUG_GATE").ok().and_then(|v| v.parse().ok()).unwrap_or(3),
+                debug_gate,
                 input: &resolved.bytes,
                 profile: resolved.profile,
                 vm_exports: resolved.vm_exports,
@@ -111,13 +136,14 @@ fn main() -> Result<()> {
                     Err(e) => format!("unavailable: {e:#}"),
                 };
                 println!(
-                    "packed -> {} ({} pages, backend={}, iat={}, decrypt_window={}, vm={}, size={}B->{}B)\noutput sha256: {digest}",
+                    "packed -> {} ({} pages, backend={}, iat={}, decrypt_window={}, vm={}, gate={}, size={}B->{}B)\noutput sha256: {digest}",
                     resolved.output.display(),
                     packed.report.pages,
                     packed.report.backend,
                     packed.report.iat_mode,
                     packed.report.runtime_decryption_window,
                     packed.report.vm_functions,
+                    packed.report.debug_gate,
                     packed.report.input_bytes,
                     packed.report.output_bytes
                 );

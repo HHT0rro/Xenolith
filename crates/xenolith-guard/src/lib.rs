@@ -5,7 +5,7 @@
 //! crate is the policy surface so tests can assert forbidden techniques stay
 //! absent. `xenolith-loader` does not execute these probes.
 //!
-//! Android/bionic (plan `out/android-production/plan.md` WS-A): the probe
+//! Android/bionic (plan `.apk-compat/xenolith/plan.md` WS-A): the probe
 //! body for the ELF path lives in the freestanding C core
 //! (`xenolith-runtime/core/xl_core.c`, `#if defined(__aarch64__)`), gated by
 //! a pack-time probe bitmap this crate computes. The mask travels over the
@@ -172,14 +172,22 @@ pub fn android_probes_for_mask(mask: u32) -> Vec<Probe> {
             .collect()
 }
 
-/// Default Android probe selection per profile, mirroring the Windows
-/// policy (`xenolith-pack/src/lib.rs` probe selection): Max runs everything,
-/// every other profile keeps the two core debugger checks.
+/// Default Android probe selection per profile. `PtraceSelfAttach` is
+/// deliberately NOT default-armed in any profile: a successful
+/// `PTRACE_TRACEME` on the INIT_ARRAY (dlopen/`System.loadLibrary`) thread
+/// makes the parent — zygote on real apps — that thread's tracer, and
+/// ptrace has no tracee-side detach, so the next signal delivered to the
+/// thread (ART GC suspension, ANR SIGQUIT, any directed signal, even a
+/// SIG_IGN'd synchronous fault) enters signal-delivery-stop and is never
+/// resumed: the app freezes until SIGKILL (verified on Linux; independent
+/// review 2026-10-06). The probe stays implemented and armable for custom
+/// builds whose parent cooperates (standalone runners) via
+/// `android_probe_mask(&[...])`.
 pub fn android_probes_for_profile(max_profile: bool) -> Vec<Probe> {
     if max_profile {
-        android_probes().to_vec()
+        vec![Probe::TracerPidScan, Probe::MapsScan]
     } else {
-        vec![Probe::TracerPidScan, Probe::PtraceSelfAttach]
+        vec![Probe::TracerPidScan]
     }
 }
 
@@ -312,19 +320,31 @@ mod tests {
 
     #[test]
     fn android_profile_defaults_mirror_windows_policy() {
-        // Max: everything; otherwise the two core debugger checks.
+        // PtraceSelfAttach is implemented but NOT profile-armed: TRACEME on
+        // the dlopen thread makes the parent (zygote) the thread's tracer
+        // with no tracee-side detach — the next signal on that thread
+        // freezes the app (independent review 2026-10-06). Max = scan set;
+        // other profiles keep the TracerPid core check only.
         assert_eq!(
             android_probes_for_profile(true),
-            android_probes().to_vec()
+            vec![Probe::TracerPidScan, Probe::MapsScan]
         );
         assert_eq!(
             android_probes_for_profile(false),
-            vec![Probe::TracerPidScan, Probe::PtraceSelfAttach]
+            vec![Probe::TracerPidScan]
         );
-        // And the non-max default is a strict subset of the full set.
+        // And every default is a strict subset of the full implemented set.
         let d = android_probe_mask(&android_probes_for_profile(false));
-        assert_eq!(d, ANDROID_PROBE_TRACERPID_SCAN | ANDROID_PROBE_PTRACE_SELF_ATTACH);
+        assert_eq!(d, ANDROID_PROBE_TRACERPID_SCAN);
+        let m = android_probe_mask(&android_probes_for_profile(true));
+        assert_eq!(m, ANDROID_PROBE_TRACERPID_SCAN | ANDROID_PROBE_MAPS_SCAN);
         assert_eq!(d & !android_probe_mask(android_probes()), 0);
+        assert_eq!(m & !android_probe_mask(android_probes()), 0);
+        // Custom builds can still arm the self-attach probe explicitly.
+        assert_eq!(
+            android_probe_mask(&[Probe::PtraceSelfAttach]),
+            ANDROID_PROBE_PTRACE_SELF_ATTACH
+        );
     }
 
     /// Review 3-2: full classify matrix, including the cross-probe case —

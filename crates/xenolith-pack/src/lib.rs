@@ -101,6 +101,13 @@ pub struct PackReport {
     /// Input machine ("x86_64" | "aarch64"). PE is always x86_64; ELF
     /// follows e_machine. Additive field — existing parsers ignore it.
     pub machine: String,
+    /// Debug gate baked into the artifact (stub meta byte 63). 3 = full
+    /// decrypt + import-bind production artifact; 0..2 are the internal
+    /// debug ladder (0 = map+entry only, 1 = no decrypt, 2 = no import
+    /// bind) and produce artifacts that do NOT fully decrypt at load —
+    /// reachable only through the CLI's validated XL_DEBUG_GATE. Additive
+    /// field — existing parsers ignore it.
+    pub debug_gate: u8,
     /// Anti-debug probes the artifact actually runs (plan WS-A): Windows
     /// names on the PE path, Android names on the aarch64 ELF path, and an
     /// EMPTY list with an explicit note on x86-64 ELF (probes are
@@ -1288,6 +1295,7 @@ pub fn pack(request: PackRequest<'_>) -> Result<PackOutput, PackError> {
             ImageKind::Elf64Dyn => "elf64-dyn".into(),
         },
         machine: "x86_64".into(), // PE path is AMD64-only
+        debug_gate: request.debug_gate,
         probes: probe_names,
         input_bytes: request.input.len(),
         output_bytes: image.len(),

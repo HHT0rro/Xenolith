@@ -953,8 +953,8 @@ static int xl_maps_contains_marker(void) {
  * activation returns 0 and the image refuses to unpack — same contract as
  * the Windows stub's STAGE_DEBUGGER path). A zero mask means the packer
  * explicitly shipped no probes (only reachable by a deliberate custom
- * build; the packer's profile defaults always arm at least the two core
- * debugger checks) and passes. */
+ * build; the packer's profile defaults always arm at least TracerPidScan)
+ * and passes. */
 static int xl_android_guard(uint32_t probe_mask) {
     uint32_t ppid, tp;
     if (probe_mask == 0) return 1;
@@ -964,6 +964,15 @@ static int xl_android_guard(uint32_t probe_mask) {
         if (xl_classify_tracerpid(tp, ppid) == XL_TRACER_HIT) return 0;
     }
     if (probe_mask & XL_PROBE_BIT_PTRACE_SELF) {
+        /* CUSTOM BUILDS ONLY — never profile-armed (see
+         * xenolith_guard::android_probes_for_profile). On this INIT_ARRAY
+         * (dlopen) thread a successful TRACEME makes the parent — zygote on
+         * real apps — the thread's tracer, and ptrace has no tracee-side
+         * detach: the next signal delivered to this thread (ART suspension,
+         * SIGQUIT, any directed signal, even SIG_IGN'd synchronous faults)
+         * enters signal-delivery-stop and is never resumed. The app freezes
+         * until SIGKILL (verified on Linux, independent review 2026-10-06).
+         * Arming requires a parent that resumes tracee stops. */
         long rc = xl_sys3(XL_SYS_PTRACE, 0 /* PTRACE_TRACEME */, 0, 0);
         if (rc != 0) {
             /* TRACEME refused: either policy denied it (Yama/SELinux on
@@ -975,7 +984,8 @@ static int xl_android_guard(uint32_t probe_mask) {
         }
         /* Success: the parent now occupies the tracer slot; later external
          * PTRACE_ATTACH is refused by the kernel. Residue on re-activation
-         * is BenignSelf by construction (classify above). */
+         * is BenignSelf by construction (classify above). The freeze
+         * exposure above is the price — hence not a default probe. */
     }
     if (probe_mask & XL_PROBE_BIT_MAPS) {
         if (xl_maps_contains_marker() != 0) return 0;

@@ -193,10 +193,16 @@ platform byte 2, page-size-parameterized sealing and readelf-level artifact
 assertions. Anti-debug probes exist on **aarch64 only**: TracerPid scan,
 `PTRACE_TRACEME` self-attach and `/proc/self/maps` marker scan, executed in the
 freestanding core before any AEAD open and armed per profile through a
-pack-time probe bitmap (`max` = all three; other profiles = TracerPid +
-self-attach; x86_64-ELF = none, reported as an empty `probes` list with an
-aarch64-only note). Probe status on a real loader: max-profile images with all
-three probes armed load cleanly through the emulator's bionic loader
+pack-time probe bitmap (`max` = TracerPid + maps scan; other profiles =
+TracerPid only; x86_64-ELF = none, reported as an empty `probes` list with an
+aarch64-only note). `PTRACE_TRACEME` self-attach is implemented but **not
+armed by any profile**: on the dlopen/INIT_ARRAY thread a successful TRACEME
+makes the parent — zygote on real apps — the thread's tracer with no
+tracee-side detach, and the next signal delivered to that thread (ART GC
+suspension, ANR SIGQUIT, any directed signal) freezes the app until SIGKILL;
+it stays available to custom builds via `xenolith_guard::android_probe_mask`.
+Probe status on a real loader: max-profile images with the default probe set
+armed load cleanly through the emulator's bionic loader
 (ndk_translation, arm64 4-KiB gate, 16/16 + rerun) — no false-positive
 fail-close under a clean loader; detection of an actually attached debugger
 and any real-device run are **not yet verified**. Per-function virtualization
