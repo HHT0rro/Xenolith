@@ -62,6 +62,11 @@ pub enum PackError {
     Lift(String),
     #[error("ELF cannot be packed: {0}")]
     Elf(&'static str),
+    #[error(
+        "ELF cannot be packed: Android shared object has an executable PT_LOAD with \
+         p_filesz={file_size} bytes, smaller than the derived page size of {page_size} bytes"
+    )]
+    AndroidSmallExecutableLoad { file_size: u64, page_size: u32 },
     #[error("{0}")]
     Runtime(String),
     #[error("{0}")]
@@ -1857,18 +1862,13 @@ pub fn inspect_bytes(image: &[u8]) -> Result<serde_json::Value, PackError> {
     match classify(image) {
         Ok(ImageKind::Elf64Exec | ImageKind::Elf64Dyn) => {
             let elf = xenolith_formats::elf::parse(image).map_err(PackError::Format)?;
-            // Packed artifact: INIT_ARRAY[0]'s R_X86_64_RELATIVE addend (what
-            // ld.so actually calls first) lands inside the appended R+X
-            // PT_LOAD — that addend is the bootstrap stub. Anything else is
-            // an unpacked (or foreign) ELF.
-            let boot = xenolith_formats::elf::packed_bootstrap_target(image, &elf)
+            let metadata = xenolith_formats::elf::inspect_metadata(image, &elf)
                 .map_err(PackError::Format)?;
+            let boot = metadata.packed_bootstrap;
             let packed = boot.is_some();
             let resolvers = xenolith_formats::elf::ifunc_resolvers(image, &elf)
                 .map_err(PackError::Format)?
                 .len();
-            let (verneed, verdef) = xenolith_formats::elf::symbol_versions(image, &elf)
-                .map_err(PackError::Format)?;
             let (tls_ie, tls_ld) = xenolith_formats::elf::tls_reloc_census(image, &elf)
                 .map_err(PackError::Format)?;
             // Android probe manifest, decoded from the stub machine code the
@@ -1934,33 +1934,31 @@ pub fn inspect_bytes(image: &[u8]) -> Result<serde_json::Value, PackError> {
                     xenolith_formats::elf::ElfMachine::Aarch64 => 2,
                 },
                 "image_bytes": image.len(),
-                "pie": elf.pie,
+                "pie": metadata.pie,
                 "relro": elf.relro,
                 "tls": elf.has_tls,
                 "dynamic": elf.dynamic,
                 "entry": elf.entry,
                 "packed": packed,
-                "aslr": elf.pie,
-                "long_term_rwx": false,
+                "aslr": elf.kind == ImageKind::Elf64Dyn,
+                "long_term_rwx": metadata.writable_executable_load,
                 "runtime_decryption_window": false,
                 "c2_reencrypt": false,
                 "host_emulator_injected": false,
                 "xenolith_runtime_injected": false,
                 "iat_mode": if packed { "loader-resolved-got-plt" } else { "ld.so" },
                 "ifunc_resolvers": resolvers,
-                "symbol_versions": { "verneed": verneed, "verdef": verdef },
+                "symbol_versions": { "verneed": metadata.verneed_count, "verdef": metadata.verdef_count },
                 "tls_models": { "initial_exec": tls_ie, "dynamic": tls_ld },
                 "probes": probes_json,
             });
             if !packed {
                 info["note"] = serde_json::json!(
-                    "unpacked ELF: parsed only; packing fail-closes on static linkage, \
-                     TPOFF32-in-text, RELATIVE into sealed page"
+                    "unpacked ELF: no Xenolith bootstrap detected"
                 );
             } else {
                 info["note"] = serde_json::json!(
-                    "packed ELF: INIT_ARRAY[0] bootstraps pic-stub+xl-core; ld.so keeps \
-                     PIE/RELRO/GOT-PLT; executable PT_LOAD bytes sealed on disk"
+                    "packed ELF: Xenolith bootstrap and appended load detected"
                 );
                 if let Some(extra) = probes_note {
                     info["note"] = serde_json::json!(format!(
@@ -3249,7 +3247,12 @@ mod tests {
         assert_eq!(info["format"], "elf64-dyn");
         assert_eq!(info["packed"], false);
         assert_eq!(info["backend"], "none");
-        assert!(info["note"].as_str().unwrap().contains("fail-closes"));
+        assert_eq!(info["report_version"], PACK_REPORT_VERSION);
+        assert_eq!(info["machine"], "x86_64");
+        assert_eq!(info["pie"], false);
+        assert_eq!(info["aslr"], true);
+        assert_eq!(info["probes"], serde_json::json!([]));
+        assert!(info["note"].as_str().unwrap().starts_with("unpacked ELF:"));
     }
 
     fn cfg_pack_request(input: &[u8]) -> PackRequest<'_> {

@@ -276,12 +276,7 @@ fn configure(f: &mut Frame, app: &mut App) {
     } else if app.fast_vm_conflict() {
         hint = format!("⚠ Pack disabled: fast + VM exports — switch profile (p) or uncheck · {hint}");
     }
-    let save_exists = app.project_path().exists();
-    let save_label = if save_exists {
-        "[Overwrite project]"
-    } else {
-        "[Save project]"
-    };
+    let save_label = app.project_save_label();
     let mut disabled: Vec<usize> = Vec::new();
     if app.fast_vm_conflict() || app.bulk_busy.is_some() {
         disabled.push(0);
@@ -888,13 +883,14 @@ fn result(f: &mut Frame, app: &mut App) {
             area0,
         );
         app.scroll_zones.push((area0, Zone::Result));
+        let save_label = app.project_save_label();
         paint_buttons(
             f,
             app,
             chunks[1],
             &[
                 ("[Pack again]".to_string(), Action::PackAnother),
-                ("[Save project]".to_string(), Action::SaveProject),
+                (save_label.to_string(), Action::SaveProject),
                 ("[Quit]".to_string(), Action::Quit),
             ],
             "Enter/Space confirm · ←/→ move · Esc back to configure",

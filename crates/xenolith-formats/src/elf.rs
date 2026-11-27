@@ -10,6 +10,7 @@ const EM_AARCH64: u16 = 183;
 pub const PT_LOAD: u32 = 1;
 pub const PT_DYNAMIC: u32 = 2;
 pub const PT_INTERP: u32 = 3;
+const PT_NOTE: u32 = 4;
 pub const PT_PHDR: u32 = 6;
 pub const PT_TLS: u32 = 7;
 pub const PT_GNU_RELRO: u32 = 0x6474e552;
@@ -259,6 +260,45 @@ pub fn program_headers(bytes: &[u8], elf: &Elf64) -> Result<Vec<ProgramHeader>, 
         });
     }
     Ok(out)
+}
+
+/// Positive Android identification from a complete Android ident note.
+/// Use PT_NOTE so stripping section headers does not affect identification.
+pub fn has_android_ident(bytes: &[u8], phdrs: &[ProgramHeader]) -> bool {
+    phdrs
+        .iter()
+        .filter(|ph| ph.p_type == PT_NOTE)
+        .filter_map(|ph| {
+            let start = usize::try_from(ph.p_offset).ok()?;
+            let len = usize::try_from(ph.p_filesz).ok()?;
+            bytes.get(start..start.checked_add(len)?)
+        })
+        .any(|notes| android_ident_in_notes(notes) == Some(true))
+}
+
+fn android_ident_in_notes(mut notes: &[u8]) -> Option<bool> {
+    const HEADER_SIZE: usize = 12;
+    const NT_ANDROID_TYPE_IDENT: u32 = 1;
+    while notes.len() >= HEADER_SIZE {
+        let name_len = read_u32(notes, 0).ok()? as usize;
+        let desc_len = read_u32(notes, 4).ok()? as usize;
+        let note_type = read_u32(notes, 8).ok()?;
+        // Android notes have a NUL-terminated owner and four-byte padding.
+        let name_end = HEADER_SIZE.checked_add(name_len)?;
+        let desc_start = name_end.checked_add(3)? & !3;
+        let desc_end = desc_start.checked_add(desc_len)?;
+        let note_end = desc_end.checked_add(3)? & !3;
+        let note = notes.get(..note_end)?;
+        // The descriptor starts with at least a 32-bit Android API level.
+        if note_type == NT_ANDROID_TYPE_IDENT
+            && desc_len >= 4
+            && &note[HEADER_SIZE..name_end] == b"Android\0"
+        {
+            return Some(true);
+        }
+        notes = &notes[note_end..];
+    }
+    Some(false)
 }
 
 pub fn write_program_header(
@@ -1384,7 +1424,7 @@ mod tests {
     }
 
     #[test]
-    fn aarch64_census_ifunc_and_bootstrap_marker() {
+    fn aarch64_census_ifunc_and_ordinary_constructor() {
         // One of each: RELATIVE(1027), IRELATIVE(1032), TLS_TPREL64(1030),
         // TLS_DTPMOD64(1028), TLS_DTPREL64(1029), GLOB_DAT(1025) —
         // ie=1, ld=2, one resolver at 0x280.
@@ -1400,9 +1440,9 @@ mod tests {
         let parsed = parse(&img).unwrap();
         assert_eq!(tls_reloc_census(&img, &parsed).unwrap(), (1, 2));
         assert_eq!(ifunc_resolvers(&img, &parsed).unwrap(), vec![0x280]);
-        // packed marker: INIT_ARRAY[0] rides a 1027 whose addend sits inside
-        // the last R+X PT_LOAD (the whole file here).
-        assert_eq!(packed_bootstrap_target(&img, &parsed).unwrap(), Some(0x180));
+        // The constructor lands in the only executable segment, as it does
+        // in ordinary shared objects. It is not a Xenolith bootstrap.
+        assert_eq!(packed_bootstrap_target(&img, &parsed).unwrap(), None);
     }
 
     #[test]
@@ -1425,9 +1465,41 @@ mod tests {
         assert_eq!(parsed.machine, ElfMachine::Amd64);
         assert_eq!(
             packed_bootstrap_target(&img, &parsed).unwrap(),
-            Some(0x100),
-            "x86 keeps its R_X86_64_RELATIVE(8) bootstrap marker"
+            None,
+            "an ordinary x86-64 constructor does not identify a packed image"
         );
+    }
+
+    #[test]
+    fn inspect_reports_version_counts_from_count_tags() {
+        let (img, _) = elf_dyn_with_rela(
+            ElfMachine::Amd64,
+            &[],
+            &[(0x6fff_fffc, 0x180), (0x6fff_fffd, 2), (0x6fff_fffe, 0x200), (0x6fff_ffff, 3)],
+        );
+        let info = inspect_metadata(&img, &parse(&img).unwrap()).unwrap();
+        assert_eq!((info.verneed_count, info.verdef_count), (3, 2));
+    }
+
+    #[test]
+    fn inspect_rejects_conflicting_constructor_metadata() {
+        let machine = ElfMachine::Amd64;
+        let rela = machine.relative_type();
+        let (img, _) = elf_dyn_with_rela(machine, &[(u64::MAX, rela, 0x100)], &[(27, 16)]);
+        assert!(packed_bootstrap_target(&img, &parse(&img).unwrap())
+            .unwrap_err()
+            .to_string()
+            .contains("conflicting ELF dynamic tags"));
+
+        let (img, _) = elf_dyn_with_rela(
+            machine,
+            &[(u64::MAX, rela, 0x100), (u64::MAX, rela, 0x108)],
+            &[],
+        );
+        assert!(packed_bootstrap_target(&img, &parse(&img).unwrap())
+            .unwrap_err()
+            .to_string()
+            .contains("conflicting ELF INIT_ARRAY[0] relocations"));
     }
 
     /// Same shape as `elf_with_dynsym` but with no DT_HASH: forces the
@@ -1481,54 +1553,150 @@ mod tests {
     }
 }
 
-/// If INIT_ARRAY[0] rides an R_<ARCH>_RELATIVE whose addend lands inside the
-/// last R+X PT_LOAD, that addend is the injected bootstrap stub — the packed
-/// marker for Xenolith ELF images.
-pub fn packed_bootstrap_target(bytes: &[u8], elf: &Elf64) -> Result<Option<u64>, FormatError> {
+/// Inspect-only facts. The packer uses its own input policy and does not
+/// depend on this classification.
+#[derive(Debug)]
+pub struct ElfInspection {
+    pub packed_bootstrap: Option<u64>,
+    pub pie: bool,
+    pub writable_executable_load: bool,
+    pub verneed_count: u64,
+    pub verdef_count: u64,
+}
+
+pub fn inspect_metadata(bytes: &[u8], elf: &Elf64) -> Result<ElfInspection, FormatError> {
+    const DT_RELAENT: u64 = 9;
+    const DT_INIT_ARRAY: u64 = 25;
+    const DT_INIT_ARRAYSZ: u64 = 27;
+    const DT_VERDEFNUM: u64 = 0x6fff_fffd;
+    const DT_VERNEEDNUM: u64 = 0x6fff_ffff;
+    const RELA_SIZE: usize = 24;
+
     let phdrs = program_headers(bytes, elf)?;
-    let last_rx = phdrs.iter().filter(|p| p.p_type == PT_LOAD && p.p_flags & PF_X != 0).last()
-        .ok_or(FormatError::Invalid("no executable PT_LOAD"))?;
-    let (mut rela_off, mut rela_sz, mut init_array_va, mut init_array_sz) = (0u64, 0u64, 0u64, 0u64);
-    let mut dyn_off = None;
-    let mut dyn_sz = 0usize;
-    for ph in &phdrs {
-        if ph.p_type == PT_DYNAMIC {
-            dyn_off = Some(ph.p_offset as usize);
-            dyn_sz = ph.p_filesz as usize;
+    let mut dynamic = phdrs.iter().filter(|ph| ph.p_type == PT_DYNAMIC);
+    let (mut rela, mut rela_size, mut rela_entry) = (None, None, None);
+    let (mut init_array, mut init_size, mut flags) = (None, None, None);
+    let (mut verneed, mut verdef) = (None, None);
+    if let Some(ph) = dynamic.next() {
+        if dynamic.any(|other| {
+            (other.p_offset, other.p_filesz, other.p_vaddr)
+                != (ph.p_offset, ph.p_filesz, ph.p_vaddr)
+        }) {
+            return Err(FormatError::Invalid("conflicting ELF PT_DYNAMIC headers"));
+        }
+        let off = usize::try_from(ph.p_offset).map_err(|_| FormatError::Truncated)?;
+        let size = usize::try_from(ph.p_filesz).map_err(|_| FormatError::Truncated)?;
+        let table = bytes
+            .get(off..off.saturating_add(size))
+            .ok_or(FormatError::Truncated)?;
+        for entry in table.chunks_exact(16) {
+            let tag = match read_u64(entry, 0)? {
+                DT_NULL => break,
+                DT_RELA => &mut rela,
+                DT_RELASZ => &mut rela_size,
+                DT_RELAENT => &mut rela_entry,
+                DT_INIT_ARRAY => &mut init_array,
+                DT_INIT_ARRAYSZ => &mut init_size,
+                DT_FLAGS_1 => &mut flags,
+                DT_VERNEEDNUM => &mut verneed,
+                DT_VERDEFNUM => &mut verdef,
+                _ => continue,
+            };
+            let val = read_u64(entry, 8)?;
+            if tag.replace(val).is_some_and(|prev| prev != val) {
+                return Err(FormatError::Invalid("conflicting ELF dynamic tags"));
+            }
         }
     }
-    let Some(off) = dyn_off else { return Ok(None) };
-    let mut i = 0usize;
-    while i + 16 <= dyn_sz {
-        let tag = read_u64(bytes, off + i)?;
-        if tag == 0 { break; }
-        let val = read_u64(bytes, off + i + 8)?;
-        match tag {
-            7 => rela_off = val,
-            8 => rela_sz = val,
-            25 => init_array_va = val,
-            27 => init_array_sz = val, // DT_INIT_ARRAYSZ (26 is DT_FINI_ARRAY)
-            _ => {}
+
+    let mut target = None;
+    if let (Some(rela), Some(size @ 1..), Some(slot), Some(8..)) =
+        (rela, rela_size, init_array, init_size)
+    {
+        if size % RELA_SIZE as u64 != 0 || rela_entry.is_some_and(|entry| entry != RELA_SIZE as u64)
+        {
+            return Err(FormatError::Invalid("invalid ELF DT_RELA entry size"));
         }
-        i += 16;
+        let file = vaddr_file_offset(bytes, elf, rela)?;
+        let size = usize::try_from(size).map_err(|_| FormatError::Truncated)?;
+        let table = bytes
+            .get(file..file.saturating_add(size))
+            .ok_or(FormatError::Truncated)?;
+        for entry in table.chunks_exact(RELA_SIZE) {
+            if read_u64(entry, 0)? == slot
+                && read_u64(entry, 8)? == u64::from(elf.machine.relative_type())
+            {
+                let addend = read_u64(entry, 16)?;
+                if target.replace(addend).is_some_and(|prev| prev != addend) {
+                    return Err(FormatError::Invalid(
+                        "conflicting ELF INIT_ARRAY[0] relocations",
+                    ));
+                }
+            }
+        }
     }
-    if init_array_va == 0 || init_array_sz < 8 || rela_off == 0 || rela_sz == 0 {
+
+    let packed_bootstrap = match appended_bootstrap(bytes.len() as u64, elf, &phdrs)? {
+        Some(expected) if target == Some(expected) => Some(expected),
+        Some(_) => {
+            return Err(FormatError::Invalid(
+                "ELF packed layout conflicts with INIT_ARRAY[0]",
+            ))
+        }
+        None => None,
+    };
+    Ok(ElfInspection {
+        packed_bootstrap,
+        pie: elf.kind == ImageKind::Elf64Dyn
+            && (elf.interp || flags.unwrap_or_default() & DF_1_PIE != 0),
+        writable_executable_load: phdrs
+            .iter()
+            .any(|ph| ph.p_type == PT_LOAD && ph.p_flags & (PF_W | PF_X) == (PF_W | PF_X)),
+        verneed_count: verneed.unwrap_or_default(),
+        verdef_count: verdef.unwrap_or_default(),
+    })
+}
+
+/// The current Xenolith ELF layout places the relocated program header table
+/// at the start of a dedicated RX load, followed by the stub. A separate
+/// header describes the stub's unwind table at the end of that load.
+fn appended_bootstrap(
+    file_len: u64,
+    elf: &Elf64,
+    phdrs: &[ProgramHeader],
+) -> Result<Option<u64>, FormatError> {
+    let [original @ .., load, unwind] = phdrs else {
+        return Ok(None);
+    };
+    if load.p_type != PT_LOAD
+        || load.p_offset != elf.phoff
+        || unwind.p_type != PT_GNU_EH_FRAME
+        || !original.iter().any(|ph| ph.p_type == PT_LOAD)
+    {
         return Ok(None);
     }
-    let rela_file = vaddr_file_offset(bytes, elf, rela_off)?;
-    for k in 0..(rela_sz as usize / 24) {
-        let o = rela_file + k * 24;
-        let r_offset = read_u64(bytes, o)?;
-        let info = read_u64(bytes, o + 8)?;
-        if r_offset == init_array_va
-            && (info & 0xffff_ffff) as u32 == elf.machine.relative_type()
-        {
-            let addend = read_u64(bytes, o + 16)?;
-            if addend >= last_rx.p_vaddr && addend < last_rx.p_vaddr + last_rx.p_memsz {
-                return Ok(Some(addend));
-            }
-            return Ok(None);
-        }
+    const INVALID: FormatError = FormatError::Invalid("inconsistent ELF packed program headers");
+    let table_size = u64::from(elf.phnum) * u64::from(elf.phentsize);
+    let stub = load.p_vaddr.checked_add(table_size).ok_or(INVALID)?;
+    if load.p_flags != PF_R | PF_X
+        || load.p_filesz != load.p_memsz
+        || load.p_offset.checked_add(load.p_filesz) != Some(file_len)
+        || load.p_vaddr.checked_add(load.p_memsz).is_none()
+        || unwind.p_offset.checked_sub(load.p_offset) != unwind.p_vaddr.checked_sub(load.p_vaddr)
+        || unwind.p_vaddr <= stub
+        || unwind.p_filesz == 0
+        || unwind.p_offset.checked_add(unwind.p_filesz) != Some(file_len)
+        || original.iter().filter(|ph| ph.p_type == PT_LOAD).any(|ph| {
+            ph.p_offset.saturating_add(ph.p_filesz) > load.p_offset
+                || ph.p_vaddr.saturating_add(ph.p_memsz) > load.p_vaddr
+        })
+    {
+        return Err(INVALID);
     }
-    Ok(None)
+    Ok(Some(stub))
+}
+
+/// Inspect for the Xenolith ELF bootstrap and return its virtual address.
+pub fn packed_bootstrap_target(bytes: &[u8], elf: &Elf64) -> Result<Option<u64>, FormatError> {
+    Ok(inspect_metadata(bytes, elf)?.packed_bootstrap)
 }

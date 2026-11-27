@@ -92,6 +92,33 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
     let page_size = (max_align.clamp(0x1000, 0x4000)) as u32;
     let page_mask = !(page_size - 1);
 
+    if kind == ImageKind::Elf64Dyn && !parsed.interp && elf::has_android_ident(request.input, &phdrs)
+    {
+        if !phdrs.iter().any(|ph| ph.p_type == elf::PT_PHDR) {
+            return Err(PackError::Elf(
+                "Android shared object is missing PT_PHDR required by bionic for the packed layout",
+            ));
+        }
+        // Refuse the observed unsupported layout even when p_offset and p_vaddr
+        // are page-aligned. The relevant size is the file-backed executable data.
+        if let Some(ph) = phdrs.iter().find(|ph| {
+            ph.p_type == elf::PT_LOAD
+                && ph.p_flags & elf::PF_X != 0
+                && ph.p_filesz > 0
+                && ph.p_filesz < u64::from(page_size)
+        }) {
+            return Err(PackError::AndroidSmallExecutableLoad {
+                file_size: ph.p_filesz,
+                page_size,
+            });
+        }
+        if machine == ElfMachine::Amd64 && page_size == 0x4000 {
+            return Err(PackError::Elf(
+                "Android x86_64 shared objects with 16 KiB pages are unsupported because SELinux can deny executable access to the modified file mapping",
+            ));
+        }
+    }
+
     // TASK-022: PT_TLS is allowed. ld.so finishes TLS setup (DTPMOD/DTPREL/
     // GOTTPOFF into the RW GOT) before INIT_ARRAY, and we only seal RX
     // pages, so initial-exec and local/general-dynamic models survive.
@@ -1802,6 +1829,8 @@ mod tests {
             out.report.notes
         );
         let info = crate::inspect_bytes(&out.image).expect("packed artifact inspects");
+        assert_eq!(info["packed"], true);
+        assert_eq!(info["backend"], crate::BACKEND_PIC_STUB);
         assert_eq!(info["probes"], serde_json::json!([]));
         assert!(
             info["note"]
@@ -1810,6 +1839,16 @@ mod tests {
                 .contains("anti-debug probes are aarch64-only"),
             "inspect note must state the aarch64-only scope"
         );
+
+        let mut inconsistent = out.image;
+        let original = elf::parse(&img).unwrap();
+        let constructor = init_array_bootstrap(&img, &original).unwrap();
+        // Restore the native constructor without removing the appended load.
+        write_u64(&mut inconsistent, constructor.rela_addend_off, constructor.orig_target).unwrap();
+        assert!(crate::inspect_bytes(&inconsistent)
+            .unwrap_err()
+            .to_string()
+            .contains("packed layout conflicts with INIT_ARRAY[0]"));
     }
 
     // ------------------------------------------------------------------

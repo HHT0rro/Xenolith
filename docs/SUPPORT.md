@@ -32,12 +32,20 @@ The following are **not** the product runtime:
 | --- | --- | --- |
 | Windows AMD64 PE64 DLL | Yes | Yes, via system `LoadLibrary` (`GATE 3 OK result=Some(7)`) |
 | Windows AMD64 PE64 EXE | Yes | Yes on this Windows host (`hello-exe` prints `xenolith-hello`); selected-export VM still needs a named export or `--select-rva` |
-| Linux AMD64 ELF64 ET_DYN / ET_EXEC / .so | Yes — appends an R+X PT_LOAD (relocated PHDR table + PIC stub + `xl_core` + EnvelopeV2) and redirects INIT_ARRAY[0] to the stub; ld.so stays the loader (PIE/RELRO/GOT-PLT untouched) | Verified in WSL Ubuntu 24.04: packed `hello-elf` prints `xenolith-hello-elf`; packed `libhello-elf.so` dlopen/dlclose OK (`packed_elf_prints_hello`). PT_TLS, IFUNC, TLSDESC, copy reloc, static, RELATIVE-into-RX fail closed |
-| Android arm64 ELF64 ET_DYN `.so` (EM_AARCH64, no PT_INTERP) | Yes — same appended R+X PT_LOAD + INIT_ARRAY[0] bootstrap strategy, `stub_aarch64` hand-encoded stub + NDK r27c-compiled aarch64 `xl_core`; page size derived from the input (`clamp(max PT_LOAD p_align, 4K, 16K)`) threads through chunking, the protocol (`XL_MAX_REGION` 16384), `META_PAGE_SIZE` and both stubs' vprotect shims — 16-KiB-page devices are first-class | Structural CI layer only (build/pack/`llvm-readelf` assertions). OS-load on Android is **not** claimed here: emulator `ndk_translation` and real-device matrices are follow-up gates (design `.apk-compat/xenolith/design.md` §8) |
-| Android x86_64 ELF64 `.so` | Yes — reuses the Linux AMD64 path (same stub/ABI/`__NR_mprotect`) with bionic-incompatible inputs failing closed | Same as arm64: structural layer; bionic OS-load is a follow-up gate |
+| Linux AMD64 ELF64 ET_DYN / ET_EXEC / .so | Yes — appends an R+X PT_LOAD (relocated PHDR table + PIC stub + `xl_core` + EnvelopeV2) and redirects INIT_ARRAY[0] to the stub; ld.so stays the loader (PIE/RELRO/GOT-PLT untouched) | Verified with the standard profile on WSL Ubuntu 24.04 x86_64 through PIE, shared-library load/reload, C++ EH/ABI, IFUNC, symbol versions and initial-exec/local-dynamic TLS fixtures. Imported IFUNC, TLSDESC, local-exec TPOFF32, copy relocations and static linkage retain named refusals |
+| Android arm64 ELF64 ET_DYN `.so` (EM_AARCH64, no PT_INTERP) | Experimental. Structural CI covers accepted ELF inputs with 4 KiB and 16 KiB segment alignment, subject to the input checks below. | Structural results do not establish support for either device page size. Historical `ndk_translation` results were emulator observations; native arm64 OS loading on real devices remains unverified. |
+| Android x86_64 ELF64 `.so` | Experimental packing for inputs with 4 KiB alignment. Inputs with 16 KiB alignment are rejected. | On an API 35 emulator with 16 KiB pages, SELinux denied executable access to the modified mapping in shell and APK tests. Both original libraries ran. General runtime support remains unverified. |
 | ARM32 / any ELF32 (armeabi-v7a), macOS | **Rejected** with a named diagnostic | Out of scope for this version |
 | .NET mixed-mode images (COM descriptor / CLR header, datadir 14 present) | **Rejected** with a named diagnostic | Out of scope for this version |
 | CFG-instrumented images (`DllCharacteristics GUARD_CF` or load-config `GuardFlags` instrumented) | **Rejected** with a named diagnostic | The loader GuardCF-checks a CFG image's entry against GFIDS; the packed stub entry is not registered there and the process fast-fails (0xC0000409) at load. Rebuild without `/guard:cf`, or wait for GFIDS-aware packing |
+
+On both Android architectures, an Android ident note in `PT_NOTE` triggers
+two input checks. A shared object must have `PT_PHDR` and each nonempty,
+file-backed executable `PT_LOAD` must be at least one derived page in
+size. The CLI reports either refusal before writing an artifact. Android
+CI covers these refusals and checks the structure of accepted ELF inputs.
+Its NDK fixtures target API 24; this is a compilation target, not a verified
+minimum runtime API. The x86_64 16 KiB case is a refusal test only.
 
 Current `pack()` also:
 
@@ -48,7 +56,7 @@ Current `pack()` also:
 - output suffix follows kind: `.xl.dll` / `.xl.exe` / `.xl.so` / `.xl.elf`
 
 C++ exceptions, setjmp/longjmp, varargs, 8-byte struct returns and tail calls are verified through **packed** images on both OSes (`packed_eh_matrix`, `packed_elf_eh_matrix`); the injected stub carries synthesized unwind records (PE: XDATA + relocated .pdata with the stub RUNTIME_FUNCTION; ELF: appended .eh_frame + PT_GNU_EH_FRAME). Rust panic-unwind through a packed image is not separately frozen; On Linux, IFUNC (resolver pages stay native), symbol versions (DT_VERNEED/VERDEF preserved, dlvsym-verified) and initial-exec/local-dynamic TLS are supported packed; imported IFUNC, TLS descriptors, local-exec TPOFF32 and static linkage still fail closed.
-TLS callback images keep the directory with the first callback wrapped by the stub; delay-load and ordinal-only imports are packed (see "Imports: delay-load and ordinal"). On ELF, executable PT_LOAD file bytes are 0x90-filled and sealed in EnvelopeV2, except the first 64 bytes at `e_entry` which stay original — glibc (2.39 verified) decodes an ~40-byte instruction window at the entry point and suppresses the whole init phase when it cannot; that window is the `_start` prologue, not protected logic. Linux IFUNC/TLS descriptor/copy reloc/PT_TLS still fail closed until stage 5. Those remaining gaps are defects relative to G3/G4, not features.
+TLS callback images keep the directory with the first callback wrapped by the stub; delay-load and ordinal-only imports are packed (see "Imports: delay-load and ordinal"). On ELF, executable PT_LOAD file bytes are 0x90-filled and sealed in EnvelopeV2, except the first 64 bytes at `e_entry` which stay original — glibc (2.39 verified) decodes an ~40-byte instruction window at the entry point and suppresses the whole init phase when it cannot; that window is the `_start` prologue, not protected logic. Imported IFUNC, TLS descriptors, local-exec TPOFF32, copy relocations and static linkage retain named refusals.
 
 ### ASLR / DIR64 pairing (current)
 

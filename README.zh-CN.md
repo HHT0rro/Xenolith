@@ -153,11 +153,15 @@ ZF = r11 移位后的某一位(seed 决定)
 
 ### 6. ELF 路线
 
-Linux 打包不接管加载器:追加一个 R+X `PT_LOAD`(迁移后的 PHDR 表 + PIC stub + `xl_core` + EnvelopeV2),把 `INIT_ARRAY[0]` 重定向到 stub;`ld.so` 照常完成重定位与符号解析,PIE/RELRO/GOT-PLT 不动。可执行 `PT_LOAD` 的文件字节 `0x90` 填充后密封进信封。已在 WSL Ubuntu 24.04 验证:打包后的 `hello-elf` 正常输出,`libhello-elf.so` 可 `dlopen`/`dlclose`;IFUNC resolver 保持原生并支持,符号版本(`DT_VERNEED/VERDEF`)保留且 `dlvsym` 验证通过。IFUNC 导入、TLS 描述符、local-exec TPOFF32、copy 重定位、`PT_TLS`、静态链接 fail closed 直到 stage 5。ELF 符号选择本版本只报告,同样要求 `--allow-native-fallback`。
+Linux 打包不接管加载器:追加一个 R+X `PT_LOAD`(迁移后的 PHDR 表 + PIC stub + `xl_core` + EnvelopeV2),把 `INIT_ARRAY[0]` 重定向到 stub;`ld.so` 照常完成重定位与符号解析,PIE/RELRO/GOT-PLT 不动。可执行 `PT_LOAD` 的文件字节 `0x90` 填充后密封进信封。已在 WSL Ubuntu 24.04 验证:打包后的 `hello-elf` 正常输出,`libhello-elf.so` 可 `dlopen`/`dlclose`;IFUNC resolver 保持原生并支持,符号版本(`DT_VERNEED/VERDEF`)保留且 `dlvsym` 验证通过。initial-exec/local-dynamic TLS 已通过现有样例验证。IFUNC 导入、TLS 描述符、local-exec TPOFF32、copy 重定位与静态链接继续具名拒绝。ELF 符号选择本版本只报告,同样要求 `--allow-native-fallback`。
 
-**安卓路线(实验性)**:同一策略打包安卓 arm64(EM_AARCH64)与 x86_64 ELF64 `.so`——手写定宽编码的 AArch64 stub 加 NDK 编译的 aarch64 `xl_core`,页尺寸从输入推导(4-KiB 与 16-KiB 设备一等公民)。CLI 面不变:`pack`/`inspect`、profiles、`--json` 报告同构(仅新增 `machine` 字段);不支持的输入(ELF32/armeabi-v7a、`PT_INTERP`、`p_align`>16K、RELR/packed 重定位、aarch64 上 `DT_INIT`+`DT_INIT_ARRAY` 并存)一律具名报错。安卓强度:两种机器都有页级 AEAD 密封;**仅 arm64** 另有首批指令白名单的 `--vm-export`(整数/访存/分支类提升到 64 位 IR、逐块再生成 AArch64 superoperator;白名单之外——调用、SIMD/FP、原子、PAC、乘法、位段等——一律具名报错,绝不静默近似)与 bionic 反调试探针集(TracerPid 扫描、`PTRACE_TRACEME` 自附加、`/proc/self/maps` 标记扫描;按 profile 装配,`max`=三个全开,其余 profile=两个,x86_64-ELF=无并如实报告)。x86_64-ELF 的函数选择保持 fail closed(SysV x86-64 lift 属后续阶段)。
+**安卓路线(实验性)**:仅接受部分安卓 arm64(EM_AARCH64)与 x86_64 ELF64 `.so`——手写定宽编码的 AArch64 stub 加 NDK 编译的 aarch64 `xl_core`,对齐从 ELF 输入推导，不能据此推断对应设备页大小已受支持。CLI 面不变:`pack`/`inspect`、profiles、`--json` 报告同构(仅新增 `machine` 字段);不支持的输入(ELF32/armeabi-v7a、`PT_INTERP`、`p_align`>16K、RELR/packed 重定位、aarch64 上 `DT_INIT`+`DT_INIT_ARRAY` 并存)一律具名报错。安卓强度:两种机器都有页级 AEAD 密封;**仅 arm64** 另有首批指令白名单的 `--vm-export`(整数/访存/分支类提升到 64 位 IR、逐块再生成 AArch64 superoperator;白名单之外——调用、SIMD/FP、原子、PAC、乘法、位段等——一律具名报错,绝不静默近似)与 bionic 反调试探针集(TracerPid 扫描、`PTRACE_TRACEME` 自附加、`/proc/self/maps` 标记扫描;按 profile 装配,`max`=三个全开,其余 profile=两个,x86_64-ELF=无并如实报告)。x86_64-ELF 的函数选择保持 fail closed(SysV x86-64 lift 属后续阶段)。
 
-装机状态(模拟器,Android 14 x86_64 + `ndk_translation`):真实 arm64 应用库(SimpleX `libsupport.so`,14.6 MB→19.2 MB)走完打包→回填 APK→对齐→签名→安装→启动(含 force-stop 重启)全流程,进程存活、库已映射、logcat 干净;合成 x86_64 `.so` 通过同一 `dlopen`/`dlsym` 检查。合成端到端门(`/data/local/tmp/xl-e2e/run_e2e.sh`,重建产物):x86_64 打包映像通过硬门——构造函数经 stub 转发,`xl_add`/`xl_mul` 与原生基线 9 组用例全对;arm64 4-KiB 映像经 `ndk_translation` 通过同一检查(观测 16/16);用 `--vm-export xl_add` 打包的 arm64 映像(导出已虚拟化进 stub superoperator)同样经转译 9 组全对,而 `--vm-export xl_mul` 被白名单具名拒绝(乘法保持原生)。arm64 16-KiB 映像仅在装载偏移恰好 16-KiB 同余时通过转译(约 1/4 概率;vprotect shim 按信封页尺寸对齐,而该 4-KiB 内核模拟器只保证 4K 同余)。上述 max-profile 映像中反调试探针已全副武装,在干净装载器下无误报;真实调试器附加下的检出与真机均未验证。仍有一类输入未修复:ELF 头表中不带 `PT_PHDR` 条目的库(如 PPSSPP 1.19.3 的 `libppsspp_jni.so`)能打包成功,但装载器拒绝装载(`loaded phdr … not in loadable segment`)——打包把 `e_phoff` 迁入了附加 `PT_LOAD`;打包器对该类输入尚未 fail closed。另有一个边角:输入可执行段小于一个推导页时密封页数为 0,输入构造函数会被静默跳过。修复前安卓装载支持按实验对待;真机矩阵未验证。
+历史模拟器记录（Android 14 x86_64 + `ndk_translation`，早于当前拒绝规则）：真实 arm64 应用库(SimpleX `libsupport.so`,14.6 MB→19.2 MB)走完打包→回填 APK→对齐→签名→安装→启动(含 force-stop 重启)全流程,进程存活、库已映射、logcat 干净;合成 x86_64 `.so` 通过同一 `dlopen`/`dlsym` 检查。合成端到端门(`/data/local/tmp/xl-e2e/run_e2e.sh`,重建产物):x86_64 打包映像通过硬门——构造函数经 stub 转发,`xl_add`/`xl_mul` 与原生基线 9 组用例全对;arm64 4-KiB 映像经 `ndk_translation` 通过同一检查(观测 16/16);用 `--vm-export xl_add` 打包的 arm64 映像(导出已虚拟化进 stub superoperator)同样经转译 9 组全对,而 `--vm-export xl_mul` 被白名单具名拒绝(乘法保持原生)。arm64 16-KiB 映像仅在装载偏移恰好 16-KiB 同余时通过转译(约 1/4 概率;vprotect shim 按信封页尺寸对齐,而该 4-KiB 内核模拟器只保证 4K 同余)。上述 max-profile 映像中反调试探针已全副武装,在干净装载器下无误报;真实调试器附加下的检出与真机均未验证。
+
+对于含 Android 标识 note 的 ELF 共享库，若缺少 `PT_PHDR`，或有文件内容的可执行 `PT_LOAD` 小于从输入推导出的页尺寸，Xenolith 会拒绝打包。前一种布局曾在 bionic 装载时报 `loaded phdr … not in loadable segment`。自有的 API 34 x86_64 JNI 样例含 `PT_PHDR`，可执行段在文件中占 224 字节，原库返回 42，先前打包的两个版本（含页对齐版本）均在进入 JNI 时触发 `SIGSEGV / SEGV_ACCERR`。
+
+如果 Android x86_64 库的 ELF 装载段指定了 16 KiB 对齐，Xenolith 也会拒绝打包。在 16 KiB 页的 API 35 模拟器上，shell 夹具和直接从 APK 加载库的应用都遇到了 SELinux 拒绝执行已修改的文件映射，原库在两个环境中均能运行。这些拒绝均发生在写入产物之前。Android CI 验证拒绝行为和可接受输入的 ELF 结构。Android 运行时支持仍处于实验阶段，真机尚未验证。
 
 ### 7. 工程面
 
@@ -237,6 +241,10 @@ xenolith project init IN -o FILE [--profile P] [--vm-export N ...]
 xenolith project show FILE
 ```
 
+项目内的相对路径以项目文件所在目录为基准。命令行显式指定的 `-o` 以当前工作目录为基准。打包和项目初始化要求输出路径尚不存在。TUI 替换已有项目时会要求确认。
+
+`inspect --json` 区分原始 ELF 和 Xenolith 产物。`--exports` 支持 PE 输入。Android 支持矩阵分别列出结构检查、模拟器结果和真机验证。
+
 ### `pack` 标志
 
 | 标志 | 取值 | 默认 | 说明 |
@@ -268,6 +276,8 @@ xenolith project show FILE
 
 ## 构建与测试
 
+Linux 构建 CLI 后执行 `bash tests/linux-elf-smoke.sh ./target/release/xenolith target`。自有夹具比较原件和 standard 档产物的 PIE、共享库加载与重载、C++ 异常展开、setjmp、可变参数、结构体返回、回调、IFUNC、版本符号及 initial-exec/local-dynamic TLS。每次运行在 `target/elf-smoke.*` 保存命令、退出码、stdout、stderr、输入源码与 SHA-256。2026年11月26日本地 Ubuntu 24.04 WSL x86_64 运行通过。Ubuntu 22.04 和 Debian 12 已配置 CI，托管运行仍待执行。
+
 ```
 cargo build --release -p xenolith-cli
 cargo build -p hello-dll --release
@@ -288,6 +298,8 @@ powershell -ExecutionPolicy Bypass -File scripts/build-exe.ps1
 产出 `dist/xenolith.exe` 与 sha256;加 `-RunTests` 连样例与工作区测试一起跑,加 `-ReleaseBundle` 组装发布 bundle(SBOM、哈希、来源、预算门)。
 
 样例:`samples/license-toy`(C 真值样例,冻结 `-O1`,手写 `DllMain`;`check_license(x,y): t=x^y; t+=0x9E3779B9; t>0x10000 ? t-y : t+y`)、`hello-dll`(rustc 构建的对齐检查:rustc 与 C 会让 lifter 分化成两个特例时,**C 是真相**)、`hello-elf`、`eh-dll`、`jni-host`、`jni-rust`。
+
+发布清单通过 `provenance.build_source` 记录 CLI 构建时嵌入的产品源码身份。发布包包含与该身份一致的确定性 `source-snapshot.json` 源码快照，其哈希也列入发布清单。本地维护包支持有未提交改动的工作区。若发布提示 `release source drift`，运行 `cargo build --locked --release -p xenolith-cli`，再使用重建后的 CLI 重试。CI 生成的 `xenolith-Windows.zip` 在根目录包含 `xenolith.exe` 和 `manifest.json`，`xenolith-Linux.tar.gz` 保留 Unix 执行权限。
 
 ## 开源协议
 

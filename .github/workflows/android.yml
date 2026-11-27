@@ -24,7 +24,7 @@ jobs:
         run: cargo build -p xenolith-cli --release
       - name: Unit tests (formats/pack cover the aarch64 matrix)
         run: cargo test -p xenolith-formats -p xenolith-protocol -p xenolith-pack --lib
-      - name: Build dual-ABI victims, pack, assert structure
+      - name: Assert Android input refusals and packed ELF structure
         env:
           NDK: ${{ env.ANDROID_NDK_HOME }}
           CLI: target/release/xenolith
@@ -37,12 +37,64 @@ jobs:
           __attribute__((constructor)) static void xl_boot_gate(void) { xl_gate = 1; }
           int hello_add(int a, int b) { return a + b; }
           const char *hello_string(void) { return "xenolith-android-ci"; }
+          #if RX_NOPS > 0
+          #define STR_INNER(x) #x
+          #define STR(x) STR_INNER(x)
+          void fixture_padding(void) {
+              __asm__ volatile(".rept " STR(RX_NOPS) "\n\tnop\n\t.endr");
+          }
+          #endif
           EOF
-          for abi_page in aarch64:4096 aarch64:16384 x86_64:4096; do
+          expect_refusal() {
+            local input="$1" output="$2" reason="$3"
+            if "$CLI" pack "$input" -o "$output" --json > "$output.stdout" 2> "$output.stderr"; then
+              echo "Unexpected pack success for $input" >&2
+              return 1
+            fi
+            grep -F "$reason" "$output.stderr" || { cat "$output.stderr" >&2; return 1; }
+            test ! -e "$output"
+            test ! -s "$output.stdout"
+          }
+          for abi_page in aarch64:4096 aarch64:16384 x86_64:4096 x86_64:16384; do
             abi=${abi_page%%:*}; page=${abi_page##*:}
             tgt=$([ "$abi" = aarch64 ] && echo aarch64-linux-android24 || echo x86_64-linux-android24)
+            # The 16 KiB case has over 4 KiB of text and must still be refused.
+            small_nops=0
+            if [ "$page" -eq 16384 ]; then
+              # Keep the executable segment between 4 KiB and 16 KiB on both ABIs.
+              if [ "$abi" = aarch64 ]; then small_nops=2048; else small_nops=8192; fi
+            fi
+            small=target/android-ci/libsmall-$abi-$page.so
             "$CLANG/clang" --target=$tgt -fPIC -shared -O1 -Wl,-z,max-page-size=$page \
-              -o target/android-ci/libvictim-$abi-$page.so target/android-ci/victim.c
+              -DRX_NOPS=$small_nops -o "$small" target/android-ci/victim.c
+            expect_refusal "$small" "target/android-ci/refused-small-$abi-$page.so" \
+              "smaller than the derived page size of $page bytes"
+
+            # The larger input exercises the existing structural assertions.
+            "$CLANG/clang" --target=$tgt -fPIC -shared -O1 -Wl,-z,max-page-size=$page \
+              -DRX_NOPS=32768 -o target/android-ci/libvictim-$abi-$page.so target/android-ci/victim.c
+            no_phdr=target/android-ci/libno-phdr-$abi-$page.so
+            python3 - "target/android-ci/libvictim-$abi-$page.so" "$no_phdr" <<'EOF'
+          import struct, sys
+          from pathlib import Path
+
+          data = bytearray(Path(sys.argv[1]).read_bytes())
+          phoff, = struct.unpack_from("<Q", data, 32)
+          entsize, count = struct.unpack_from("<HH", data, 54)
+          phdrs = [phoff + i * entsize for i in range(count)]
+          matches = [off for off in phdrs if struct.unpack_from("<I", data, off)[0] == 6]
+          assert len(matches) == 1, "expected one PT_PHDR in the original fixture"
+          struct.pack_into("<I", data, matches[0], 0)  # PT_PHDR -> PT_NULL
+          Path(sys.argv[2]).write_bytes(data)
+          EOF
+            expect_refusal "$no_phdr" "target/android-ci/refused-no-phdr-$abi-$page.so" \
+              "Android shared object is missing PT_PHDR"
+            if [ "$abi" = x86_64 ] && [ "$page" -eq 16384 ]; then
+              expect_refusal "target/android-ci/libvictim-$abi-$page.so" \
+                "target/android-ci/refused-runtime-$abi-$page.so" \
+                "Android x86_64 shared objects with 16 KiB pages are unsupported"
+              continue
+            fi
             "$CLI" pack target/android-ci/libvictim-$abi-$page.so -o target/android-ci/out-$abi-$page.xl.so
             "$CLI" inspect target/android-ci/out-$abi-$page.xl.so --json > target/android-ci/inspect-$abi-$page.json
             python3 - "$abi" "$page" <<'EOF'
@@ -68,7 +120,7 @@ jobs:
           assert last[4] & 1, "appended LOAD must be executable"
           assert (last[1] - last[0]) % last[3] == 0, "PT_LOAD congruence broken"
           assert phoff >= page, "e_phoff must point at the tail table"
-          print(f"{abi}/{page}KiB structural assertions OK")
+          print(f"{abi}/{page} bytes: structural assertions OK")
           EOF
           done
       - name: llvm-readelf deep assertions (C-1..C-4)
@@ -116,7 +168,7 @@ jobs:
           assert va <= addend < va + msz, f"redirect addend {addend:#x} outside appended LOAD [{va:#x},{va+msz:#x})"
           print("INIT_ARRAY[0] redirect addend lands in the appended LOAD: OK")
           EOF
-      - name: Tamper control (flip one envelope byte → inspect stays packed, envelope refuses)
+      - name: Inspect tampered ELF (structural check)
         run: |
           set -eu
           python3 - <<'EOF'

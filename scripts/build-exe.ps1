@@ -58,6 +58,7 @@ try {
     ) -WorkingDirectory $repoRoot
 
     if ($RunTests) {
+        # Keep the release fixtures in sync with the CI and release prebuilds.
         Invoke-Checked -FilePath "cargo" -Arguments @(
             "build",
             "--locked",
@@ -67,7 +68,13 @@ try {
             "-p",
             "license-toy",
             "-p",
-            "hello-exe"
+            "hello-exe",
+            "-p",
+            "eh-dll",
+            "-p",
+            "jni-host",
+            "-p",
+            "jni-rust"
         ) -WorkingDirectory $repoRoot
 
         $previousSkipWsl = $env:XL_SKIP_WSL_TESTS

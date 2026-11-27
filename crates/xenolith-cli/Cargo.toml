@@ -18,5 +18,13 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+ignore = "0.4"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["windows"] }
+
+[build-dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+ignore = "0.4"

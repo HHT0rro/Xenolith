@@ -66,21 +66,55 @@ jobs:
         # here instead of skipping — the release regression covers Android.
         run: cargo test --workspace --exclude xenolith-runtime
       - name: Assemble release bundle
-        run: >
-          ./target/release/xenolith release
-          --out dist
-          --label "${{ inputs.label }}-${{ runner.os }}"
-          ${{ inputs.allow_budget_fail && '--allow-budget-fail' || '' }}
-      - name: Manifest digest
+        id: assemble
         shell: bash
+        env:
+          RELEASE_LABEL: ${{ inputs.label }}
+          ALLOW_BUDGET_FAIL: ${{ inputs.allow_budget_fail }}
         run: |
-          if command -v sha256sum >/dev/null; then
-            sha256sum dist/manifest.json
-          else
-            powershell -Command "(Get-FileHash dist/manifest.json -Algorithm SHA256).Hash"
+          set -eu
+          cli=./target/release/xenolith
+          runner_temp="$RUNNER_TEMP"
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            cli+=.exe
+            runner_temp=$(cygpath -u "$runner_temp")
           fi
+          work=$(mktemp -d "$runner_temp/xenolith-release.XXXXXXXX")
+          args=(release --out "$work/dist" --label="$RELEASE_LABEL-$RUNNER_OS")
+          if [[ "$ALLOW_BUDGET_FAIL" == true ]]; then
+            args+=(--allow-budget-fail)
+          fi
+          "$cli" "${args[@]}"
+          sha256sum "$work/dist/manifest.json"
+          bundle="$work/dist"
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            bundle=$(cygpath -m "$bundle")
+          fi
+          printf 'bundle=%s\n' "$bundle" >> "$GITHUB_OUTPUT"
+      - name: Archive Windows bundle
+        if: runner.os == 'Windows'
+        id: windows_archive
+        shell: pwsh
+        env:
+          RELEASE_BUNDLE: ${{ steps.assemble.outputs.bundle }}
+        run: |
+          $archive = Join-Path (Split-Path -Parent $env:RELEASE_BUNDLE) 'xenolith-Windows.zip'
+          [IO.Compression.ZipFile]::CreateFromDirectory($env:RELEASE_BUNDLE, $archive)
+          "archive=$archive" >> $env:GITHUB_OUTPUT
+      - name: Archive Linux bundle
+        if: runner.os == 'Linux'
+        id: linux_archive
+        shell: bash
+        env:
+          RELEASE_BUNDLE: ${{ steps.assemble.outputs.bundle }}
+        run: |
+          set -eu
+          # upload-artifact normalizes permissions. The tar keeps the Unix CLI executable.
+          archive="$RELEASE_BUNDLE/../xenolith-Linux.tar.gz"
+          tar -czf "$archive" -C "$RELEASE_BUNDLE/.." dist
+          printf 'archive=%s\n' "$archive" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
           name: xenolith-${{ inputs.label }}-${{ runner.os }}
-          path: dist/
+          path: ${{ steps.windows_archive.outputs.archive || steps.linux_archive.outputs.archive }}
           if-no-files-found: error

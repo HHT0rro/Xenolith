@@ -19,14 +19,15 @@ use ratatui::widgets::ListState;
 use ratatui::Terminal;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, stdout, IsTerminal};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use worker::{spawn_pack, PackDone};
 
 use crate::args::{ProfileArg, parse_seed_hex};
-use crate::project::{self, ProjectFile};
+use crate::output::{self, Output};
+use crate::project::{self, ProjectFile, SaveMode};
 
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -273,6 +274,9 @@ struct App {
     bulk_staged: Option<(Bulk, Vec<(usize, bool, DetailResult)>)>,
     pe_bytes: Option<Arc<Vec<u8>>>,
     pack_rx: Option<Receiver<Result<PackDone, String>>>,
+    pack_output: Option<(Output, std::fs::Permissions)>,
+    /// The rendered save button authorizes replacement only at this path.
+    project_update_shown: Option<PathBuf>,
     pack_started: Option<Instant>,
     spinner_frame: usize,
     cancelled: bool,
@@ -369,6 +373,8 @@ impl App {
             bulk_staged: None,
             pe_bytes: None,
             pack_rx: None,
+            pack_output: None,
+            project_update_shown: None,
             pack_started: None,
             spinner_frame: 0,
             cancelled: false,
@@ -576,13 +582,10 @@ impl App {
     /// project file's directory; profile, switches, VM checks and `select_rva`
     /// come back exactly as saved. A missing input stays on Pick (caller logs).
     fn open_project(&mut self, path: PathBuf) -> Result<()> {
-        let file = project::load(&path).with_context(|| format!("load {}", path.display()))?;
-        let base = match path.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-            _ => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        };
-        let input = resolve_relative(&base, &file.input);
-        let output = resolve_relative(&base, &file.output);
+        let file =
+            project::load_paths(&path).with_context(|| format!("load {}", path.display()))?;
+        let input = file.input.clone();
+        let output = file.output.clone();
         let profile = ProfileArg::parse_str(&file.profile)?;
         if !input.is_file() {
             bail!("project input {} not found", input.display());
@@ -985,14 +988,30 @@ impl App {
         p
     }
 
+    fn project_save_label(&mut self) -> &'static str {
+        let path = self.project_path();
+        if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
+            self.project_update_shown = Some(path);
+            "[Overwrite project]"
+        } else {
+            self.project_update_shown = None;
+            "[Save project]"
+        }
+    }
+
     fn save_project(&mut self) -> Result<()> {
         if self.input.as_os_str().is_empty() {
             bail!("no input");
         }
         let path = self.project_path();
+        let mode = if self.project_update_shown.as_ref() == Some(&path) {
+            SaveMode::UpdateProject
+        } else {
+            SaveMode::New
+        };
         project::save(
             &path,
-            &ProjectFile {
+            ProjectFile {
                 schema_version: crate::project::SCHEMA_VERSION,
                 input: self.input.clone(),
                 output: self.output.clone(),
@@ -1008,6 +1027,7 @@ impl App {
                 protect_imports: self.protect_imports,
                 strict_constants: self.strict_constants,
             },
+            mode,
         )?;
         self.dirty = false;
         self.log_ok(format!("saved {}", path.display()));
@@ -1193,10 +1213,16 @@ impl App {
                 }
             }
         };
-        let bytes = match std::fs::read(&self.input) {
-            Ok(b) => b,
+        let prepared = (|| -> Result<_> {
+            let output = Output::new(&self.output, &[&self.input])?;
+            output.require_new()?;
+            let (bytes, permissions) = output::read_input(&self.input)?;
+            Ok((output, bytes, permissions))
+        })();
+        let (output, bytes, permissions) = match prepared {
+            Ok(prepared) => prepared,
             Err(e) => {
-                self.log_error(format!("read {}: {e}", self.input.display()));
+                self.log_error(format!("{e:#}"));
                 return;
             }
         };
@@ -1218,6 +1244,7 @@ impl App {
         ) {
             Ok(rx) => {
                 self.pack_rx = Some(rx);
+                self.pack_output = Some((output, permissions));
                 self.pack_started = Some(Instant::now());
                 self.spinner_frame = 0;
                 self.cancelled = false;
@@ -1234,6 +1261,7 @@ impl App {
     fn cancel_pack(&mut self) {
         self.cancelled = true;
         self.pack_rx = None;
+        self.pack_output = None;
         self.screen = Screen::Configure;
         self.focus = Focus::List;
         self.log_warn("pack cancelled; image discarded (worker may still finish)");
@@ -1246,10 +1274,14 @@ impl App {
         match rx.try_recv() {
             Ok(Ok(done)) => {
                 self.pack_rx = None;
+                let prepared = self.pack_output.take();
                 if self.cancelled {
                     return;
                 }
-                match std::fs::write(&done.output, &done.image) {
+                let write_result = prepared.context("missing prepared output").and_then(
+                    |(output, permissions)| output.write_new(&done.image, Some(&permissions)),
+                );
+                match write_result {
                     Ok(()) => {
                         self.log_ok(format!(
                             "pack {} · {} vm · {} pages · {:.1}s",
@@ -1263,16 +1295,15 @@ impl App {
                         self.finish_result(PackOutcome::Success(done));
                     }
                     Err(e) => {
-                        self.log_error(format!("write {}: {e}", done.output.display()));
-                        self.finish_result(PackOutcome::Failure(format!(
-                            "write {}: {e}",
-                            done.output.display()
-                        )));
+                        let msg = format!("write {}: {e:#}", done.output.display());
+                        self.log_error(&msg);
+                        self.finish_result(PackOutcome::Failure(msg));
                     }
                 }
             }
             Ok(Err(e)) => {
                 self.pack_rx = None;
+                self.pack_output = None;
                 if !self.cancelled {
                     self.log_error(format!("pack failed: {e}"));
                     self.finish_result(PackOutcome::Failure(e));
@@ -1281,6 +1312,7 @@ impl App {
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
                 self.pack_rx = None;
+                self.pack_output = None;
                 if !self.cancelled {
                     self.log_error("pack thread died");
                     self.finish_result(PackOutcome::Failure("pack thread died".into()));
@@ -1299,32 +1331,44 @@ impl App {
         self.button = 0;
     }
 
-    /// Persist the whole error chain to the fixed file so the scrollable
-    /// Result screen is not the only copy. Prefers a `last-error.txt` next to
-    /// the output (the directory the pack was headed for), falls back to the
-    /// cwd when the output has no usable parent directory or the write there
-    /// fails. Records the chosen path for the Result screen; a failed dump is
-    /// logged, never fatal.
+    /// Keep an error report beside the output when possible. An occupied
+    /// report name is left intact, including files from earlier failures.
     fn dump_last_error(&mut self, msg: &str) {
         self.failure_path = None;
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        if let Some(dir) = self.output.parent() {
-            if !dir.as_os_str().is_empty() && dir.is_dir() {
-                candidates.push(dir.join("last-error.txt"));
-            }
-        }
-        candidates.push(
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join("last-error.txt"),
-        );
-        for path in candidates {
-            match std::fs::write(&path, format!("{msg}\n")) {
-                Ok(()) => {
-                    self.failure_path = Some(path);
-                    return;
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let dir = self
+            .output
+            .parent()
+            .filter(|dir| dir.is_dir())
+            .map(PathBuf::from);
+        let report = format!("{msg}\n");
+        for dir in dir.filter(|dir| dir != &cwd).into_iter().chain([cwd]) {
+            let mut error = None;
+            for number in 0..16 {
+                let name = if number == 0 {
+                    "last-error.txt".to_owned()
+                } else {
+                    format!("last-error-{number}.txt")
+                };
+                let path = dir.join(name);
+                if std::fs::symlink_metadata(&path).is_ok() {
+                    continue;
                 }
-                Err(e) => self.log_warn(format!("cannot write {}: {e}", path.display())),
+                match Output::new(&path, &[&self.input, &self.output])
+                    .and_then(|out| out.write_new(report.as_bytes(), None))
+                {
+                    Ok(()) => {
+                        self.failure_path = Some(path);
+                        return;
+                    }
+                    Err(e) => error = Some(e),
+                }
+            }
+            if let Some(error) = error {
+                self.log_warn(format!(
+                    "cannot write error report in {}: {error:#}",
+                    dir.display()
+                ));
             }
         }
     }
@@ -1749,14 +1793,6 @@ fn lift_one(bytes: &[u8], name: &str, rva: u32) -> DetailResult {
     }
 }
 
-fn resolve_relative(base: &Path, p: &Path) -> PathBuf {
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        base.join(p)
-    }
-}
-
 fn init_cwd(input: Option<&PathBuf>) -> PathBuf {
     if let Some(p) = input {
         if let Some(parent) = p.parent() {
@@ -2147,6 +2183,7 @@ fn handle_key(app: &mut App, k: KeyEvent) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::Path;
 
     fn test_app() -> App {
         App::new(None).expect("app")
@@ -2710,5 +2747,74 @@ mod tests {
             .expect("saved project loads");
         assert_eq!(loaded.select_rva, vec!["0x2000:0x40".to_string()]);
         let _ = fs::remove_file("out.xl.xenolith.json");
+    }
+
+    #[test]
+    fn project_save_requires_the_rendered_overwrite_action() {
+        let dir = crate::output::tests::TestDir::new();
+        let mut app = configure_app();
+        app.input = dir.0.join("input.dll");
+        app.output = dir.0.join("output.dll");
+        fs::write(&app.input, b"original sample").unwrap();
+        let path = app.project_path();
+        assert_eq!(app.project_save_label(), "[Save project]");
+        let old = br#"{"input":"input.dll","output":"output.dll","profile":"fast"}"#;
+        fs::write(&path, old).unwrap();
+        app.dirty = true;
+        assert!(app.save_project().is_err());
+        assert!(app.dirty);
+        assert_eq!(fs::read(&path).unwrap(), old);
+        assert_eq!(app.project_save_label(), "[Overwrite project]");
+        app.save_project().unwrap();
+        assert!(!app.dirty);
+        let saved = project::load_paths(&path).unwrap();
+        assert_eq!((saved.input, saved.output), (app.input, app.output));
+    }
+
+    #[test]
+    fn failure_report_preserves_existing_data_and_does_not_create_pack_output() {
+        let dir = crate::output::tests::TestDir::new();
+        let mut app = configure_app();
+        let occupied = dir.0.join("last-error.txt");
+        fs::write(&occupied, b"user data").unwrap();
+        app.output = dir.0.join("last-error-1.txt");
+        app.dump_last_error("sample failure");
+        assert_eq!(fs::read(occupied).unwrap(), b"user data");
+        assert!(!app.output.exists());
+        assert_eq!(app.failure_path, Some(dir.0.join("last-error-2.txt")));
+    }
+
+    #[test]
+    fn cancelling_a_completed_worker_discards_result_before_publishing() {
+        let dir = crate::output::tests::TestDir::new();
+        let sample = sample_dll().unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../samples/hello-elf/libhello-elf.so")
+        });
+        if !sample.is_file() {
+            return;
+        }
+        let mut app = configure_app();
+        app.input = dir.0.join("input-image");
+        app.output = dir.0.join("output-image");
+        fs::copy(&sample, &app.input).unwrap();
+        let original = fs::read(&app.input).unwrap();
+        app.profile = ProfileArg::Fast;
+        app.start_pack();
+        let done = app
+            .pack_rx
+            .take()
+            .expect("worker requested")
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        let (tx, rx) = channel();
+        tx.send(Ok(done)).unwrap();
+        app.pack_rx = Some(rx);
+        app.cancel_pack();
+        app.poll_pack();
+        assert!(!app.output.exists());
+        assert_eq!(fs::read(&app.input).unwrap(), original);
+        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 1);
     }
 }

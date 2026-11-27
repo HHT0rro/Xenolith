@@ -27,6 +27,7 @@ jobs:
         run: cargo test --workspace --exclude xenolith-runtime
       - name: Build CLI, pack, inspect
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo build -p xenolith-cli --release
           ./target/release/xenolith pack ./target/release/hello_dll.dll -o ./target/release/hello_dll.xl.dll --profile max --json
           ./target/release/xenolith inspect ./target/release/hello_dll.xl.dll --json | Tee-Object -FilePath ./target/release/hello_dll.xl.inspect.json
@@ -45,7 +46,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: windows-reports
+          name: windows-reports-${{ matrix.os }}
           path: |
             target/release/*.inspect.json
           if-no-files-found: warn
@@ -64,37 +65,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build workspace
         run: cargo build -p xenolith-cli --release
+      # Build target/hello-elf before the unit test that consumes it.
+      - name: Run native ELF fixtures
+        run: bash tests/linux-elf-smoke.sh ./target/release/xenolith target
       - name: Unit tests and manifests
         run: cargo test --workspace --exclude xenolith-runtime
-      - name: Build ELF samples (frozen corpus flags)
-        run: |
-          cd samples/hello-elf
-          gcc -fPIE -pie -o ../../target/hello-elf hello.c
-          gcc -fPIC -shared -o ../../target/libhello-elf.so hello.c
-      - name: Native pack + run (EXE, 3 ASLR bases)
-        run: |
-          ./target/release/xenolith pack target/hello-elf -o target/hello-elf.xl.elf --profile standard --json
-          chmod +x target/hello-elf.xl.elf
-          for i in 1 2 3; do
-            out=$(./target/hello-elf.xl.elf)
-            echo "run $i: $out"
-            [ "$out" = "xenolith-hello-elf" ] || exit 1
-          done
-      - name: Native pack + dlopen (SO)
-        run: |
-          ./target/release/xenolith pack target/libhello-elf.so -o target/libhello-elf.xl.so --profile standard --json
-          cp target/libhello-elf.xl.so /tmp/xl-hello.so
-          python3 -c "import ctypes; l=ctypes.CDLL('/tmp/xl-hello.so'); print('DLOPEN OK'); del l; print('DLCLOSE OK')"
-      - name: Inspect reports
-        run: |
-          ./target/release/xenolith inspect target/hello-elf.xl.elf --json | tee target/hello-elf.xl.inspect.json
-          ./target/release/xenolith inspect target/libhello-elf.xl.so --json | tee target/libhello-elf.xl.so.inspect.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: linux-reports-${{ matrix.os }}
           path: |
             target/*.inspect.json
+            target/elf-smoke.*/**
           if-no-files-found: warn
 
   test-debian:
@@ -109,21 +91,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build workspace
         run: cargo build -p xenolith-cli --release
+      - name: Run native ELF fixtures
+        run: bash tests/linux-elf-smoke.sh ./target/release/xenolith target
       - name: Unit tests and manifests
         run: cargo test --workspace --exclude xenolith-runtime
-      - name: Build ELF samples
-        run: |
-          cd samples/hello-elf
-          gcc -fPIE -pie -o ../../target/hello-elf hello.c
-          gcc -fPIC -shared -o ../../target/libhello-elf.so hello.c
-      - name: Native pack + load
-        run: |
-          ./target/release/xenolith pack target/hello-elf -o target/hello-elf.xl.elf --profile standard --json
-          chmod +x target/hello-elf.xl.elf
-          [ "$(./target/hello-elf.xl.elf)" = "xenolith-hello-elf" ]
-          ./target/release/xenolith pack target/libhello-elf.so -o target/libhello-elf.xl.so --profile standard --json
-          cp target/libhello-elf.xl.so /tmp/xl-hello.so
-          python3 -c "import ctypes; l=ctypes.CDLL('/tmp/xl-hello.so'); del l"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-reports-debian-12
+          path: |
+            target/*.inspect.json
+            target/elf-smoke.*/**
+          if-no-files-found: warn
 
   # TASK-037 continuous fuzzing. Bounded per-target runs on the schedule
   # trigger only (never on PRs); crashes upload as artifacts and their

@@ -1,4 +1,5 @@
 mod args;
+mod output;
 mod project;
 mod release;
 mod tui;
@@ -8,7 +9,7 @@ use args::{parse_seed_hex, Cli, Command, ProfileArg, ProjectCmd};
 use clap::Parser;
 use xenolith_pack::{inspect_bytes, pack, PackRequest};
 use project::ProjectFile;
-use std::fs;
+use std::fs::{self, Permissions};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
@@ -81,7 +82,7 @@ fn main() -> Result<()> {
                 "packing {} (profile={}, out={})",
                 resolved.input.display(),
                 resolved.profile_label,
-                resolved.output.display()
+                resolved.output.requested_path().display()
             );
             // XL_DEBUG_GATE (independent review 2026-10-06): validated
             // 0..=3, named error on anything else — an unvalidated env var
@@ -124,20 +125,21 @@ fn main() -> Result<()> {
                 protect_imports: resolved.protect_imports,
                 strict_constants: resolved.strict_constants,
             })?;
-            fs::write(&resolved.output, &packed.image)
-                .with_context(|| format!("write {}", resolved.output.display()))?;
+            resolved
+                .output
+                .write_new(&packed.image, Some(&resolved.permissions))?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&packed.report)?);
             } else {
                 // Hash the bytes back off disk so the digest is the artifact's,
                 // not an in-memory view of it.
-                let digest = match release::sha256_file(&resolved.output) {
+                let digest = match release::sha256_file(resolved.output.path()) {
                     Ok(d) => d,
                     Err(e) => format!("unavailable: {e:#}"),
                 };
                 println!(
                     "packed -> {} ({} pages, backend={}, iat={}, decrypt_window={}, vm={}, gate={}, size={}B->{}B)\noutput sha256: {digest}",
-                    resolved.output.display(),
+                    resolved.output.requested_path().display(),
                     packed.report.pages,
                     packed.report.backend,
                     packed.report.iat_mode,
@@ -186,6 +188,7 @@ fn main() -> Result<()> {
                     }
                     return Ok(());
                 }
+                bail!("--exports is unsupported for ELF inspection");
             }
             if json {
                 println!("{}", serde_json::to_string_pretty(&info)?);
@@ -247,8 +250,7 @@ fn main() -> Result<()> {
                 strict_constants,
             } => {
                 let packed_out = {
-                    let bytes = fs::read(&input)
-                        .with_context(|| format!("read {}", input.display()))?;
+                    let (bytes, _) = output::read_input(&input)?;
                     match xenolith_formats::classify(&bytes) {
                         Ok(kind) => xenolith_formats::packed_output_name(&input, kind),
                         Err(_) => {
@@ -274,7 +276,7 @@ fn main() -> Result<()> {
                     protect_imports,
                     strict_constants,
                 };
-                project::save(&output, &file)?;
+                project::save(&output, file, project::SaveMode::New)?;
                 println!("wrote {}", output.display());
                 Ok(())
             }
@@ -295,7 +297,8 @@ struct ResolvedPack {
     /// Where the image bytes came from — shown in the pre-pack stderr line.
     input: PathBuf,
     bytes: Vec<u8>,
-    output: PathBuf,
+    permissions: Permissions,
+    output: output::Output,
     /// Profile as the user wrote it (`fast|standard|max`), for messages.
     profile_label: String,
     profile: xenolith_loader::Profile,
@@ -334,10 +337,11 @@ fn resolve_pack(
         None => None,
     };
     if let Some(pj) = project {
-        let file = project::load(&pj)?;
-        let bytes =
-            fs::read(&file.input).with_context(|| format!("read {}", file.input.display()))?;
+        let file = project::load_paths(&pj)?;
         let out = output.unwrap_or_else(|| file.output.clone());
+        let output = output::Output::new(&out, &[&file.input, &pj])?;
+        output.require_new()?;
+        let (bytes, permissions) = output::read_input(&file.input)?;
         let mut vm = file.vm_exports.clone();
         vm.extend(vm_export);
         vm.sort();
@@ -356,7 +360,8 @@ fn resolve_pack(
         return Ok(ResolvedPack {
             input: file.input.clone(),
             bytes,
-            output: out,
+            permissions,
+            output,
             profile_label: file.profile.clone(),
             profile: file.profile()?,
             vm_exports: vm,
@@ -374,13 +379,16 @@ fn resolve_pack(
     }
     let input = input.ok_or_else(|| anyhow::anyhow!("pack requires INPUT or --project"))?;
     let output = output.ok_or_else(|| anyhow::anyhow!("pack requires -o/--output or --project"))?;
-    let bytes = fs::read(&input).with_context(|| format!("read {}", input.display()))?;
+    let output = output::Output::new(&output, &[&input])?;
+    output.require_new()?;
+    let (bytes, permissions) = output::read_input(&input)?;
     if strict_coverage && allow_native_fallback {
         bail!("strict-coverage and allow-native-fallback are mutually exclusive");
     }
     Ok(ResolvedPack {
-        input: input.clone(),
+        input,
         bytes,
+        permissions,
         output,
         profile_label: profile.as_str().to_string(),
         profile: profile.into(),
@@ -396,4 +404,59 @@ fn resolve_pack(
         protect_imports,
         strict_constants,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::output::tests::TestDir;
+
+    #[test]
+    fn pack_resolves_project_fields_and_keeps_explicit_output_override() {
+        let dir = TestDir::new();
+        let input = dir.0.join("image.dll");
+        let configured = dir.0.join("configured.dll");
+        let project = dir.0.join("project.json");
+        fs::write(&input, b"sample bytes").unwrap();
+        fs::write(
+            &project,
+            r#"{"input":"image.dll","output":"configured.dll","profile":"fast"}"#,
+        )
+        .unwrap();
+        let resolve = |output| {
+            resolve_pack(
+                None,
+                output,
+                ProfileArg::Fast,
+                vec![],
+                Some(project.clone()),
+                None,
+                false,
+                vec![],
+                vec![],
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+            )
+        };
+        let pack = resolve(None).unwrap();
+        assert_eq!(pack.bytes, b"sample bytes");
+        assert_eq!(pack.input, input);
+        assert_eq!(pack.output.requested_path(), configured);
+
+        let override_dir = TestDir::new();
+        let explicit = override_dir.0.join("explicit.dll");
+        assert_eq!(
+            resolve(Some(explicit.clone()))
+                .unwrap()
+                .output
+                .requested_path(),
+            explicit
+        );
+        assert!(resolve(Some(input)).is_err());
+        assert!(resolve(Some(project.clone())).is_err());
+    }
 }
