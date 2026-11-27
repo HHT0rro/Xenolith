@@ -276,7 +276,9 @@ xenolith project show FILE
 
 ## 构建与测试
 
-Linux 构建 CLI 后执行 `bash tests/linux-elf-smoke.sh ./target/release/xenolith target`。自有夹具比较原件和 standard 档产物的 PIE、共享库加载与重载、C++ 异常展开、setjmp、可变参数、结构体返回、回调、IFUNC、版本符号及 initial-exec/local-dynamic TLS，并核对原件和产物均只有一个 `PT_GNU_EH_FRAME`。每次运行在 `target/elf-smoke.*` 保存命令、退出码、stdout、stderr、输入源码与 SHA-256。2026年11月27日本地 Kali Linux WSL x86_64 运行通过。Ubuntu 22.04 和 Debian 12 已配置 CI，托管运行仍待执行。
+Linux 构建 CLI 后执行 `bash tests/linux-elf-smoke.sh ./target/release/xenolith target`。自有夹具比较原件和 standard 档产物的 PIE、共享库加载与重载、C++ 异常展开、setjmp、可变参数、结构体返回、回调、IFUNC、版本符号及 initial-exec/local-dynamic TLS，并核对原件和产物均只有一个 `PT_GNU_EH_FRAME`。每次运行在 `target/elf-smoke.*` 保存命令、退出码、stdout、stderr、输入源码与 SHA-256。2026年11月27日本地 Kali Linux WSL x86_64 运行通过。提交 `3cb1716` 的托管 CI 已在 Ubuntu 22.04、Ubuntu 24.04 和 Debian 12 通过原生 ELF 夹具，在 Windows 2022、2025 通过 Native 样例、发布回归和十分钟压力门禁。Android 工作流已通过所支持布局和拒绝案例的结构检查。[CI 证据](https://github.com/HHT0rro/Xenolith/actions/runs/46031041256) · [Android 结构证据](https://github.com/HHT0rro/Xenolith/actions/runs/46031041248)
+
+`v1.2.0-rc2` 发行包中的 CLI 版本为 `0.1.0`。Linux x86-64 资产在 Ubuntu 24.04 构建并完成冒烟验证，要求 glibc 2.39。Windows 和 Linux 归档均包含源码身份、SBOM 和逐文件摘要，可使用 `SHA256SUMS` 核验下载文件。[发行资产](https://github.com/HHT0rro/Xenolith/releases/tag/v1.2.0-rc2)
 
 ```
 cargo build --release -p xenolith-cli
