@@ -20,6 +20,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Build script publication regressions
+        shell: pwsh
+        run: ./tests/build-exe.ps1
       - name: Build sample binaries
         run: |
           cargo build -p hello-dll -p license-toy -p hello-exe -p eh-dll -p jni-host -p jni-rust --release

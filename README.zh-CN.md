@@ -297,6 +297,8 @@ powershell -ExecutionPolicy Bypass -File scripts/build-exe.ps1
 
 产出 `dist/xenolith.exe` 与 sha256;加 `-RunTests` 连样例与工作区测试一起跑,加 `-ReleaseBundle` 组装发布 bundle(SBOM、哈希、来源、预算门)。
 
+每次构建的 `-OutputDir` 应不存在或为空。脚本通过 `cargo metadata` 解析构建目录，支持 `CARGO_TARGET_DIR`，在暂存目录验证可执行文件及发布清单的全部产物后提交目录。构建或验证失败时保留已有输出文件。输出路径经过符号链接或目录联接时拒绝发布。使用 `powershell -ExecutionPolicy Bypass -File tests/build-exe.ps1` 运行自有无害发布回归夹具。
+
 样例:`samples/license-toy`(C 真值样例,冻结 `-O1`,手写 `DllMain`;`check_license(x,y): t=x^y; t+=0x9E3779B9; t>0x10000 ? t-y : t+y`)、`hello-dll`(rustc 构建的对齐检查:rustc 与 C 会让 lifter 分化成两个特例时,**C 是真相**)、`hello-elf`、`eh-dll`、`jni-host`、`jni-rust`。
 
 发布清单通过 `provenance.build_source` 记录 CLI 构建时嵌入的产品源码身份。发布包包含与该身份一致的确定性 `source-snapshot.json` 源码快照，其哈希也列入发布清单。本地维护包支持有未提交改动的工作区。若发布提示 `release source drift`，运行 `cargo build --locked --release -p xenolith-cli`，再使用重建后的 CLI 重试。CI 生成的 `xenolith-Windows.zip` 在根目录包含 `xenolith.exe` 和 `manifest.json`，`xenolith-Linux.tar.gz` 保留 Unix 执行权限。
