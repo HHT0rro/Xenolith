@@ -116,6 +116,53 @@ for name in ('hello-elf', 'libhello-elf.so', 'libeh.so', 'libfeat.so'):
         assert info['report_version'] == 1 and info['probes'] == [], (path, info)
 PY
 
+no_header_so="$work/libhello-elf.no-eh-header.so"
+no_header_packed="$work/libhello-elf.no-eh-header.xl.so"
+run_command remove-input-eh-header python3 - "$original_so" "$no_header_so" <<'PY'
+import pathlib
+import struct
+import sys
+
+source = bytearray(pathlib.Path(sys.argv[1]).read_bytes())
+target = pathlib.Path(sys.argv[2])
+phoff = struct.unpack_from('<Q', source, 32)[0]
+phentsize = struct.unpack_from('<H', source, 54)[0]
+phnum = struct.unpack_from('<H', source, 56)[0]
+headers = [source[phoff + i * phentsize:phoff + (i + 1) * phentsize] for i in range(phnum)]
+kept = [header for header in headers if struct.unpack_from('<I', header, 0)[0] != 0x6474E550]
+assert len(kept) == phnum - 1, 'fixture must contain exactly one PT_GNU_EH_FRAME'
+for index, header in enumerate(kept):
+    start = phoff + index * phentsize
+    source[start:start + phentsize] = header
+    if struct.unpack_from('<I', header, 0)[0] == 6:  # PT_PHDR
+        struct.pack_into('<Q', source, start + 32, len(kept) * phentsize)
+        struct.pack_into('<Q', source, start + 40, len(kept) * phentsize)
+struct.pack_into('<H', source, 56, len(kept))
+target.write_bytes(source)
+PY
+run_command no-header.pack "$cli" pack "$no_header_so" -o "$no_header_packed" --profile standard --json
+run_command no-header.original.inspect "$cli" inspect "$no_header_so" --json
+run_command no-header.packed.inspect "$cli" inspect "$no_header_packed" --json
+run_command no-header.original.load "$host" "$no_header_so"
+run_command no-header.packed.load "$host" "$no_header_packed"
+run_command no-header.load-matches diff -u "$work/no-header.original.load.stdout" "$work/no-header.packed.load.stdout"
+run_command no-header-header-contract python3 - "$no_header_so" "$no_header_packed" <<'PY'
+import pathlib
+import struct
+import sys
+
+for index, filename in enumerate(sys.argv[1:]):
+    image = pathlib.Path(filename).read_bytes()
+    phoff = struct.unpack_from('<Q', image, 32)[0]
+    phentsize = struct.unpack_from('<H', image, 54)[0]
+    phnum = struct.unpack_from('<H', image, 56)[0]
+    count = sum(
+        struct.unpack_from('<I', image, phoff + i * phentsize)[0] == 0x6474E550
+        for i in range(phnum)
+    )
+    assert count == index, (filename, count)
+PY
+
 if run_command exports-negative "$cli" inspect "$original_so" --exports --json; then
     echo 'expected ELF --exports --json to fail' >&2
     exit 1
@@ -148,6 +195,7 @@ work = pathlib.Path(sys.argv[1])
 for state in ('original', 'packed'):
     eh = (work / f'{state}-eh-layout.stdout').read_text()
     assert '.eh_frame' in eh and 'GNU_EH_FRAME' in eh, state
+    assert eh.count('GNU_EH_FRAME') == 1, state
     feat = (work / f'{state}-feat-layout.stdout').read_text()
     assert re.search(r'IFUNC[^\n]*\bifunc_add\b', feat), state
     assert 'feat_ver@XLFEAT_1.0' in feat and 'feat_ver@@XLFEAT_2.0' in feat, state

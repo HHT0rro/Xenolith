@@ -77,6 +77,18 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
 
     // ---- page-size derivation (A-3) ----
     let phdrs = elf::program_headers(request.input, &parsed).map_err(PackError::Format)?;
+    let mut eh_frame_headers = phdrs
+        .iter()
+        .enumerate()
+        .filter(|(_, ph)| ph.p_type == elf::PT_GNU_EH_FRAME)
+        .map(|(index, _)| index);
+    let existing_eh_frame_index = eh_frame_headers.next();
+    if eh_frame_headers.next().is_some() {
+        return Err(PackError::Elf(
+            "ELF contains multiple PT_GNU_EH_FRAME headers; refusing ambiguous unwind metadata",
+        ));
+    }
+    let appended_phdr_count = if existing_eh_frame_index.is_some() { 1 } else { 2 };
     let mut max_align: u64 = 0;
     for ph in &phdrs {
         if ph.p_type == elf::PT_LOAD {
@@ -351,8 +363,8 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
                 let max_va_end = elf::max_load_vaddr_end(request.input, &parsed)
                     .map_err(PackError::Format)?;
                 let load_vaddr = align_up(max_va_end as u32, page_size) as u64;
-                let table_len =
-                    (parsed.phnum as usize + 2) * parsed.phentsize as usize;
+                let table_len = (parsed.phnum as usize + appended_phdr_count)
+                    * parsed.phentsize as usize;
                 let stub_vaddr = load_vaddr + table_len as u64;
                 // Sizing emission gives the in-stub guest offsets.
                 let sized = emit_elf_stub_aarch64(
@@ -537,22 +549,23 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
 
     // ---- append the new R+X PT_LOAD ----
     // Layout: [original file, section headers included] pad → new PHDR table
-    // (original entries + one new LOAD) → PIC stub → EnvelopeV2. The kernel
+    // (original entries + the new LOAD and, when needed, an unwind header) → PIC stub → EnvelopeV2. The kernel
     // maps via e_phoff (updated); the in-image PT_PHDR copy keeps the
     // original 13 entries for ld.so, so glibc/bionic's view of segments is
     // unchanged — it simply never needs to know about the stub LOAD.
     let phentsize = parsed.phentsize as usize;
     let phnum = parsed.phnum as usize;
-    // +1 for the appended R+X PT_LOAD, +1 for the appended PT_GNU_EH_FRAME
-    // carrying the stub's unwind records (TASK-021).
-    let table_len = (phnum + 2) * phentsize;
+    // An existing PT_GNU_EH_FRAME is redirected to a merged table that
+    // includes both the input FDEs and the injected stub FDE. Add a header
+    // program entry only for inputs that did not already have one.
+    let table_len = (phnum + appended_phdr_count) * phentsize;
+    let load_phdr_index = phnum + appended_phdr_count - 1;
+    let eh_phdr_index = existing_eh_frame_index.unwrap_or(phnum);
     let new_phoff = align_up(request.input.len() as u32, page_size) as usize;
     let stub_off = new_phoff + table_len;
     let env_off = align_up((stub_off + stub.bytes.len()) as u32, 16) as usize;
-    // TASK-021: self-contained .eh_frame (CIE+FDE for the stub) and an
-    // .eh_frame_hdr binary-search table, both offset-embedded so the
-    // unwinder needs zero ld.so relocations. The CIE return register is
-    // per-arch (RAX vs x30).
+    // TASK-021: append a self-contained .eh_frame for the stub and merge its
+    // FDE into the input object's existing unwind lookup table when present.
     let eh = match machine {
         ElfMachine::Amd64 => crate::unwind::dwarf::eh_frame_stub(stub.bytes.len() as u32),
         ElfMachine::Aarch64 => {
@@ -560,7 +573,6 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
         }
     };
     let eh_off = align_up((env_off + envelope.len()) as u32, 8) as usize;
-    let hdr = crate::unwind::dwarf::eh_frame_hdr(&[]);
     let hdr_off = eh_off + eh.bytes.len();
     // seg_filesz is finalized AFTER the content is placed: it must satisfy
     // bionic's hard `p_offset + p_filesz <= file size` check exactly (the
@@ -568,9 +580,41 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
     // on top of p_offset — double-counting the prefix and overshooting EOF
     // by up to a page; glibc silently zero-fills that, bionic refuses).
 
-    let max_va_end =
-        elf::max_load_vaddr_end(request.input, &parsed).map_err(PackError::Format)?;
+    let max_va_end = elf::max_load_vaddr_end(request.input, &parsed).map_err(PackError::Format)?;
     let load_vaddr = align_up(max_va_end as u32, page_size) as u64;
+
+    let stub_vaddr = load_vaddr + table_len as u64 + stub.entry_off as u64;
+    let self_rva = (load_vaddr + table_len as u64 + stub.meta_off as u64) as u32;
+    let eh_frame_rva = (load_vaddr + (eh_off - new_phoff) as u64) as u32;
+    let hdr_rva = (load_vaddr + (hdr_off - new_phoff) as u64) as u32;
+    let mut eh_bytes = eh.bytes;
+    let pc = (stub_vaddr as i64 - (eh_frame_rva as i64 + eh.pc_begin_off as i64)) as i32;
+    eh_bytes[eh.pc_begin_off..eh.pc_begin_off + 4].copy_from_slice(&pc.to_le_bytes());
+    let old_eh_header = if let Some(index) = existing_eh_frame_index {
+        let ph = &phdrs[index];
+        let offset = usize::try_from(ph.p_offset)
+            .map_err(|_| PackError::Elf("PT_GNU_EH_FRAME offset is out of range"))?;
+        let size = usize::try_from(ph.p_filesz)
+            .map_err(|_| PackError::Elf("PT_GNU_EH_FRAME size is out of range"))?;
+        let end = offset
+            .checked_add(size)
+            .ok_or(PackError::Elf("PT_GNU_EH_FRAME range overflows"))?;
+        let bytes = request
+            .input
+            .get(offset..end)
+            .ok_or(PackError::Elf("PT_GNU_EH_FRAME points outside the input image"))?;
+        Some((bytes, ph.p_vaddr))
+    } else {
+        None
+    };
+    let hdr_bytes = crate::unwind::dwarf::merge_eh_frame_hdr(
+        old_eh_header,
+        hdr_rva as u64,
+        eh_frame_rva as u64,
+        stub_vaddr,
+        eh_frame_rva as u64 + eh.fde_off as u64,
+    )
+    .map_err(PackError::Elf)?;
 
     let mut image = working;
     image.resize(new_phoff, 0);
@@ -580,7 +624,7 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
     // The relocated table lives at new_phoff; only e_phoff/e_phnum point at it.
     let parsed_new = elf::Elf64 {
         phoff: new_phoff as u64,
-        phnum: (phnum + 2) as u16,
+        phnum: (phnum + appended_phdr_count) as u16,
         ..parsed.clone()
     };
     for (i, ph) in phdrs.iter().enumerate() {
@@ -611,37 +655,12 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
         elf::write_program_header(&mut image, &parsed_new, phdr_idx, &phdr_ph)
             .map_err(PackError::Format)?;
     }
-    // `hdr` here is the zero-entry placeholder sizing the segment; the real
-    // one-entry header is written later once stub_vaddr is known.
-    let hdr_placeholder_len = hdr.len();
-    image.resize(hdr_off + hdr_placeholder_len.max(4 + 4 + 4 + 8), 0);
+    image.resize(hdr_off + hdr_bytes.len(), 0);
     image[stub_off..stub_off + stub.bytes.len()].copy_from_slice(&stub.bytes);
     image[env_off..env_off + envelope.len()].copy_from_slice(&envelope);
     let envelope_len = envelope.len();
     drop(envelope);
 
-    // In the new segment, va = base + p_vaddr + (file_off - p_offset); the
-    // bootstrap table precedes the stub, so add table_len to every stub-file
-    // offset when converting to a load-relative VA.
-    let stub_vaddr = load_vaddr + table_len as u64 + stub.entry_off as u64;
-    let self_rva = (load_vaddr + table_len as u64 + stub.meta_off as u64) as u32;
-
-    // TASK-021: emit the .eh_frame + .eh_frame_hdr and the PT_GNU_EH_FRAME
-    // exposing them. All encodings are pack-time constants: pc_begin is
-    // pcrel within the appended segment; the search table is datarel
-    // (object-base = load-relative RVA).
-    let eh_frame_rva = (load_vaddr + (eh_off - new_phoff) as u64) as u32;
-    let hdr_rva = (load_vaddr + (hdr_off - new_phoff) as u64) as u32;
-    let mut eh_bytes = eh.bytes;
-    let pc = (stub_vaddr as i64 - (eh_frame_rva as i64 + eh.pc_begin_off as i64)) as i32;
-    eh_bytes[eh.pc_begin_off..eh.pc_begin_off + 4].copy_from_slice(&pc.to_le_bytes());
-    let entries = [(
-        stub_vaddr as i32,
-        (eh_frame_rva as i64 + eh.fde_off as i64) as i32,
-    )];
-    let mut hdr_bytes = crate::unwind::dwarf::eh_frame_hdr(&entries);
-    let efp = (eh_frame_rva as i64 - (hdr_rva as i64 + 4)) as i32;
-    hdr_bytes[4..8].copy_from_slice(&efp.to_le_bytes());
     image[eh_off..eh_off + eh_bytes.len()].copy_from_slice(&eh_bytes);
     image[hdr_off..hdr_off + hdr_bytes.len()].copy_from_slice(&hdr_bytes);
     let eh_ph = elf::ProgramHeader {
@@ -654,7 +673,7 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
         p_memsz: hdr_bytes.len() as u64,
         p_align: 4,
     };
-    elf::write_program_header(&mut image, &parsed_new, phnum + 1, &eh_ph)
+    elf::write_program_header(&mut image, &parsed_new, eh_phdr_index, &eh_ph)
         .map_err(PackError::Format)?;
     let mut meta = vec![0u8; STUB_META_LEN];
     // The stub computes `base + payload_rva`, so this is the load-relative
@@ -703,11 +722,12 @@ pub fn pack_elf(request: &PackRequest<'_>) -> Result<PackOutput, PackError> {
         p_memsz: seg_filesz as u64,
         p_align: page_size as u64,
     };
-    elf::write_program_header(&mut image, &parsed_new, phnum, &new_load)
+    elf::write_program_header(&mut image, &parsed_new, load_phdr_index, &new_load)
         .map_err(PackError::Format)?;
     // Kernel-facing program header table.
     write_u64(&mut image, 32, new_phoff as u64)?;
-    elf::set_phnum(&mut image, (phnum + 2) as u16).map_err(PackError::Format)?;
+    elf::set_phnum(&mut image, (phnum + appended_phdr_count) as u16)
+        .map_err(PackError::Format)?;
 
     // Bootstrap: drop DT_INIT (an in-place tag-zero would truncate the array
     // at DT_NULL, so the remaining entries shift left), then point the

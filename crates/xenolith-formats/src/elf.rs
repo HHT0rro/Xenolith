@@ -1658,22 +1658,30 @@ pub fn inspect_metadata(bytes: &[u8], elf: &Elf64) -> Result<ElfInspection, Form
 }
 
 /// The current Xenolith ELF layout places the relocated program header table
-/// at the start of a dedicated RX load, followed by the stub. A separate
-/// header describes the stub's unwind table at the end of that load.
+/// at the start of a dedicated RX load, followed by the stub. Its single
+/// PT_GNU_EH_FRAME header points to the merged original and stub lookup table.
 fn appended_bootstrap(
     file_len: u64,
     elf: &Elf64,
     phdrs: &[ProgramHeader],
 ) -> Result<Option<u64>, FormatError> {
-    let [original @ .., load, unwind] = phdrs else {
+    let Some((load, original)) = phdrs.split_last() else {
         return Ok(None);
     };
     if load.p_type != PT_LOAD
         || load.p_offset != elf.phoff
-        || unwind.p_type != PT_GNU_EH_FRAME
         || !original.iter().any(|ph| ph.p_type == PT_LOAD)
     {
         return Ok(None);
+    }
+    let mut unwind_headers = original.iter().filter(|ph| ph.p_type == PT_GNU_EH_FRAME);
+    let Some(unwind) = unwind_headers.next() else {
+        return Ok(None);
+    };
+    if unwind_headers.next().is_some() {
+        return Err(FormatError::Invalid(
+            "packed ELF must expose one merged PT_GNU_EH_FRAME header",
+        ));
     }
     const INVALID: FormatError = FormatError::Invalid("inconsistent ELF packed program headers");
     let table_size = u64::from(elf.phnum) * u64::from(elf.phentsize);
@@ -1682,6 +1690,7 @@ fn appended_bootstrap(
         || load.p_filesz != load.p_memsz
         || load.p_offset.checked_add(load.p_filesz) != Some(file_len)
         || load.p_vaddr.checked_add(load.p_memsz).is_none()
+        || unwind.p_offset < load.p_offset
         || unwind.p_offset.checked_sub(load.p_offset) != unwind.p_vaddr.checked_sub(load.p_vaddr)
         || unwind.p_vaddr <= stub
         || unwind.p_filesz == 0

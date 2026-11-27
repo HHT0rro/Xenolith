@@ -1,13 +1,11 @@
 //! Self-contained .eh_frame + .eh_frame_hdr synthesis for the injected ELF
 //! stub (TASK-021).
 //!
-//! The appended segment carries its own eh_frame (CIE with `zR` augmentation,
-//! pcrel-sdata4 FDE for the stub range) and a binary-search eh_frame_hdr; a
-//! PT_GNU_EH_FRAME program header exposes it so the libgcc unwinder's
-//! dl_iterate_phdr path finds FDEs for the stub with **zero** ld.so
-//! relocation — pc_begin is self-relative (pcrel) and the search table is
-//! datarel (object-base relative); both are pack-time constants for an
-//! appended segment.
+//! The appended segment carries a self-contained eh_frame (CIE with `zR`
+//! augmentation and a pcrel-sdata4 FDE for the stub range). The original
+//! binary-search eh_frame_hdr entries and the stub entry are merged into one
+//! relocated header so libgcc's dl_iterate_phdr path can find both original
+//! and injected frames with **zero** ld.so relocation.
 //!
 //! The FDE describes the ELF stub's fixed prologue:
 //! `push rbx; push r15; sub rsp, 8` (1+2+4 bytes).
@@ -121,6 +119,80 @@ pub fn eh_frame_hdr(entries: &[(i32, i32)]) -> Vec<u8> {
         out.extend_from_slice(&fde.to_le_bytes());
     }
     out
+}
+
+/// Move an ELF object's unwind lookup table and add the injected stub's FDE.
+/// The data-relative table entries are decoded to object-relative addresses
+/// before they are re-encoded against the new header location.
+pub fn merge_eh_frame_hdr(
+    existing: Option<(&[u8], u64)>,
+    header_addr: u64,
+    eh_frame_addr: u64,
+    stub_addr: u64,
+    stub_fde_addr: u64,
+) -> Result<Vec<u8>, &'static str> {
+    const HEADER_PREFIX_LEN: usize = 12;
+    const ENTRY_LEN: usize = 8;
+    const ENCODINGS: [u8; 4] = [1, 0x1b, 0x03, 0x3b];
+
+    let mut eh_frame_addr = eh_frame_addr;
+    let mut entries = Vec::new();
+    if let Some((bytes, old_header_addr)) = existing {
+        if bytes.len() < HEADER_PREFIX_LEN || bytes[..4] != ENCODINGS {
+            return Err("unsupported or truncated PT_GNU_EH_FRAME header");
+        }
+        let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let expected_len = HEADER_PREFIX_LEN
+            .checked_add(count.checked_mul(ENTRY_LEN).ok_or("unwind header is too large")?)
+            .ok_or("unwind header is too large")?;
+        if bytes.len() != expected_len {
+            return Err("PT_GNU_EH_FRAME size does not match its entry count");
+        }
+
+        let frame_pointer = i32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let frame_pointer_addr = old_header_addr
+            .checked_add(4)
+            .ok_or("unwind header address is out of range")?;
+        eh_frame_addr = add_signed(frame_pointer_addr, frame_pointer)?;
+        for entry in bytes[HEADER_PREFIX_LEN..].chunks_exact(ENTRY_LEN) {
+            let pc_offset = i32::from_le_bytes(entry[0..4].try_into().unwrap());
+            let fde_offset = i32::from_le_bytes(entry[4..8].try_into().unwrap());
+            entries.push((
+                add_signed(old_header_addr, pc_offset)?,
+                add_signed(old_header_addr, fde_offset)?,
+            ));
+        }
+    }
+
+    entries.push((stub_addr, stub_fde_addr));
+    entries.sort_unstable_by_key(|(pc, _)| *pc);
+    if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err("duplicate PC in merged PT_GNU_EH_FRAME table");
+    }
+
+    let frame_pointer_addr = header_addr
+        .checked_add(4)
+        .ok_or("merged unwind header address is out of range")?;
+    let frame_pointer = i32::try_from(eh_frame_addr as i128 - frame_pointer_addr as i128)
+        .map_err(|_| "merged eh_frame pointer is out of range")?;
+    let count = u32::try_from(entries.len()).map_err(|_| "too many unwind table entries")?;
+    let mut merged = eh_frame_hdr(&[]);
+    merged[4..8].copy_from_slice(&frame_pointer.to_le_bytes());
+    merged[8..12].copy_from_slice(&count.to_le_bytes());
+    for (pc, fde) in entries {
+        let pc_offset = i32::try_from(pc as i128 - header_addr as i128)
+            .map_err(|_| "merged unwind PC is out of range")?;
+        let fde_offset = i32::try_from(fde as i128 - header_addr as i128)
+            .map_err(|_| "merged unwind FDE is out of range")?;
+        merged.extend_from_slice(&pc_offset.to_le_bytes());
+        merged.extend_from_slice(&fde_offset.to_le_bytes());
+    }
+    Ok(merged)
+}
+
+fn add_signed(base: u64, offset: i32) -> Result<u64, &'static str> {
+    let address = base as i128 + i128::from(offset);
+    u64::try_from(address).map_err(|_| "unwind table address is out of range")
 }
 
 /// AArch64 twin of `eh_frame_stub`: the CIE's return-address column is x30
@@ -262,5 +334,91 @@ mod tests {
         assert_eq!(&hdr[0..4], &[1, 0x1B, 0x03, 0x3B]);
         assert_eq!(u32::from_le_bytes(hdr[8..12].try_into().unwrap()), 1);
         assert_eq!(hdr.len(), 4 + 4 + 4 + 8);
+    }
+
+    #[test]
+    fn merged_header_rebases_existing_entries_and_sorts_stub() {
+        let old_header_addr = 0x2000;
+        let old_eh_frame_addr = 0x2070;
+        let old_entries = [(0x1010, 0x2080), (0x3040, 0x2110)];
+        let mut old_header = eh_frame_hdr(
+            &old_entries
+                .map(|(pc, fde)| {
+                    (
+                        (pc as i64 - old_header_addr as i64) as i32,
+                        (fde as i64 - old_header_addr as i64) as i32,
+                    )
+                }),
+        );
+        old_header[4..8]
+            .copy_from_slice(&((old_eh_frame_addr - (old_header_addr + 4)) as i32).to_le_bytes());
+
+        let new_header_addr = 0x9000;
+        let new_eh_frame_addr = 0x9100;
+        let stub_addr = 0x1020;
+        let stub_fde_addr = 0x9120;
+        let merged = merge_eh_frame_hdr(
+            Some((&old_header, old_header_addr)),
+            new_header_addr,
+            new_eh_frame_addr,
+            stub_addr,
+            stub_fde_addr,
+        )
+        .unwrap();
+
+        assert_eq!(merged.len(), 12 + 3 * 8);
+        assert_eq!(u32::from_le_bytes(merged[8..12].try_into().unwrap()), 3);
+        assert_eq!(
+            i32::from_le_bytes(merged[4..8].try_into().unwrap()),
+            (old_eh_frame_addr as i64 - (new_header_addr + 4) as i64) as i32
+        );
+        let decoded: Vec<_> = merged[12..]
+            .chunks_exact(8)
+            .map(|entry| {
+                let pc = i32::from_le_bytes(entry[0..4].try_into().unwrap());
+                let fde = i32::from_le_bytes(entry[4..8].try_into().unwrap());
+                (
+                    add_signed(new_header_addr, pc).unwrap(),
+                    add_signed(new_header_addr, fde).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(decoded, [(0x1010, 0x2080), (0x1020, 0x9120), (0x3040, 0x2110)]);
+    }
+
+    #[test]
+    fn merged_header_without_existing_header_points_to_new_frame() {
+        let merged = merge_eh_frame_hdr(None, 0x9000, 0x9100, 0x9200, 0x9120).unwrap();
+        assert_eq!(merged.len(), 20);
+        assert_eq!(
+            i32::from_le_bytes(merged[4..8].try_into().unwrap()),
+            0xfc
+        );
+        assert_eq!(
+            i32::from_le_bytes(merged[12..16].try_into().unwrap()),
+            0x200
+        );
+        assert_eq!(
+            i32::from_le_bytes(merged[16..20].try_into().unwrap()),
+            0x120
+        );
+    }
+
+    #[test]
+    fn merged_header_rejects_unknown_encoding_and_duplicate_pc() {
+        let mut unsupported = eh_frame_hdr(&[]);
+        unsupported[3] = 0x00;
+        assert_eq!(
+            merge_eh_frame_hdr(Some((&unsupported, 0x2000)), 0x9000, 0x9100, 0x9200, 0x9120)
+                .unwrap_err(),
+            "unsupported or truncated PT_GNU_EH_FRAME header"
+        );
+
+        let old = eh_frame_hdr(&[(0x200, 0x240)]);
+        assert_eq!(
+            merge_eh_frame_hdr(Some((&old, 0x9000)), 0x9000, 0x9100, 0x9200, 0x9240)
+                .unwrap_err(),
+            "duplicate PC in merged PT_GNU_EH_FRAME table"
+        );
     }
 }

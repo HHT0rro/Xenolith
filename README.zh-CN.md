@@ -115,7 +115,7 @@ dump 与调试对策(现状,不夸大):
 - `max` 档 stub 探针:PEB.BeingDebugged、`NtSetInformationThread(HideFromDebugger)`、`NtQueryInformationProcess(ProcessDebugPort / ProcessDebugObjectHandle / ProcessDebugFlags)`、NtQuery 前 INT3。CI 不附加调试器、不跑 Frida、不测 RPM。
 - **已知残余**:解包后可执行页保持明文(C2 再加密未接线,因为加密 hello_dll 的 `.text` 页会破坏 `hello_add`);Scylla 式 IAT 写断点在解包窗口内仍然成立;暂停的进程可以读当前页。这些写在 docs 里,不假装不存在。
 
-兼容性不是靠关安全特性换来的:ASLR/`DYNAMIC_BASE`/`HIGH_ENTROPY_VA` 与重定位目录保留;DEP/NX、W^X、Windows CFG/CET、Linux RELRO/PIE 全部保持。TLS 目录保留且首个 TLS callback 被包装,保证解包先于 CRT TLS;有 TLS callback 的映像保留磁盘导入目录(loader lock 下 `LoadLibraryA` 不安全)。异常处理在两侧都合成展开元数据:PE 侧 XDATA + 重定位 `.pdata` 携带 stub 的 RUNTIME_FUNCTION,ELF 侧追加 `.eh_frame` + `PT_GNU_EH_FRAME`。C++ 异常、`setjmp/longjmp`、varargs、8 字节结构体返回、尾调用都在**打包后的映像**上验证过(`packed_eh_matrix` / `packed_elf_eh_matrix`)。
+兼容性不是靠关安全特性换来的:ASLR/`DYNAMIC_BASE`/`HIGH_ENTROPY_VA` 与重定位目录保留;DEP/NX、W^X、Windows CFG/CET、Linux RELRO/PIE 全部保持。TLS 目录保留且首个 TLS callback 被包装,保证解包先于 CRT TLS;有 TLS callback 的映像保留磁盘导入目录(loader lock 下 `LoadLibraryA` 不安全)。异常处理在两侧都合成展开元数据:PE 侧 XDATA + 重定位 `.pdata` 携带 stub 的 RUNTIME_FUNCTION;ELF 侧合并原 FDE 查找表与 stub 条目,输出保留唯一 `PT_GNU_EH_FRAME`。C++ 异常、`setjmp/longjmp`、varargs、8 字节结构体返回、尾调用都在**打包后的映像**上验证过(`packed_eh_matrix` / `packed_elf_eh_matrix`)。
 
 ### 4. 选择性虚拟化(lift → IR → SuperOp)
 
@@ -153,7 +153,7 @@ ZF = r11 移位后的某一位(seed 决定)
 
 ### 6. ELF 路线
 
-Linux 打包不接管加载器:追加一个 R+X `PT_LOAD`(迁移后的 PHDR 表 + PIC stub + `xl_core` + EnvelopeV2),把 `INIT_ARRAY[0]` 重定向到 stub;`ld.so` 照常完成重定位与符号解析,PIE/RELRO/GOT-PLT 不动。可执行 `PT_LOAD` 的文件字节 `0x90` 填充后密封进信封。已在 WSL Ubuntu 24.04 验证:打包后的 `hello-elf` 正常输出,`libhello-elf.so` 可 `dlopen`/`dlclose`;IFUNC resolver 保持原生并支持,符号版本(`DT_VERNEED/VERDEF`)保留且 `dlvsym` 验证通过。initial-exec/local-dynamic TLS 已通过现有样例验证。IFUNC 导入、TLS 描述符、local-exec TPOFF32、copy 重定位与静态链接继续具名拒绝。ELF 符号选择本版本只报告,同样要求 `--allow-native-fallback`。
+Linux 打包不接管加载器:追加一个 R+X `PT_LOAD`(迁移后的 PHDR 表 + PIC stub + `xl_core` + EnvelopeV2),把 `INIT_ARRAY[0]` 重定向到 stub;`ld.so` 照常完成重定位与符号解析,PIE/RELRO/GOT-PLT 不动。可执行 `PT_LOAD` 的文件字节 `0x90` 填充后密封进信封。输出复用单个 `PT_GNU_EH_FRAME`,把输入的 FDE 查找项重定位到合并表,并加入 stub 的 FDE,避免动态展开器漏掉原库栈帧。已在 WSL Kali Linux x86_64 验证:打包后的 `hello-elf` 正常输出,`libhello-elf.so` 可 `dlopen`/`dlclose`;C++ 异常展开与 `_Unwind_Backtrace` 穿过打包库后仍分别得到 3 层展开及 7 帧回溯;IFUNC resolver 保持原生并支持,符号版本(`DT_VERNEED/VERDEF`)保留且 `dlvsym` 验证通过。initial-exec/local-dynamic TLS 已通过现有样例验证。IFUNC 导入、TLS 描述符、local-exec TPOFF32、copy 重定位与静态链接继续具名拒绝。ELF 符号选择本版本只报告,同样要求 `--allow-native-fallback`。
 
 **安卓路线(实验性)**:仅接受部分安卓 arm64(EM_AARCH64)与 x86_64 ELF64 `.so`——手写定宽编码的 AArch64 stub 加 NDK 编译的 aarch64 `xl_core`,对齐从 ELF 输入推导，不能据此推断对应设备页大小已受支持。CLI 面不变:`pack`/`inspect`、profiles、`--json` 报告同构(仅新增 `machine` 字段);不支持的输入(ELF32/armeabi-v7a、`PT_INTERP`、`p_align`>16K、RELR/packed 重定位、aarch64 上 `DT_INIT`+`DT_INIT_ARRAY` 并存)一律具名报错。安卓强度:两种机器都有页级 AEAD 密封;**仅 arm64** 另有首批指令白名单的 `--vm-export`(整数/访存/分支类提升到 64 位 IR、逐块再生成 AArch64 superoperator;白名单之外——调用、SIMD/FP、原子、PAC、乘法、位段等——一律具名报错,绝不静默近似)与 bionic 反调试探针集(TracerPid 扫描、`PTRACE_TRACEME` 自附加、`/proc/self/maps` 标记扫描;按 profile 装配,`max`=三个全开,其余 profile=两个,x86_64-ELF=无并如实报告)。x86_64-ELF 的函数选择保持 fail closed(SysV x86-64 lift 属后续阶段)。
 
@@ -276,7 +276,7 @@ xenolith project show FILE
 
 ## 构建与测试
 
-Linux 构建 CLI 后执行 `bash tests/linux-elf-smoke.sh ./target/release/xenolith target`。自有夹具比较原件和 standard 档产物的 PIE、共享库加载与重载、C++ 异常展开、setjmp、可变参数、结构体返回、回调、IFUNC、版本符号及 initial-exec/local-dynamic TLS。每次运行在 `target/elf-smoke.*` 保存命令、退出码、stdout、stderr、输入源码与 SHA-256。2026年11月26日本地 Ubuntu 24.04 WSL x86_64 运行通过。Ubuntu 22.04 和 Debian 12 已配置 CI，托管运行仍待执行。
+Linux 构建 CLI 后执行 `bash tests/linux-elf-smoke.sh ./target/release/xenolith target`。自有夹具比较原件和 standard 档产物的 PIE、共享库加载与重载、C++ 异常展开、setjmp、可变参数、结构体返回、回调、IFUNC、版本符号及 initial-exec/local-dynamic TLS，并核对原件和产物均只有一个 `PT_GNU_EH_FRAME`。每次运行在 `target/elf-smoke.*` 保存命令、退出码、stdout、stderr、输入源码与 SHA-256。2026年11月27日本地 Kali Linux WSL x86_64 运行通过。Ubuntu 22.04 和 Debian 12 已配置 CI，托管运行仍待执行。
 
 ```
 cargo build --release -p xenolith-cli

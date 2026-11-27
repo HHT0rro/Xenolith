@@ -265,7 +265,7 @@
    "with_callback(ELF)"
   ],
   "windows": "packed_eh_matrix: LoadLibrary + all exports; unwinder pops C++ frames via the RELOCATED .pdata (stub RUNTIME_FUNCTION appended, exception directory repointed)",
-  "linux": "packed_elf_eh_matrix: dlopen + all exports; _Unwind_Backtrace walks through the packed frame (7 frames) via intact .eh_frame; appended PT_GNU_EH_FRAME carries the stub CIE+FDE",
+  "linux": "packed_elf_eh_matrix: dlopen + all exports; _Unwind_Backtrace walks through the packed frame (7 frames) via the merged original and stub FDE table under one PT_GNU_EH_FRAME header",
   "fixes_landed": [
    "scan_ifunc bounded by DT_STRTAB (false IFUNC positives on C++ objects)",
    "UNWIND_CODE stored reverse-by-operation-group",
