@@ -161,8 +161,20 @@ jobs:
           assert addend is not None, f"no R_AARCH64_RELATIVE at DT_INIT_ARRAY {ia:#x}"
           data = open(OUT, "rb").read()
           phoff = struct.unpack_from("<Q", data, 32)[0]
-          phnum = struct.unpack_from("<H", data, 56)[0]
-          o = phoff + (phnum - 2) * 56
+          phentsize, phnum = struct.unpack_from("<HH", data, 54)
+          assert phentsize == 56, f"unexpected ELF64 program header size {phentsize}"
+          # The appended LOAD starts with the relocated program-header table.
+          # Input NOTE and unwind headers make ordinal selection unreliable.
+          loads = []
+          for i in range(phnum):
+            o = phoff + i * phentsize
+            p_type, _, off = struct.unpack_from("<IIQ", data, o)
+            if p_type == 1 and off == phoff:  # PT_LOAD at the appended table
+              loads.append(o)
+          assert len(loads) == 1, f"expected one appended LOAD at e_phoff {phoff:#x}, found {len(loads)}"
+          o = loads[0]
+          flags = struct.unpack_from("<I", data, o + 4)[0]
+          assert flags == 5, f"appended LOAD flags {flags:#x} must be R+X"
           va = struct.unpack_from("<Q", data, o + 16)[0]
           msz = struct.unpack_from("<Q", data, o + 40)[0]
           assert va <= addend < va + msz, f"redirect addend {addend:#x} outside appended LOAD [{va:#x},{va+msz:#x})"
